@@ -11,10 +11,14 @@ requires-python = ">=3.11"
 [project.optional-dependencies]
 dev = ["pytest>=8", "build>=1", "ruff>=0.9"]
 
+[project.scripts]
+ariadne-install = "hermes_ariadne.install:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
-["plugin.yaml"]
+[tool.setuptools.package-data]
+hermes_ariadne = ["plugin.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
