@@ -28,6 +28,24 @@ long-horizon memory engine.
 
 See [inspected contracts and architecture](docs/integration-findings.md).
 
+## Project and contributions
+
+Maintained by [Whayn](https://github.com/whayn), under [Apache-2.0](LICENSE).
+The long-term direction is a UniiChat-inspired memory/context engine **inside
+Hermes**, but this public development milestone implements only the archival
+foundation described above. There is no stable release or PyPI publication.
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for commit/branch naming, PRs, issue triage,
+verification and release policy. [AGENTS.md](AGENTS.md) carries repository-local
+agent guidance. Report vulnerabilities through [SECURITY.md](SECURITY.md), not a
+public issue. Public reports and fixtures must use synthetic data, never private
+life-chat transcripts or memory archives.
+
+Repository conventions draw on Hermes Agent, T3 Code and hermes-lcm; the pinned
+references and deliberate differences are recorded in
+[repository-conventions.md](docs/repository-conventions.md). UniiChat remains the
+memory-algorithm reference; no UniiChat source has been ported in v0.1.
+
 ## Installation (isolated home first)
 
 Prerequisites: an installed Hermes with the inspected ContextEngine/identity

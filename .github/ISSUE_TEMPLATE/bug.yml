@@ -1,0 +1,44 @@
+name: Bug report
+description: A reproducible defect in currently implemented behavior.
+title: "bug: "
+labels: [bug, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues first. Use synthetic data only. Never attach a real
+        transcript, archive, credentials, auth/config file or an unredacted log.
+        Missing planned features are feature requests, not bugs.
+  - type: input
+    id: versions
+    attributes:
+      label: Versions and environment
+      description: Ariadne revision, Hermes revision, Python version, OS and interface.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Steps and synthetic inputs, starting from a disposable HERMES_HOME.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence
+      description: Relevant error text and commands/results; no private archives or credentials.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked for duplicates and removed private data and secrets.
+          required: true
