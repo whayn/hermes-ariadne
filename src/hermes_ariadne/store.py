@@ -106,7 +106,12 @@ class EventStore:
                     conn.execute("PRAGMA journal_mode=WAL").fetchone()
                     break
                 except sqlite3.OperationalError as exc:
-                    if exc.sqlite_errorcode != sqlite3.SQLITE_BUSY or time.monotonic() >= deadline:
+                    # SQLite's low byte is the primary result; recovery may
+                    # report an extended BUSY code rather than plain BUSY.
+                    if (
+                        exc.sqlite_errorcode & 0xFF != sqlite3.SQLITE_BUSY
+                        or time.monotonic() >= deadline
+                    ):
                         raise
                     time.sleep(0.01)
 

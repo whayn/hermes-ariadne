@@ -212,6 +212,35 @@ def test_wal_transition_retries_extended_busy_codes(tmp_path, monkeypatch, error
         assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 
 
+@pytest.mark.parametrize("error_code", [sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_IOERR])
+def test_wal_transition_propagates_non_busy_errors_without_retry(tmp_path, monkeypatch, error_code):
+    connect = sqlite3.connect
+    attempts = []
+    sleeps = []
+
+    class FailingConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if sql == "PRAGMA journal_mode=WAL":
+                attempts.append(sql)
+                exc = sqlite3.OperationalError("non-busy sentinel")
+                exc.sqlite_errorcode = error_code
+                raise exc
+            return super().execute(sql, parameters)
+
+    monkeypatch.setattr(
+        sqlite3, "connect", lambda *a, **kw: connect(*a, **kw, factory=FailingConnection)
+    )
+    monkeypatch.setattr(
+        "hermes_ariadne.store.time",
+        SimpleNamespace(monotonic=lambda: 0, sleep=sleeps.append),
+    )
+    with pytest.raises(sqlite3.OperationalError, match="non-busy sentinel") as caught:
+        EventStore(tmp_path / "archive.sqlite3")
+    assert caught.value.sqlite_errorcode == error_code
+    assert len(attempts) == 1
+    assert sleeps == []
+
+
 def test_unknown_schema_is_refused_without_changes(tmp_path):
     path = tmp_path / "archive.sqlite3"
     with sqlite3.connect(path) as conn:
