@@ -1,0 +1,36 @@
+name: Feature or design proposal
+description: Explain a problem, a bounded proposal and how we could validate it.
+title: "feat: "
+labels: [enhancement, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Discuss substantial work before implementation. Ariadne is a Hermes memory
+        plugin, not another harness. Keep examples synthetic and privacy-safe.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and use case
+      description: What is hard today? Why do existing capabilities not solve it?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change and alternatives
+      description: Include scope, non-goals and simpler alternatives considered.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria and verification
+      description: Observable behavior, tests or benchmarks that would establish success.
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks and compatibility
+      description: Archive integrity, migrations, privacy, latency, cost and Hermes compatibility.
