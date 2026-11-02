@@ -53,10 +53,10 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install -r requirements-dev.txt -e .
-      - name: Test archive independently of Hermes
+      - name: Test archive and simulator independently of Hermes
         env:
           TMPDIR: ${{ runner.temp }}
-        run: python -m pytest tests/test_store.py tests/test_crash.py -q
+        run: python -m pytest tests/test_store.py tests/test_crash.py tests/test_simulation.py -q
 
   hermes:
     name: Hermes integration

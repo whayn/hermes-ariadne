@@ -213,7 +213,22 @@ main DB while WAL writes are active). No backup/export/migration CLI is shipped.
   gateway/desktop UI lifecycle, power-loss hardware guarantees and multiprocess
   long-running production loads are not certified by this milestone.
 
-**Next smallest milestone:** a separate, pure context-selection simulator with
-fixed transcript fixtures and budget/identity/cache-prefix invariants. Keep the
-live `select_context` hook inherited until that simulator passes. Do not add
-summarization or proactive retrieval before the selection contract is tested.
+## Offline selection simulator (development only)
+
+A separate, stdlib-only [context-selection simulator](docs/context-selection-simulator.md)
+now exercises synthetic summary coverage, explicit retention boundaries, complete
+tool sequences, measured budgets and logical cache-prefix invariants. Run it with:
+
+```bash
+.venv/bin/python -m pytest tests/test_simulation.py -q
+```
+
+It is not called by the engine or copied by the runtime installer. Its default
+measurement is canonical ASCII-JSON bytes, **not provider tokens**, and it neither
+creates summaries nor implements UniiChat's tree/view algorithm. The warning at
+the top of this README remains in force: live context is still not compacted.
+
+**Next smallest milestone:** a faithful pure tree/view implementation checked
+against the simulator invariants and deterministic summary fixtures. Keep live
+`select_context` inherited until the algorithm and real host/provider boundary
+are tested; summarization and proactive retrieval remain separate stages.
