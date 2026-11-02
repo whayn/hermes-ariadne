@@ -59,7 +59,7 @@ def test_concurrent_retries_are_idempotent(tmp_path):
 def test_concurrent_initializers_of_nonexistent_database(tmp_path):
     message = {"message_uid": "new", "content": "concurrent fresh archive"}
     with ThreadPoolExecutor(max_workers=8) as workers:
-        for round_number in range(100):
+        for round_number in range(1000):
             path = tmp_path / f"fresh-{round_number}.sqlite3"
             assert not path.exists()
             start = Barrier(8)
@@ -165,6 +165,51 @@ def test_wal_transition_retries_real_sqlite_busy(tmp_path, monkeypatch, contenti
     with connect(path) as conn:
         assert conn.execute("PRAGMA journal_mode").fetchone() == ("wal",)
         assert conn.execute("PRAGMA user_version").fetchone() == (1,)
+
+
+@pytest.mark.parametrize(
+    "error_code,error_name",
+    [
+        (sqlite3.SQLITE_BUSY, "SQLITE_BUSY"),
+        (sqlite3.SQLITE_BUSY_RECOVERY, "SQLITE_BUSY_RECOVERY"),
+    ],
+)
+def test_wal_transition_retries_extended_busy_codes(tmp_path, monkeypatch, error_code, error_name):
+    path = tmp_path / "archive.sqlite3"
+    connect = sqlite3.connect
+    attempts = []
+    sleeps = []
+
+    class RecoveryConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if sql == "PRAGMA journal_mode=WAL":
+                attempts.append(sql)
+                if len(attempts) == 1:
+                    # Inject the documented SQLite recovery result at the driver
+                    # boundary; all initialization, retry and archive IO are real.
+                    exc = sqlite3.OperationalError("database is locked")
+                    exc.sqlite_errorcode = error_code
+                    exc.sqlite_errorname = error_name
+                    raise exc
+            return super().execute(sql, parameters)
+
+    def recovery_connect(*args, **kwargs):
+        return connect(*args, **kwargs, factory=RecoveryConnection)
+
+    monkeypatch.setattr(sqlite3, "connect", recovery_connect)
+    monkeypatch.setattr(
+        "hermes_ariadne.store.time",
+        SimpleNamespace(monotonic=lambda: 0, sleep=sleeps.append),
+    )
+    store = EventStore(path)
+    assert len(attempts) == 2
+    assert sleeps == [0.01]
+    message = {"message_uid": "recovery", "content": "exact recovery sentinel"}
+    assert store.ingest("s", [message], origin="hook")["inserted"] == 1
+    assert store.search("sentinel", session_id="s")[0]["message"] == message
+    with connect(path) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 
 
 def test_unknown_schema_is_refused_without_changes(tmp_path):
