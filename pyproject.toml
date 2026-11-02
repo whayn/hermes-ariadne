@@ -8,6 +8,14 @@ version = "0.1.0"
 description = "Passive, versioned verbatim archive ContextEngine for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.11"
+authors = [{ name = "Whayn" }]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+
+[project.urls]
+Repository = "https://github.com/whayn/hermes-ariadne"
+Issues = "https://github.com/whayn/hermes-ariadne/issues"
+Contributing = "https://github.com/whayn/hermes-ariadne/blob/main/CONTRIBUTING.md"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "build>=1", "ruff>=0.9"]
