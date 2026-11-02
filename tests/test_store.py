@@ -66,7 +66,14 @@ def test_concurrent_initializers_of_nonexistent_database(tmp_path):
 
             def initialize(_):
                 start.wait(timeout=10)
-                return EventStore(path).ingest("s", [message], origin="hook")["inserted"]
+                try:
+                    return EventStore(path).ingest("s", [message], origin="hook")["inserted"]
+                except sqlite3.OperationalError as exc:
+                    exc.add_note(
+                        f"SQLite {sqlite3.sqlite_version}, round {round_number}: "
+                        f"{exc.sqlite_errorname} ({exc.sqlite_errorcode})"
+                    )
+                    raise
 
             assert sum(workers.map(initialize, range(8))) == 1
             assert EventStore(path).search("fresh", session_id="s")[0]["message"] == message
