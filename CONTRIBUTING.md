@@ -89,7 +89,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt -e .
 .venv/bin/ruff check src tests
 .venv/bin/ruff format --check src tests
-.venv/bin/python -m pytest tests/test_store.py tests/test_crash.py -q
+.venv/bin/python -m pytest tests/test_store.py tests/test_crash.py tests/test_simulation.py -q
 .venv/bin/python -m build
 git diff --check
 ```
@@ -107,7 +107,7 @@ Tests must redirect `HERMES_HOME` before importing Hermes. Use the caller's scra
 they are not proof of actual model recall. Add a regression test for a bug and,
 where practical, demonstrate that it fails on the base revision and passes on the fix.
 
-Hosted CI runs lint/format/build, archive tests on Python 3.11 and 3.14, a full
+Hosted CI runs lint/format/build, archive/simulator tests on Python 3.11 and 3.14, a full
 integration suite against a **pinned real Hermes revision**, and a history secret
 scan. The host pin is in `.github/workflows/ci.yml`; one pinned revision is not a
 claim of compatibility with all Hermes releases or providers. Hosted runners are
@@ -134,6 +134,14 @@ a draft, and disclose missing verification. A draft is not a promise of acceptan
   and review threads must be resolved. No minimum approval count is imposed while
   this is a solo-maintainer project; that avoids requiring an impossible self-review.
 - After initial repository bootstrap, normal maintainer changes also use PRs.
+
+For substantive code PRs, request a Codex review with a PR comment containing
+`@codex review`, when the repository's Codex cloud integration is available.
+Repository-specific rules live in the root `AGENTS.md` under Code Review Rules.
+A request or reaction is not a completed review: inspect the actual bot review,
+triage findings and request re-review after substantive fixes. Codex review
+complements tests and maintainer judgment; it does not certify correctness or
+replace the existing CI gate. Do not claim it ran if setup/authorization is missing.
 
 ## Issues and triage
 

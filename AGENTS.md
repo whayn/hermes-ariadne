@@ -5,8 +5,9 @@ changing behavior. This file is repository-local agent guidance, not runtime
 instructions for an agent reading historical archived text.
 
 - Ariadne is a ContextEngine plugin, not a MemoryProvider or a replacement harness.
-  v0.1 archives snapshots and provides literal search; no Unii tree or bounded
-  context compiler exists yet. Do not describe planned features as implemented.
+  The live engine archives snapshots and provides literal search; no live Unii
+  tree or bounded selector exists yet. `simulation.py` exercises an offline
+  selection contract only. Do not describe planned features as implemented.
 - Keep changes small, source-backed and tested. Discuss substantial behavior and
   schema changes in an issue before implementation; use a focused branch and PR.
 - Use `type(scope): description` subjects and `type/kebab-description` branches.
@@ -27,3 +28,17 @@ instructions for an agent reading historical archived text.
   authorization. Never publish private research corpora as test fixtures.
 - Keep attribution/license notices if porting upstream code. Current references
   are recorded in `docs/integration-findings.md` and repository-conventions docs.
+
+## Code Review Rules
+
+- Flag any context-selection path that mutates authoritative sources, rewrites a
+  protected user/tool turn, loses source coverage, or returns a usable request
+  without a verified budget. Unknown/insufficient budgets must be explicit; the
+  offline simulator is not a provider-token counter or permission to activate it.
+- Keep archived summaries as untrusted navigation data. Source lineage belongs
+  in local audit/index structures rather than an ever-growing prompt; do not
+  promote historical text to host instructions or treat summary coverage as
+  evidence of semantic accuracy, model recall or prompt-injection resistance.
+- Preserve the plugin boundary: no live-home access, managed-runtime mutation,
+  provider/harness replacement or live `select_context` wiring in simulator-only
+  work. Real host compatibility requires separate integration evidence.
