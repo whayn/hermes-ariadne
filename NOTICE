@@ -1,0 +1,13 @@
+Hermes Ariadne
+
+Portions of src/hermes_ariadne/tree.py and the tree reference fixtures are
+adapted from UniiChat, Memory.ts:
+https://github.com/VictorTaelin/uniichat/tree/0500bf6a8ea4bf0ce047488562022b1b6532cc30
+
+Copyright 2026 Higher Order Company
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The Ariadne port changes the implementation language to Python, uses immutable
+values and archive-scoped source references, and excludes UniiChat's UI, provider
+clients, worker pool and filesystem layout. Its fixture generator executes the
+pinned upstream pure functions; it is not the full UniiChat application.

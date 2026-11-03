@@ -161,6 +161,29 @@ class EventStore:
                 )
         return {"inserted": inserted, "skipped": skipped}
 
+    def get_event(self, event_id, *, session_id):
+        """Read an exact archived version only within an explicitly selected session."""
+        if (
+            not isinstance(event_id, str)
+            or len(event_id) != 64
+            or any(char not in "0123456789abcdef" for char in event_id)
+        ):
+            raise ValueError("event_id must be a canonical lowercase SHA-256 identity")
+        if not isinstance(session_id, str):
+            raise ValueError("session_id must be explicit")
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM events e WHERE e.event_id = ? AND EXISTS "
+                "(SELECT 1 FROM observations o WHERE o.event_id=e.event_id AND o.session_id=?)",
+                (event_id, session_id),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = row["payload_json"]
+        if hashlib.sha256(payload).hexdigest() != event_id:
+            raise ValueError("archived event payload does not match its identity")
+        return json.loads(payload.decode("utf-8", "surrogatepass"))
+
     def search(self, query, *, session_id, limit=20, offset=0):
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("limit must be an integer between 1 and 100")

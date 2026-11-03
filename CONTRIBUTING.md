@@ -2,8 +2,8 @@
 
 Ariadne is a small, experimental Hermes **ContextEngine plugin**. Correctness,
 archive integrity and reviewable changes come before feature count. Read the
-[README](README.md) for shipped behavior; the UniiChat-inspired memory engine is
-not implemented yet.
+[README](README.md) for shipped behavior. The installed engine remains passive;
+the UniiChat-inspired kernel is an offline development module, not live compaction.
 
 ## Before starting
 
@@ -89,7 +89,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt -e .
 .venv/bin/ruff check src tests
 .venv/bin/ruff format --check src tests
-.venv/bin/python -m pytest tests/test_store.py tests/test_crash.py tests/test_simulation.py -q
+.venv/bin/python -m pytest tests/test_store.py tests/test_crash.py tests/test_simulation.py tests/test_tree.py tests/test_kernel.py tests/test_kernel_demo.py -q
 .venv/bin/python -m build
 git diff --check
 ```
@@ -107,7 +107,7 @@ Tests must redirect `HERMES_HOME` before importing Hermes. Use the caller's scra
 they are not proof of actual model recall. Add a regression test for a bug and,
 where practical, demonstrate that it fails on the base revision and passes on the fix.
 
-Hosted CI runs lint/format/build, archive/simulator tests on Python 3.11 and 3.14, a full
+Hosted CI runs lint/format/build, archive/simulator/kernel tests on Python 3.11 and 3.14, a full
 integration suite against a **pinned real Hermes revision**, and a history secret
 scan. The host pin is in `.github/workflows/ci.yml`; one pinned revision is not a
 claim of compatibility with all Hermes releases or providers. Hosted runners are
@@ -166,7 +166,8 @@ not planned, or superseded. Do not silently bury follow-up work in PR comments.
 
 Contributions are under [Apache-2.0](LICENSE), without a separate CLA. Retain any
 upstream copyright, license and NOTICE obligations when code is actually ported.
-At present the UniiChat algorithm is a reference, not an implemented port.
+The offline pure tree/view module is ported from the pinned UniiChat source;
+retain its notices in source and distribution artifacts (see NOTICE).
 
 Keep `main` installable as an experimental development milestone. Version tags
 use `vMAJOR.MINOR.PATCH`; unstable public releases must be marked as prereleases
