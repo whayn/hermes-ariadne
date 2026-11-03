@@ -32,8 +32,9 @@ See [inspected contracts and architecture](docs/integration-findings.md).
 
 Maintained by [Whayn](https://github.com/whayn), under [Apache-2.0](LICENSE).
 The long-term direction is a UniiChat-inspired memory/context engine **inside
-Hermes**, but this public development milestone implements only the archival
-foundation described above. There is no stable release or PyPI publication.
+Hermes**. The installed runtime implements the archival foundation described
+above; a separate offline tree/view/zoom kernel is available for development.
+There is no stable release or PyPI publication.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) for commit/branch naming, PRs, issue triage,
 verification and release policy. [AGENTS.md](AGENTS.md) carries repository-local
@@ -44,7 +45,8 @@ life-chat transcripts or memory archives.
 Repository conventions draw on Hermes Agent, T3 Code and hermes-lcm; the pinned
 references and deliberate differences are recorded in
 [repository-conventions.md](docs/repository-conventions.md). UniiChat remains the
-memory-algorithm reference; no UniiChat source has been ported in v0.1.
+memory-algorithm reference; the offline pure tree/view port is attributed in
+[NOTICE](NOTICE). It is not wired into the installed runtime.
 
 ## Installation (isolated home first)
 
@@ -203,9 +205,9 @@ main DB while WAL writes are active). No backup/export/migration CLI is shipped.
   External attachment bytes are not copied; exact references are not durable media.
 - Full session rescans and literal scans are intentionally simple and may become
   expensive with large histories. No cursor optimization, FTS index or derived
-  index rebuild command yet. Summary trees/indexes will be separate rebuildable
-  projections over these authoritative snapshots, not replacements for them.
-- There is no current-version projection or revision chronology API. Results are
+  index rebuild command yet. The offline summary tree is a separate rebuildable
+  projection over these authoritative snapshots, not a replacement for them.
+- There is no automatic current-version resolver or revision chronology API. Results are
   ordered by observed position and snapshot id, not by edit time. The archive
   retains versions but does not infer an edit sequence from timestamps.
 - The tested path is the in-process directory loader and local chat-completions
@@ -228,7 +230,28 @@ measurement is canonical ASCII-JSON bytes, **not provider tokens**, and it neith
 creates summaries nor implements UniiChat's tree/view algorithm. The warning at
 the top of this README remains in force: live context is still not compacted.
 
-**Next smallest milestone:** a faithful pure tree/view implementation checked
-against the simulator invariants and deterministic summary fixtures. Keep live
-`select_context` inherited until the algorithm and real host/provider boundary
-are tested; summarization and proactive retrieval remain separate stages.
+## Offline memory kernel (development only)
+
+The [archive-backed tree/view/zoom kernel](docs/offline-memory-kernel.md) now connects
+an explicitly selected source projection to persisted hierarchical summaries,
+a bounded view and paged exact-source retrieval. Its pure tree/view algorithm is
+ported from a pinned UniiChat revision and checked against executable reference
+fixtures. It is not copied by the runtime installer or called by the live engine.
+
+Run the two-process synthetic demonstration in a NEW scratch directory:
+
+```bash
+.venv/bin/python -m hermes_ariadne.demo "$TMPDIR/ariadne-kernel-demo" --phase build
+.venv/bin/python -m hermes_ariadne.demo "$TMPDIR/ariadne-kernel-demo" --phase recall
+.venv/bin/python -m pytest tests/test_tree.py tests/test_kernel.py tests/test_kernel_demo.py -q
+```
+
+The deterministic topic-label provider is a fixture, **not a real AI compactor
+or recall evaluation**. The second process navigates persisted summaries and
+recovers old code from the archive, without re-ingestion or source regeneration.
+See the kernel document for byte accounting, exact page codec, source scoping,
+single-writer/checkpoint limitations and what was deliberately not ported.
+
+**Next milestone:** a real, measured compactor using Hermes model routing, then
+isolated live selection/zoom integration. Keep live `select_context` inherited
+until the host/provider boundary is tested. Proactive recall remains a later stage.
