@@ -252,6 +252,30 @@ recovers old code from the archive, without re-ingestion or source regeneration.
 See the kernel document for byte accounting, exact page codec, source scoping,
 single-writer/checkpoint limitations and what was deliberately not ported.
 
-**Next milestone:** a real, measured compactor using Hermes model routing, then
-isolated live selection/zoom integration. Keep live `select_context` inherited
-until the host/provider boundary is tested. Proactive recall remains a later stage.
+## Native offline compactor (development only)
+
+The [native compactor and durable receipt ledger](docs/native-compaction.md) add
+an opt-in model-backed path over that kernel, including bounded chunk/reduce work
+and checkpoint recovery without paying again for completed summaries.
+
+It is deliberately restricted to a dedicated sequential worker and inspected
+native SDK/adapter versions. It is **not live `ctx.llm`/`select_context`
+integration**, and unsupported routes fail closed. Exact request-body/attempt
+bounds, rough token estimates, missing usage and Codex's explicit uncapped-output
+exception are separate concepts; see the contract before making paid calls.
+
+```bash
+.venv/bin/python -m pytest tests/test_receipts.py tests/test_compaction.py -q
+# Scripted loopback native transport; no actual provider/credentials:
+HERMES_SOURCE=/path/to/hermes HERMES_PYTHON=/path/to/hermes/.venv/bin/python \
+  bash scripts/test.sh tests/test_native_compactor.py tests/test_compaction_transport.py -q
+```
+
+The real-model demo requires explicit `--allow-model-calls`; do not run it as a
+free test or point it at private history. Receipt-only rebuild never dispatches.
+No compaction module is copied by the runtime installer or called by the live
+engine. The warning at the top of this README still applies.
+
+**Next milestone:** a host-compatible strict-dispatch/live selection/zoom
+integration in an isolated development agent. Proactive and cross-session recall
+remain later stages; no default-profile activation is part of this milestone.

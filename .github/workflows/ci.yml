@@ -58,7 +58,8 @@ jobs:
           TMPDIR: ${{ runner.temp }}
         run: >-
           python -m pytest tests/test_store.py tests/test_crash.py tests/test_simulation.py
-          tests/test_tree.py tests/test_kernel.py tests/test_kernel_demo.py -q
+          tests/test_tree.py tests/test_kernel.py tests/test_kernel_demo.py
+          tests/test_receipts.py tests/test_compaction.py -q
 
   hermes:
     name: Hermes integration
