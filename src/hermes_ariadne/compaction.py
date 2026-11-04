@@ -71,6 +71,8 @@ def messages_for(plan, text, *, kind, span):
 
 
 def request_fits(messages, *, policy, model, output_tokens, estimate_tokens=None):
+    if output_tokens is not None and (type(output_tokens) is not int or output_tokens <= 0):
+        raise ValueError("output token cap must be positive or explicitly absent")
     payload = {"model": model, "messages": messages}
     if output_tokens is not None:
         payload["max_tokens"] = output_tokens
@@ -81,7 +83,11 @@ def request_fits(messages, *, policy, model, output_tokens, estimate_tokens=None
         estimate = estimate_tokens(messages)
         if type(estimate) is not int or estimate < 0:
             raise ValueError("native token estimate must be a nonnegative integer")
-        if estimate + policy.output_reserve_tokens > policy.context_limit_tokens:
+        # An explicit cap must fit; uncapped Codex keeps only the planning reserve.
+        reserve = policy.output_reserve_tokens
+        if output_tokens is not None:
+            reserve = max(reserve, output_tokens)
+        if estimate + reserve > policy.context_limit_tokens:
             return False
     return True
 

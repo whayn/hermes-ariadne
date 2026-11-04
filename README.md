@@ -271,8 +271,9 @@ HERMES_SOURCE=/path/to/hermes HERMES_PYTHON=/path/to/hermes/.venv/bin/python \
   bash scripts/test.sh tests/test_native_compactor.py tests/test_compaction_transport.py -q
 ```
 
-The real-model demo requires explicit `--allow-model-calls`; do not run it as a
-free test or point it at private history. Receipt-only rebuild never dispatches.
+The real-model demo requires explicit `--allow-model-calls` and `--hermes-home`
+selection of a dedicated development profile; it never inherits the live home.
+Do not run it as a free test or point it at private history. Receipt-only rebuild never dispatches.
 No compaction module is copied by the runtime installer or called by the live
 engine. The warning at the top of this README still applies.
 

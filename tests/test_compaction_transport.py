@@ -58,9 +58,11 @@ def test_native_compaction_and_receipt_only_rebuild_across_processes(tmp_path):
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    home = tmp_path / "isolated-home"
-    home.mkdir()
-    (home / "config.yaml").write_text(
+    root = tmp_path / "isolated-root"
+    home = root / "profiles" / "fixture-dev"
+    home.mkdir(parents=True)
+    config = home / "config.yaml"
+    config.write_text(
         "auxiliary:\n  compression:\n    provider: custom\n    model: fixture\n"
         f"    base_url: http://127.0.0.1:{server.server_port}/v1\n"
         "    api_key: synthetic-fixture-key\n"
@@ -71,8 +73,12 @@ def test_native_compaction_and_receipt_only_rebuild_across_processes(tmp_path):
         if key in os.environ
     }
     env.update(
-        HOME=str(home),
-        HERMES_HOME=str(home),
+        HOME=str(root),
+        HERMES_HOME=str(root),
+        HERMES_CONFIG=str(root / "config.yaml"),
+        HERMES_ENV=str(root / ".env"),
+        HERMES_PROFILE="default",
+        HERMES_ACTIVE_PROFILE="default",
         HERMES_SOURCE=host,
         PYTHONPATH=os.pathsep.join(
             [str(Path("src").resolve()), host, os.environ.get("PYTHONPATH", "")]
@@ -82,17 +88,50 @@ def test_native_compaction_and_receipt_only_rebuild_across_processes(tmp_path):
         PYTHONNOUSERSITE="1",
     )
 
+    # The CLI/factory/SDK remain real. These tripwires only observe selection and
+    # prevent accidental external traffic or any host import during offline replay.
+    child = """
+import builtins, os, runpy, socket, sys
+selected = sys.argv.pop(1)
+rebuilding = sys.argv[sys.argv.index('--phase') + 1] == 'rebuild'
+original_import = builtins.__import__
+def checked_import(name, *args, **kwargs):
+    if name.split('.')[0] in {
+        'agent', 'hermes_cli', 'hermes_constants', 'openai', 'httpx', 'native_compactor'
+    }:
+        assert not rebuilding, 'receipt-only rebuild imported host/native code'
+        assert os.environ['HOME'] == os.environ['HERMES_HOME'] == selected
+        assert not any(key in os.environ for key in (
+            'HERMES_CONFIG', 'HERMES_ENV', 'HERMES_PROFILE', 'HERMES_ACTIVE_PROFILE'
+        ))
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = checked_import
+original_connect = socket.socket.connect
+def loopback_connect(sock, address):
+    assert isinstance(address, tuple) and address[0] in {'127.0.0.1', '::1'}
+    return original_connect(sock, address)
+socket.socket.connect = loopback_connect
+original_resolve = socket.getaddrinfo
+def loopback_resolve(host, *args, **kwargs):
+    assert host in {'127.0.0.1', '::1', 'localhost'}, 'non-loopback DNS forbidden'
+    return original_resolve(host, *args, **kwargs)
+socket.getaddrinfo = loopback_resolve
+runpy.run_module('hermes_ariadne.compactor_demo', run_name='__main__')
+"""
+    before = config.read_bytes()
+
     def run(phase):
         command = [
             sys.executable,
-            "-m",
-            "hermes_ariadne.compactor_demo",
+            "-c",
+            child,
+            str(home),
             str(tmp_path / "case"),
             "--phase",
             phase,
         ]
         if phase == "build":
-            command.append("--allow-model-calls")
+            command += ["--allow-model-calls", "--hermes-home", str(home)]
         result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60)
         assert result.returncode == 0, result.stderr + result.stdout
         return json.loads(result.stdout.strip().splitlines()[-1])
@@ -107,6 +146,9 @@ def test_native_compaction_and_receipt_only_rebuild_across_processes(tmp_path):
         assert rebuilt["exact_source_recovered"]
         assert rebuilt["model_dispatches"] == 0
         assert len(requests) == 3
+        assert config.read_bytes() == before
+        assert not (home / "auth.json").exists()
+        assert not (home / ".env").exists()
         assert not errors
     finally:
         server.shutdown()

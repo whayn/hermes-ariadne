@@ -167,6 +167,10 @@ quality, provider caching, live compaction or production-scale performance.
 
 Executed on 2026-11-03 against the installed native source and the built wheel.
 The active ContextEngine was not switched; no personal corpus was imported.
+This historical run preceded the explicit development-profile guard and used the
+then-selected existing profile. It does **not** certify the later profile boundary.
+At follow-up publication, the new dedicated-profile model run remained pending;
+subsequent evidence belongs on [PR #9](https://github.com/whayn/hermes-ariadne/pull/9).
 
 ```text
 HERMES_SOURCE=/opt/hermes HERMES_PYTHON=/opt/hermes/.venv/bin/python \

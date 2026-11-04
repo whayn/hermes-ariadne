@@ -52,6 +52,31 @@ def _adapter(task, provider, model, allow_unbounded):
         return NativeCompactorAdapter.from_hermes(**kwargs)
 
 
+def _development_home(value):
+    """Validate an existing named development profile without importing Hermes.
+
+    This is an explicit-selection guard, not an OS sandbox. Configuration stays
+    host-owned; profile creation and credential copying are never performed here.
+    """
+    error = "--hermes-home must select an existing development profile at ROOT/profiles/NAME-dev"
+    try:
+        home = Path(value).expanduser().resolve(strict=True)
+        config = home / "config.yaml"
+        if (
+            not home.is_dir()
+            or home.parent.name != "profiles"
+            or not {"dev", "development"}.intersection(
+                home.name.lower().replace("_", "-").split("-")
+            )
+            or not config.is_file()
+            or config.is_symlink()
+        ):
+            raise ValueError(error)
+    except (OSError, RuntimeError, TypeError) as exc:
+        raise ValueError(error) from exc
+    return home
+
+
 def build(
     directory,
     *,
@@ -60,9 +85,24 @@ def build(
     task="compression",
     provider=None,
     model=None,
+    hermes_home=None,
 ):
+    """Build only in a fresh sequential process, before any Hermes host imports.
+
+    ``hermes_home`` is mandatory explicit selection, never an environment fallback.
+    The selected environment remains bound for this worker's lifetime. Hermes owns
+    native profile reads and normal shared/global authentication; this is not a
+    sandbox or a promise of independently isolated provider accounts.
+    """
+    if hermes_home is None:
+        raise ValueError("build requires an explicit --hermes-home development profile")
+    hermes_home = _development_home(hermes_home)
     if not allow_model_calls:
         raise ValueError("model dispatch requires explicit --allow-model-calls")
+    # Own this fresh sequential worker's environment BEFORE any host imports.
+    os.environ["HOME"] = os.environ["HERMES_HOME"] = str(hermes_home)
+    for key in ("HERMES_CONFIG", "HERMES_ENV", "HERMES_PROFILE", "HERMES_ACTIVE_PROFILE"):
+        os.environ.pop(key, None)
     directory.mkdir(mode=0o700, parents=True, exist_ok=False)
     code = "def NEEDLE(value):\n    # λ; retain indentation and trailing whitespace\n    return value + 1  \n"
     code += "    # archived code comment; exact whitespace matters  \n" * 15
@@ -218,6 +258,11 @@ def main():
     parser.add_argument("directory", type=Path, help="NEW synthetic demo directory for build")
     parser.add_argument("--phase", choices=("build", "rebuild"), required=True)
     parser.add_argument("--allow-model-calls", action="store_true")
+    parser.add_argument(
+        "--hermes-home",
+        type=Path,
+        help="build only: existing dedicated ROOT/profiles/NAME-dev with config.yaml; no default",
+    )
     parser.add_argument("--allow-unbounded-codex-output", action="store_true")
     parser.add_argument("--task", default="compression")
     parser.add_argument("--provider")
@@ -226,6 +271,7 @@ def main():
     result = (
         build(
             args.directory,
+            hermes_home=args.hermes_home,
             allow_model_calls=args.allow_model_calls,
             allow_unbounded=args.allow_unbounded_codex_output,
             task=args.task,

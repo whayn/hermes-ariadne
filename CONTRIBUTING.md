@@ -89,7 +89,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt -e .
 .venv/bin/ruff check src tests
 .venv/bin/ruff format --check src tests
-.venv/bin/python -m pytest tests/test_store.py tests/test_crash.py tests/test_simulation.py tests/test_tree.py tests/test_kernel.py tests/test_kernel_demo.py tests/test_receipts.py tests/test_compaction.py -q
+.venv/bin/python -m pytest tests/test_store.py tests/test_crash.py tests/test_simulation.py tests/test_tree.py tests/test_kernel.py tests/test_kernel_demo.py tests/test_receipts.py tests/test_compaction.py tests/test_compactor_profile.py tests/test_host_site.py -q
 .venv/bin/python -m build
 git diff --check
 ```

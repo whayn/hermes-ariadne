@@ -42,8 +42,10 @@ This lower-level lane does not provide the full `ctx.llm` trust/audit surface.
 - The planner predicts full ASCII-JSON requests plus a framing margin. The wire
   guard independently checks actual serialization; prediction is not wire proof.
 - Hermes's native token counter is a **rough full-prompt estimate**, checked
-  against an explicit configured planning window/reserve. It is neither exact
-  provider tokenization nor a monetary ceiling.
+  against an explicit configured planning window. Capped requests reserve at least
+  `max(configured reserve, output-token cap)`; explicitly uncapped requests retain
+  only the configured planning reserve. This is neither exact provider
+  tokenization nor a monetary ceiling.
 - Chat routes require an output-token cap. Codex's endpoint rejects that field:
   it requires both `max_output_tokens=None` and explicit unbounded-output consent.
   Short-summary instructions are not a hard token ceiling. The demo's Codex
@@ -142,28 +144,53 @@ additional HTTP requests. Keep full-suite/CI verification separate from unit cou
 
 ## Explicitly authorized synthetic real-model demo
 
-The demo can spend provider quota. Use a **NEW scratch directory** and the active
-profile's native model/auth configuration read-only. It does not install a plugin,
-activate Ariadne, edit configuration or upload private history. Do not point it at
-a life-chat corpus; the source records are fixed synthetic code/garden text.
+The demo can spend provider quota. Use a **NEW scratch output directory** and an
+explicitly selected, dedicated development Hermes profile, never the inherited
+live/default home. Prepare/authenticate that profile through Hermes's normal
+mechanisms; do not copy credentials into the demo. Shared native authentication
+may still be used/refreshed by Hermes. Profile separation is not an OS sandbox.
+The demo does not install a plugin, activate Ariadne, edit profile configuration
+or import conversation history. Its records are fixed synthetic code/garden text.
 
 ```bash
 export HERMES_SOURCE=/path/to/hermes
 export HERMES_PYTHON=/path/to/hermes/.venv/bin/python
-# HERMES_HOME selects the profile whose native model/auth configuration is used.
+# Select a dedicated, authenticated named development profile explicitly.
+# Inherited HERMES_HOME is never accepted for build; no default-profile fallback.
+export ARIADNE_DEV_HOME=/path/to/hermes-home/profiles/ariadne-dev
 
 # Chat-Completions-compatible configured compression route, with cap:
 bash scripts/compactor-demo.sh "$TMPDIR/ariadne-native-demo" \
-  --phase build --allow-model-calls
+  --phase build --hermes-home "$ARIADNE_DEV_HOME" --allow-model-calls
 
 # OR explicit Codex route, ONLY with separately authorized uncapped output:
 bash scripts/compactor-demo.sh "$TMPDIR/ariadne-native-codex" \
-  --phase build --allow-model-calls --allow-unbounded-codex-output \
+  --phase build --hermes-home "$ARIADNE_DEV_HOME" --allow-model-calls --allow-unbounded-codex-output \
   --provider openai-codex --model YOUR_CONFIGURED_CODEX_MODEL
 
 # New process, fresh derived state, saved receipts; no host auth/model/network:
 bash scripts/compactor-demo.sh "$TMPDIR/ariadne-native-codex" --phase rebuild
 ```
+
+Build requires `--hermes-home PATH` (or API `build(..., hermes_home=PATH)`). The
+canonical existing path must be `ROOT/profiles/NAME`, with a separate `dev` or
+`development` token in its name (hyphens/underscores delimit tokens), and a regular,
+non-symlink `config.yaml`. Missing/default/non-development selections and aliases
+resolving outside an acceptable canonical development profile fail before native
+imports or output creation; aliases to acceptable canonical profiles are allowed.
+The fresh worker binds HOME/HERMES_HOME
+and removes inherited config/env/profile overrides. The launcher disables Python
+site/.pth startup before selection. This is an operator-selected development
+boundary, not proof that arbitrary plugins or profile contents are harmless.
+Receipt-only rebuilding needs no selected profile.
+
+If the managed runtime uses a different SDK pair, do **not** downgrade it. Create
+a disposable compatibility venv with OpenAI 2.24.0/httpx 0.28.1, select its Python
+as `HERMES_PYTHON`, and append the managed dependency site-packages read-only via
+caller `PYTHONPATH`; the wrapper places the selected compatibility site first.
+[CI compatibility](native-ci-compatibility.md) records the same deliberate test
+override and the separately tested pristine Hermes baseline. SDK and profile
+isolation are separate requirements.
 
 Each demo campaign allows at most **3 physical model requests**, **8,000 body
 bytes per request**, and a fixed total request-byte reservation. Failed requests

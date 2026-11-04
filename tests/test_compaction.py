@@ -13,6 +13,60 @@ def request(text, *, limit=96):
     return SummaryRequest(Part(0, 2), (text,), (Part(1, 0),), ("0+2|past project",), 2, limit)
 
 
+def test_request_fits_reserves_requested_output_cap():
+    from hermes_ariadne.compaction import CompactionPolicy, request_fits
+
+    assert not request_fits(
+        [{"role": "user", "content": "source"}],
+        policy=CompactionPolicy(context_limit_tokens=1024, output_reserve_tokens=1),
+        model="fixture",
+        output_tokens=512,
+        estimate_tokens=lambda messages: 1023,
+    )
+
+
+@pytest.mark.parametrize(
+    ("reserve", "cap", "estimate", "fits"),
+    [
+        (1, 512, 512, True),  # Requested cap fits exactly, not just the smaller reserve.
+        (1, 512, 513, False),
+        (768, 512, 256, True),  # A larger configured reserve must still be honored.
+        (768, 512, 257, False),
+        (1, None, 1023, True),  # Explicitly uncapped Codex retains the rough reserve.
+        (1, None, 1024, False),
+        (512, None, 512, True),
+        (512, None, 513, False),
+    ],
+)
+def test_request_fits_effective_reserve_boundaries(reserve, cap, estimate, fits):
+    from hermes_ariadne.compaction import CompactionPolicy, request_fits
+
+    assert (
+        request_fits(
+            [{"role": "user", "content": "source"}],
+            policy=CompactionPolicy(context_limit_tokens=1024, output_reserve_tokens=reserve),
+            model="fixture",
+            output_tokens=cap,
+            estimate_tokens=lambda messages: estimate,
+        )
+        is fits
+    )
+
+
+@pytest.mark.parametrize("cap", [True, False, 0, -1, 1.5, "512"])
+def test_request_fits_rejects_invalid_output_caps(cap):
+    from hermes_ariadne.compaction import CompactionPolicy, request_fits
+
+    with pytest.raises(ValueError, match="output token cap"):
+        request_fits(
+            [{"role": "user", "content": "source"}],
+            policy=CompactionPolicy(context_limit_tokens=1024),
+            model="fixture",
+            output_tokens=cap,
+            estimate_tokens=lambda messages: 1,
+        )
+
+
 def test_plan_covers_whole_escaped_unicode_input_with_bounded_requests():
     from hermes_ariadne.compaction import (
         CompactionPolicy,
@@ -129,6 +183,72 @@ def kernel_and_limits(tmp_path, count=2):
         "max_jobs": 128,
     }
     return kernel, limits
+
+
+def test_output_cap_forces_token_bounded_chunks_before_reservation(tmp_path):
+    from hermes_ariadne.compaction import (
+        CompactionPolicy,
+        DurableCompactor,
+        make_plan,
+        messages_for,
+        serialize_inputs,
+    )
+
+    kernel, limits = kernel_and_limits(tmp_path, count=1)
+    req = SummaryRequest(Part(0, 0), (kernel.source_input(0),), (), (), 0, kernel.node_bytes)
+    source = serialize_inputs(req.inputs)
+    whole_plan = make_plan(
+        req, policy=CompactionPolicy(context_limit_tokens=8192), model="scripted", output_tokens=512
+    )
+    whole_messages = messages_for(whole_plan, source, kind="chunk", span=whole_plan["spans"][0])
+    estimate = ScriptedAdapter().estimate_tokens(whole_messages)
+    policy = CompactionPolicy(context_limit_tokens=estimate + 1, output_reserve_tokens=1)
+
+    class CappedAdapter(ScriptedAdapter):
+        output_tokens = 512
+
+        def dispatch(self, messages, *, before_send):
+            # Check BEFORE the fixture invokes the durable reservation callback.
+            assert (
+                self.estimate_tokens(messages) + self.output_tokens <= policy.context_limit_tokens
+            )
+            return super().dispatch(messages, before_send=before_send)
+
+    adapter = CappedAdapter()
+    with DurableCompactor(
+        kernel, adapter, tmp_path / "capped-chunks.sqlite", policy=policy, limits=limits
+    ) as runner:
+        assert runner.build()["pending"] == 0
+        plan = runner.ledger.get_plan("node:0+1")
+        assert plan is not None
+        assert len(plan["spans"]) > 1
+        assert "".join(source[s["start"] : s["stop"]] for s in plan["spans"]) == source
+        assert adapter.calls > len(plan["spans"])  # Bounded reductions also dispatched.
+        assert runner.ledger.report()["attempts"] == adapter.calls
+
+
+def test_output_cap_blocks_unplannable_request_without_durable_reservation(tmp_path):
+    from hermes_ariadne.compaction import CompactionPolicy, DurableCompactor
+
+    class NoRoomAdapter(ScriptedAdapter):
+        output_tokens = 512
+
+        def estimate_tokens(self, messages):
+            return 1023
+
+    kernel, limits = kernel_and_limits(tmp_path, count=1)
+    adapter = NoRoomAdapter()
+    policy = CompactionPolicy(context_limit_tokens=1024, output_reserve_tokens=1)
+    with DurableCompactor(
+        kernel, adapter, tmp_path / "no-room.sqlite", policy=policy, limits=limits
+    ) as runner:
+        assert runner.build()["pending"] == 1
+        assert adapter.calls == 0
+        assert runner.ledger.get_plan("node:0+1") is None
+        report = runner.ledger.report()
+        assert report["attempts"] == 0
+        assert report["reserved_request_bytes"] == 0
+        assert "cannot fit" in runner.status()["blocked"]["node:0+1"]
 
 
 def test_receipts_rebuild_lost_kernel_checkpoint_without_new_dispatches(tmp_path):
