@@ -58,7 +58,9 @@ jobs:
           TMPDIR: ${{ runner.temp }}
         run: >-
           python -m pytest tests/test_store.py tests/test_crash.py tests/test_simulation.py
-          tests/test_tree.py tests/test_kernel.py tests/test_kernel_demo.py -q
+          tests/test_tree.py tests/test_kernel.py tests/test_kernel_demo.py
+          tests/test_receipts.py tests/test_compaction.py tests/test_compactor_profile.py
+          tests/test_host_site.py -q
 
   hermes:
     name: Hermes integration
@@ -88,7 +90,33 @@ jobs:
           HERMES_HOME: ${{ runner.temp }}/hermes-build-home
           TMPDIR: ${{ runner.temp }}
         run: python -m pm.build_env --source "$PWD" --out "$RUNNER_TEMP/hermes-python" --ci
-      - name: Run the full suite with real Hermes and a loopback provider fixture
+      - name: Test baseline Engine integration with pristine PM dependencies
+        env:
+          HERMES_SOURCE: ${{ github.workspace }}/.ci/hermes
+          HERMES_PYTHON: ${{ runner.temp }}/hermes-python/bin/python
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          "$HERMES_PYTHON" -c 'import openai, httpx; print("PM baseline:", "openai=" + openai.__version__, "httpx=" + httpx.__version__)'
+          bash scripts/test.sh tests/test_engine.py tests/test_host_contract.py tests/test_restart.py tests/test_install.py -q
+      - name: Align disposable CI host with source-validated native SDK versions
+        env:
+          HERMES_PYTHON: ${{ runner.temp }}/hermes-python/bin/python
+        run: |
+          echo "CI-only dependency override: native tests use openai==2.24.0 and httpx==0.28.1; this is NOT the pristine Hermes PM lock."
+          # Use pip from the development venv: PM's disposable venv need not contain pip.
+          .venv/bin/python -m pip --python "$HERMES_PYTHON" install openai==2.24.0 httpx==0.28.1
+          "$HERMES_PYTHON" - <<'PY'
+          from importlib.metadata import version
+          import httpx
+          import openai
+
+          for name, module, expected in (("openai", openai, "2.24.0"), ("httpx", httpx, "0.28.1")):
+              reported = module.__version__
+              installed = version(name)
+              print(f"Native CI SDK: {name} imported={reported} installed={installed}")
+              assert reported == installed == expected, f"Unexpected {name} SDK version"
+          PY
+      - name: Run ALL tests with source-validated SDKs and a loopback provider fixture
         env:
           HERMES_SOURCE: ${{ github.workspace }}/.ci/hermes
           HERMES_PYTHON: ${{ runner.temp }}/hermes-python/bin/python

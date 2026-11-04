@@ -162,3 +162,70 @@ including real Hermes integration, both safety fixes and the existing 1,000-roun
 concurrent-initializer test. Hosted CI/Codex status is recorded on the PR.
 These executions prove the synthetic offline data path, not semantic recall
 quality, provider caching, live compaction or production-scale performance.
+
+## Native offline compactor evidence (issue #8)
+
+Executed on 2026-11-03 against the installed native source and the built wheel.
+The active ContextEngine was not switched; no personal corpus was imported.
+This historical run preceded the explicit development-profile guard and used the
+then-selected existing profile. It does **not** certify the later profile boundary.
+At follow-up publication, the new dedicated-profile model run remained pending;
+subsequent evidence belongs on [PR #9](https://github.com/whayn/hermes-ariadne/pull/9).
+
+```text
+HERMES_SOURCE=/opt/hermes HERMES_PYTHON=/opt/hermes/.venv/bin/python \
+  bash scripts/test.sh -q -o faulthandler_timeout=120
+537 passed, 1 skipped in 1371.07s (0:22:51)
+```
+
+The skip is optional **HTTPX zstd response decoding** because that dependency is
+absent. Native stdlib-zstd request tests and gzip response tests ran. Ruff lint,
+format (31 files), staged whitespace, checksum-verified Gitleaks, sdist/wheel
+contents and an installed-wheel smoke check passed. Full-suite faulthandler
+snapshots during long tests were diagnostics, not assertion failures.
+
+Independent same-model spec and quality reviews reproduced and then verified
+fixes for native request compression, false EOF completion, and a live endpoint
+omitting Content-Type. These reviews are separate from GitHub Codex review;
+current hosted checks/review evidence belongs on the PR.
+
+### Actual native model campaign and recovery
+
+- Used Hermes's configured native factory/auth/HTTP transport with explicit
+  `openai-codex / gpt-6.1-sol`, SDK 2.24.0 and HTTPX 0.28.1. Actual installed
+  `auxiliary_client.py` SHA-256:
+  `053078416f2b2d94256584a5c1ed6176bfbd3f3de88a8ca858e8257274a04bb5`.
+  This differs from the historical CI pin; it is not certified by that revision.
+- The successful, separately authorized synthetic campaign committed **3 valid
+  model receipts**, built **3 nodes**, left **0 pending**, and returned usable.
+  Encoded request-body reservations: **788, 904, 902 bytes**; **2,594 total**,
+  all below the frozen 8,000-byte per-request/24,000-byte campaign bounds.
+- Provider-reported usage for those successful responses: **1,334 input tokens,
+  138 output tokens, 1,472 total**. Raw reported cache/reasoning/attribution fields
+  remain private in the receipts. No monetary or exact-token estimation claim.
+- Codex output was uncapped only under explicit operator consent; requesting
+  short summaries is not an output-token ceiling.
+- Build PID **147574** used the installed wheel, checked against staged source.
+  Separate rebuild PID **147665** started with **0 ready nodes**, rebuilt all
+  **3** from receipts, and made **0 model dispatches**. HOME/HERMES_HOME were
+  empty scratch directories, socket/DNS connections were prohibited, and no
+  `agent`, `openai` or `httpx` module was imported by recovery.
+- Generated navigation retained `NEEDLE`. Recovery reconstructed **11 canonical
+  archive pages** and verified the exact original code, including Unicode,
+  indentation and trailing spaces. Recovered code SHA-256:
+  `edde23ef6ef7b682bf35c0205a0eec8d2a0f0fa94ad74b86b76eb6c2710d78c1`.
+
+The first campaign reserved **2 requests/1,538 bytes** and remained UNCERTAIN
+without publishing summaries. One later authorized independent diagnostic
+reserved **1 request/213 bytes** and identified HTTP 200 without Content-Type as
+the compatibility refusal. Those reservations were **not refunded or reset**.
+A network-forbidden restart made zero calls and verified the originals intact.
+The operator authorized additional diagnostic/smoke requests before the diagnostic.
+Only after the header fix and repeated offline/review gates was the successful
+fresh campaign run. Across all
+three campaigns: **6 conservative reservations/4,345 encoded body bytes**.
+Unknown usage on the earlier uncertain attempts remains unknown, not zero.
+
+This proves the tiny synthetic real-model path and receipt-backed exact recovery.
+It does not establish long-horizon semantic fidelity, proactive recall,
+large-history performance, live compaction or universal provider compatibility.
