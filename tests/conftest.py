@@ -25,6 +25,11 @@ _RUNNER_PYTHONPATH = os.environ.get("PYTHONPATH")
 # Only explicitly requested host source; no default-path probing.
 source = os.environ.get("HERMES_SOURCE")
 if source:
+    # Bind the real runner-selected SDKs before host PM activation can replace
+    # sys.path. Restoring PYTHONPATH below only protects fresh child processes.
+    import httpx  # noqa: F401
+    import openai  # noqa: F401
+
     sys.path.insert(0, source)
 
 import pytest  # noqa: E402 -- isolate before any test-related imports

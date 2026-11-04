@@ -103,6 +103,61 @@ def test_test_fixtures_preserve_initial_pythonpath_between_tests(
     assert "2 passed" in result.stdout
 
 
+def test_collection_bootstrap_binds_real_runner_sdks_only_for_explicit_host(tmp_path):
+    # Run the real bootstrap before any host import, with real installed packages.
+    # The host-free run must remain SDK-free even if caller dependencies have SDKs.
+    source = os.environ.get("HERMES_SOURCE")
+    env = clean_env()
+    if "PYTHONPATH" in os.environ:
+        env["PYTHONPATH"] = os.environ["PYTHONPATH"]
+    if source:
+        env["HERMES_SOURCE"] = source
+    env.update(HOME=str(tmp_path), HERMES_HOME=str(tmp_path / "before-bootstrap"))
+    code = f"""
+import importlib.util, inspect, json, os, runpy, sys
+from pathlib import Path
+source = os.environ.get('HERMES_SOURCE')
+assert 'openai' not in sys.modules and 'httpx' not in sys.modules
+expected = {{name: importlib.util.find_spec(name).origin for name in ('openai', 'httpx')}} \\
+    if source else {{}}
+runpy.run_path({str(REPO / "tests" / "conftest.py")!r})
+assert os.environ['HERMES_HOME'] != {env["HERMES_HOME"]!r}
+assert not any(name == 'agent' or name.startswith('agent.') for name in sys.modules)
+if source:
+    for name, origin in expected.items():
+        assert name in sys.modules, f'{{name}} not bound before host imports'
+        assert sys.modules[name].__file__ == origin
+    import httpx, openai
+    from httpx._client import Client
+    from openai._client import OpenAI
+    assert httpx.Client is Client and openai.OpenAI is OpenAI
+    classes = (OpenAI, Client)
+    paths = tuple(inspect.getfile(cls) for cls in classes)
+    # This is the real host state import used by Engine, not a simulated sys.path edit.
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=Path(os.environ['HERMES_HOME']) / 'state.db')
+    db.close()
+    assert (openai.OpenAI, httpx.Client) == classes
+    assert tuple(inspect.getfile(cls) for cls in classes) == paths
+    assert all(sys.modules[name].__file__ == origin for name, origin in expected.items())
+    print(json.dumps({{name: {{'version': sys.modules[name].__version__, 'path': origin}}
+                      for name, origin in expected.items()}}))
+else:
+    assert 'openai' not in sys.modules and 'httpx' not in sys.modules
+    print('host-free bootstrap remains SDK-free')
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    print(result.stdout.strip())
+
+
 @pytest.mark.parametrize("version", [None, "3.13"])
 def test_site_disabled_discovery_uses_real_venv_without_executing_startup(tmp_path, version):
     interpreter = sys.executable if version is None else shutil.which(f"python{version}")
