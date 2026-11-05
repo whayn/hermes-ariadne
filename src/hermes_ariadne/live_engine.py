@@ -200,11 +200,12 @@ class PreparedAriadneEngine(AriadneEngine):
         with self._lock:
             super().update_model(model, context_length, base_url, api_key, provider, api_mode)
             # Source identity is model-independent, but the preceding measurement isn't.
-            self._selection = {
-                "status": "unmeasured",
-                "provider_fit_verified": False,
-                "host_fallback": "original_request_on_decline",
-            }
+            if self._prepared is not None:
+                self._selection = {
+                    "status": "unmeasured",
+                    "provider_fit_verified": False,
+                    "host_fallback": "original_request_on_decline",
+                }
 
     def select_context(
         self,

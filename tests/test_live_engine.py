@@ -672,13 +672,84 @@ def test_rebinding_same_session_to_another_db_reloads_but_checks_active_source(t
     assert select(engine, conversation, wire) is None
 
 
-def test_model_switch_invalidates_measurement_not_frozen_source(tmp_path):
+@pytest.mark.parametrize(
+    "state",
+    [
+        "constructed",
+        "reset",
+        "ended",
+        "missing_view",
+        "missing_view_declined",
+        "archive_unavailable",
+        "archive_declined",
+    ],
+)
+def test_model_update_preserves_readiness_without_prepared_view(tmp_path, monkeypatch, state):
+    engine = live_class()()
+    if state.startswith("archive"):
+        from hermes_ariadne import store
+
+        def broken(*args, **kwargs):
+            raise OSError("private archive failure")
+
+        monkeypatch.setattr(store, "EventStore", broken)
+    if state != "constructed":
+        engine.on_session_start("chosen", hermes_home=tmp_path)
+    if state == "reset":
+        engine.on_session_reset()
+    elif state == "ended":
+        engine.on_session_end("chosen", [])
+    elif state.endswith("declined"):
+        assert engine.select_context([]) is None
+
+    expected = {
+        "status": (
+            "not_initialized"
+            if state in {"constructed", "reset", "ended"}
+            else "declined"
+            if state.endswith("declined")
+            else "unavailable"
+        ),
+        "provider_fit_verified": False,
+        "host_fallback": "original_request_on_decline",
+    }
+    if state.endswith("declined"):
+        expected["reason"] = "prepared_unavailable"
+    before = engine.get_status()["selection"]
+    assert before == expected
+    scope = engine._capture()
+    assert scope.prepared is None
+    engine.model_thresholds = {"fixture": 0.5}
+
+    engine.update_model("fixture", 1000)
+
+    assert engine.get_status()["selection"] == before
+    assert engine._capture() == scope
+    assert engine.context_length == 1000
+    assert engine.threshold_percent == 0.5
+    assert engine.threshold_tokens == 500
+
+
+@pytest.mark.parametrize("initial_selection", ["ready", "selected"])
+def test_model_switch_invalidates_measurement_not_frozen_source(tmp_path, initial_selection):
     engine, _, _, conversation, wire, _ = engine_fixture(tmp_path)
-    assert select(engine, conversation, wire) is not None
+    if initial_selection == "selected":
+        assert select(engine, conversation, wire) is not None
+    assert engine.get_status()["selection"]["status"] == initial_selection
+    scope = engine._capture()
     frozen = engine._prepared
+    engine.model_thresholds = {"fixture": 0.5}
     engine.update_model("fixture", 1000, "", "", "", "")
     assert engine._prepared is frozen
-    assert engine.get_status()["selection"]["status"] == "unmeasured"
+    assert engine._capture() == scope
+    assert engine.context_length == 1000
+    assert engine.threshold_percent == 0.5
+    assert engine.threshold_tokens == 500
+    assert engine.get_status()["selection"] == {
+        "status": "unmeasured",
+        "provider_fit_verified": False,
+        "host_fallback": "original_request_on_decline",
+    }
     assert select(engine, conversation, wire, budget_tokens=1000) is None
     assert engine.get_status()["selection"]["reason"] == "over_budget"
 
