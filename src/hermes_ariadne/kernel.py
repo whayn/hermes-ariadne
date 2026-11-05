@@ -48,6 +48,44 @@ class MemoryKernel:
         compactor_high=32000,
         summary_version="manual-v1",
     ):
+        self._initialize(
+            projection,
+            path,
+            node_bytes=node_bytes,
+            chat_high=chat_high,
+            compactor_high=compactor_high,
+            summary_version=summary_version,
+        )
+        if self.path.exists():
+            self._load()
+        else:
+            self._chat = advance_view(
+                self._chat, len(projection.event_ids), self._nodes, next_message=True
+            )
+            self._save()
+
+    @classmethod
+    def from_snapshot(cls, projection, path, *, snapshot, **settings):
+        """Validate captured decoded state without reading or creating its path.
+
+        Path/archive separation and settings checks match ordinary construction.
+        Invalid snapshots raise ValueError; there is no blank-state fallback.
+        """
+        kernel = cls.__new__(cls)
+        kernel._initialize(projection, path, **settings)
+        kernel._load_snapshot(snapshot)
+        return kernel
+
+    def _initialize(
+        self,
+        projection,
+        path,
+        *,
+        node_bytes=512,
+        chat_high=128000,
+        compactor_high=32000,
+        summary_version="manual-v1",
+    ):
         for name, value in (
             ("node_bytes", node_bytes),
             ("chat_high", chat_high),
@@ -77,11 +115,6 @@ class MemoryKernel:
             for level in range(count.bit_length())
             for index in range(count // (1 << level))
         )
-        if self.path.exists():
-            self._load()
-        else:
-            self._chat = advance_view(self._chat, count, self._nodes, next_message=True)
-            self._save()
 
     @property
     def parts(self):
@@ -142,6 +175,12 @@ class MemoryKernel:
     def _load(self):
         try:
             data = json.loads(self.path.read_bytes().decode("utf-8", "surrogatepass"))
+        except UnicodeError as error:
+            raise ValueError("invalid derived state") from error
+        self._load_snapshot(data)
+
+    def _load_snapshot(self, data):
+        try:
             if (
                 data.get("format") != FORMAT
                 or type(data.get("version")) is not int

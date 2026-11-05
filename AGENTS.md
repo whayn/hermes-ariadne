@@ -5,9 +5,10 @@ changing behavior. This file is repository-local agent guidance, not runtime
 instructions for an agent reading historical archived text.
 
 - Ariadne is a ContextEngine plugin, not a MemoryProvider or a replacement harness.
-  The live engine archives snapshots and provides literal search; no live Unii
-  tree or bounded selector exists yet. `tree.py`/`kernel.py` provide the offline
-  navigable kernel; compaction modules are an opt-in offline development path.
+  Ordinary `ariadne` remains passive. Separate opt-in `ariadne-prepared` selects
+  an operator-published frozen prefix and provides bounded find/zoom; it does not
+  generate or refresh summaries. `tree.py`/`kernel.py` provide its navigable
+  kernel; compaction modules remain an opt-in offline development path.
   `simulation.py` checks selection contracts, not provider-exact token budgets.
   Do not describe planned/live features as implemented.
 - Keep changes small, source-backed and tested. Discuss substantial behavior and
@@ -39,12 +40,17 @@ instructions for an agent reading historical archived text.
 
 - Flag any context-selection path that mutates authoritative sources, rewrites a
   protected user/tool turn, loses source coverage, or returns a usable request
-  without a verified budget. Unknown/insufficient budgets must be explicit; the
-  offline simulator is not a provider-token counter or permission to activate it.
+  outside its declared budget policy. Unknown/insufficient budgets must be explicit;
+  message-only rough tokens/operator reserves do not certify full provider fit.
+  Prepared declines return None and the host sends the original request; never
+  describe this as a dispatch veto. The simulator is not a provider-token counter.
 - Keep archived summaries as untrusted navigation data. Source lineage belongs
   in local audit/index structures rather than an ever-growing prompt; do not
   promote historical text to host instructions or treat summary coverage as
   evidence of semantic accuracy, model recall or prompt-injection resistance.
+- Reject unsupported machine data-use restrictions in prepared publication,
+  selection and evidence retrieval rather than stripping them. Natural-language
+  restriction retention is not certified by a valid tree or exact coverage.
 - Preserve the plugin boundary: no live-home access, managed-runtime mutation,
   provider/harness replacement or live `select_context` wiring in simulator-only
   work. Real host compatibility requires separate integration evidence.

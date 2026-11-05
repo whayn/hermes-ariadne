@@ -119,6 +119,86 @@ def test_kernel_builds_persists_and_zooms_without_future_context(tmp_path):
     assert requests
 
 
+@pytest.mark.parametrize("ready", [False, True], ids=["pending", "ready"])
+@pytest.mark.parametrize("present", [False, True], ids=["absent-path", "existing-path"])
+def test_kernel_from_snapshot_never_reads_or_initializes_a_state_file(
+    tmp_path, monkeypatch, ready, present
+):
+    import copy
+    import json
+    from pathlib import Path
+
+    from hermes_ariadne.kernel import MemoryKernel
+
+    projection = kernel_fixture(tmp_path, 2)
+    source = MemoryKernel(projection, tmp_path / "source.json", node_bytes=64)
+    if ready:
+        source.build(lambda _: "captured summary")
+    snapshot = json.loads(source.path.read_bytes())
+    original = copy.deepcopy(snapshot)
+    target = tmp_path / "snapshot.json"
+    if present:
+        target.write_bytes(b"not the captured snapshot")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("snapshot construction must not probe/read/create/save state")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "exists", forbidden)
+        patch.setattr(Path, "read_bytes", forbidden)
+        patch.setattr(MemoryKernel, "_load", forbidden)
+        patch.setattr(MemoryKernel, "_save", forbidden)
+        loaded = MemoryKernel.from_snapshot(
+            projection, target, snapshot=snapshot, **source._settings()
+        )
+    assert loaded.path == target and loaded.projection is projection
+    assert loaded.view() == source.view()
+    assert loaded._settings() == source._settings()
+    assert snapshot == original
+    if ready:
+        assert loaded.prefix_view(2) == source.prefix_view(2)
+    else:
+        with pytest.raises(ValueError, match="pending"):
+            loaded.prefix_view(2)
+    if present:
+        assert target.read_bytes() == b"not the captured snapshot"
+    else:
+        assert not target.exists()
+
+
+@pytest.mark.parametrize("mutation", ["shape", "projection", "settings", "node", "view"])
+def test_kernel_from_snapshot_rejects_invalid_state_without_blank_fallback(
+    tmp_path, monkeypatch, mutation
+):
+    import json
+
+    from hermes_ariadne.kernel import MemoryKernel
+
+    projection = kernel_fixture(tmp_path, 2)
+    source = MemoryKernel(projection, tmp_path / "source.json", node_bytes=64)
+    source.build(lambda _: "captured summary")
+    snapshot = json.loads(source.path.read_bytes())
+    if mutation == "shape":
+        snapshot = None
+    elif mutation == "projection":
+        snapshot["projection"]["id"] = "0" * 64
+    elif mutation == "settings":
+        snapshot["settings"]["summary_version"] = "foreign"
+    elif mutation == "node":
+        snapshot["nodes"][0]["text"] = "x" * 65
+    elif mutation == "view":
+        snapshot["chat"]["size"] += 1
+    target = tmp_path / "must-not-create" / "snapshot.json"
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid captured state must not create a blank checkpoint")
+
+    monkeypatch.setattr(MemoryKernel, "_save", forbidden)
+    with pytest.raises(ValueError):
+        MemoryKernel.from_snapshot(projection, target, snapshot=snapshot, **source._settings())
+    assert not target.parent.exists()
+
+
 def test_kernel_pending_oversized_and_foreign_nodes_are_explicit(tmp_path):
     from hermes_ariadne.kernel import MemoryKernel
 
@@ -160,6 +240,8 @@ def test_kernel_rejects_absent_archive_companion_paths(tmp_path, suffix, alias):
 
     with pytest.raises(ValueError, match="archive|separate"):
         MemoryKernel(projection, path)
+    with pytest.raises(ValueError, match="archive|separate"):
+        MemoryKernel.from_snapshot(projection, path, snapshot={})
 
     assert set(archive.path.parent.iterdir()) == before
     assert all(not companion.exists() for companion in companions)

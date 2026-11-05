@@ -4,13 +4,14 @@ An installable, Hermes-native **ContextEngine development plugin**. It archives
 verbatim message snapshots in SQLite and exposes `ariadne_search`. It is not a
 new harness, frontend, or Hermes fork. No Hermes core patches are required.
 
-**Do not enable this milestone on an important/live profile.** v0.1 does not
-compact, prune, or select replacement context. It takes the ContextEngine slot,
-so it displaces the built-in compressor; long chats can hit the provider context
-limit. This is the durable-storage vertical slice, not yet a production
-long-horizon memory engine.
+**Do not enable this milestone on an important/live profile.** Ordinary `ariadne`
+is passive. The separate opt-in [`ariadne-prepared`](docs/prepared-context.md)
+engine can select an operator-prepared frozen prefix and expose bounded find/zoom
+tools. Neither automatically compacts growing chats. Both displace the built-in
+compressor; long chats or selection fallback can hit provider limits. This is not
+yet a production long-horizon memory engine.
 
-## What works
+## Passive engine (`ariadne`)
 
 - Exact JSON-value snapshots: Unicode, whitespace, structured content, nulls,
   tool calls/results, host identity fields and metadata are preserved.
@@ -32,8 +33,9 @@ See [inspected contracts and architecture](docs/integration-findings.md).
 
 Maintained by [Whayn](https://github.com/whayn), under [Apache-2.0](LICENSE).
 The long-term direction is a UniiChat-inspired memory/context engine **inside
-Hermes**. The installed runtime implements the archival foundation described
-above; a separate offline tree/view/zoom kernel is available for development.
+Hermes**. The default installed runtime implements the archival foundation above;
+the separately installed prepared engine connects frozen offline kernel views to
+live request selection and bounded session-local evidence.
 There is no stable release or PyPI publication.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) for commit/branch naming, PRs, issue triage,
@@ -46,7 +48,7 @@ Repository conventions draw on Hermes Agent, T3 Code and hermes-lcm; the pinned
 references and deliberate differences are recorded in
 [repository-conventions.md](docs/repository-conventions.md). UniiChat remains the
 memory-algorithm reference; the offline pure tree/view port is attributed in
-[NOTICE](NOTICE). It is not wired into the installed runtime.
+[NOTICE](NOTICE). Only the opt-in prepared runtime uses it.
 
 ## Installation (isolated home first)
 
@@ -225,10 +227,11 @@ tool sequences, measured budgets and logical cache-prefix invariants. Run it wit
 .venv/bin/python -m pytest tests/test_simulation.py -q
 ```
 
-It is not called by the engine or copied by the runtime installer. Its default
+The simulator is not itself a live selection policy. Its default
 measurement is canonical ASCII-JSON bytes, **not provider tokens**, and it neither
-creates summaries nor implements UniiChat's tree/view algorithm. The warning at
-the top of this README remains in force: live context is still not compacted.
+creates summaries nor implements UniiChat's tree/view algorithm. The prepared
+runtime reuses its pure JSON/tool-sequence helpers, with separate strict mapping
+and scoped budget checks. No automatic live compaction is implemented.
 
 ## Offline memory kernel (development only)
 
@@ -236,7 +239,8 @@ The [archive-backed tree/view/zoom kernel](docs/offline-memory-kernel.md) now co
 an explicitly selected source projection to persisted hierarchical summaries,
 a bounded view and paged exact-source retrieval. Its pure tree/view algorithm is
 ported from a pinned UniiChat revision and checked against executable reference
-fixtures. It is not copied by the runtime installer or called by the live engine.
+fixtures. The passive installer omits it; the separate prepared installer includes
+it to load an explicitly published, already-ready immutable prefix.
 
 Run the two-process synthetic demonstration in a NEW scratch directory:
 
@@ -277,6 +281,17 @@ Do not run it as a free test or point it at private history. Receipt-only rebuil
 No compaction module is copied by the runtime installer or called by the live
 engine. The warning at the top of this README still applies.
 
-**Next milestone:** a host-compatible strict-dispatch/live selection/zoom
-integration in an isolated development agent. Proactive and cross-session recall
-remain later stages; no default-profile activation is part of this milestone.
+## Prepared live bridge (explicit opt-in)
+
+See [prepared-prefix selection and bounded evidence](docs/prepared-context.md)
+for operator publication, `ariadne-install --prepared`, supported mappings,
+`ariadne_find`/`ariadne_zoom`, scoped byte/rough-token limits and rollback.
+
+This separate engine preserves the host prefix and previous/current raw turns;
+revisions, unsupported replay, restricted evidence or unknown policy state
+decline selection. **Hermes then sends its original request: decline is not a
+dispatch veto.** Full tool/output/provider fit remains unverified. No model is
+called by the bridge and the normal profile is not activated by installation.
+
+Automatic evolving summaries, proactive/cross-session recall and a supported hard
+dispatch-budget seam remain future work, not guarantees of this prepared slice.

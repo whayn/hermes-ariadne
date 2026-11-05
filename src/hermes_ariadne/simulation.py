@@ -1,4 +1,4 @@
-"""Pure offline context-selection simulator; never called by the live engine."""
+"""Pure offline selector; prepared runtime reuses JSON/tool-sequence helpers."""
 
 import copy
 import json
