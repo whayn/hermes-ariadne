@@ -62,12 +62,23 @@ runtime contains archive/kernel/selector/retrieval modules, not the native
 compactor, receipt ledger, SDK dependencies or credentials. Hermes still owns
 routing, authentication, request assembly, persistence and the tool loop.
 
-A prepared view (or its absence) is loaded once at session start. Republishing
-during a tool loop does not change that view. Restart the process/session lifecycle
-explicitly to load a new publication. Reset, end, clone or binding another
-session/DB invalidates the attachment. Model switches invalidate the last
-measurement; source references remain frozen and the next request is measured
-against its newly supplied window.
+A prepared view (or its absence) is loaded once per attachment. The initial bind
+before session start performs no archive I/O. After initialization, reset/end
+followed by binding, or binding another session/DB, starts a new attachment using
+the remembered explicit profile home; it does not require another start hook.
+Repeated binding of the same attached session/DB does not reload even an absent
+view. Explicit session start can reload or select a different profile; clones
+start with no attachment or remembered home. Republishing during a tool loop does
+not change the view. Model switches invalidate the last measurement, not the
+frozen source references; the next request uses its newly supplied window.
+
+Operations capture their attachment generation and source scope. If a lifecycle
+change occurs during a read, stale scans are discarded before archival ingestion,
+stale selection declines, and stale tools return `lifecycle_changed` without
+historical evidence. This fences work that has already entered its hook; Hermes
+supplies no caller lifetime token with which to identify an old request that
+first enters a hook **after** rebinding. It is not a universal concurrent-request
+or transport-cancellation guarantee.
 
 ## Deliberately narrow supported mapping
 
@@ -152,7 +163,12 @@ index.
 versions in the attached session. It returns event handles (`event:<sha256>`),
 roles and clearly lossy ASCII-escaped previews, not complete records. Query size
 is at most 1024 UTF-8/surrogatepass bytes; limit is 1–10. `count` is the page count,
-not a total. `next_offset` is only a continuation candidate: mutation may shift
+not a total. Each index candidate is re-read through the hash-checked,
+session-scoped event lookup and its literal match is rechecked against the
+canonical content's exact indexed text/JSON representation. An unavailable,
+corrupt or stale-index candidate refuses the whole page with
+`evidence_unavailable`; no partial descriptors or misleading pagination are
+returned. `next_offset` is only a continuation candidate: mutation may shift
 pages and an empty terminal page is possible. No `has_more` is invented.
 
 ```json

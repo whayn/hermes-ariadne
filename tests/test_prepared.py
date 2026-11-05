@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+import sqlite3
 import stat
 
 import pytest
@@ -1239,6 +1240,71 @@ def test_selection_rechecks_canonical_projection_even_if_constructed_without_loa
     result = choose(direct, active, conversation, wire)
     assert result.status == "declined" and result.messages is None
     assert result.diagnostics["reason"] == "unsupported_data_use"
+
+
+@pytest.mark.parametrize("error_type", [sqlite3.Error, sqlite3.OperationalError, OSError])
+@pytest.mark.parametrize("failed_index", [0, 1])
+def test_selection_archive_read_error_declines_without_changes(
+    tmp_path, monkeypatch, error_type, failed_index
+):
+    prepared, active, conversation, wire = selection_fixture(tmp_path)
+    assert choose(prepared, active, conversation, wire).status == "selected"
+    store = prepared.projection._archive
+    before = copy.deepcopy((active, conversation, wire))
+    archive = store.path.read_bytes()
+    checkpoint = prepared.kernel.path.read_bytes()
+    tree_view = prepared.kernel.view()
+    generation = (prepared.checkpoint_id, prepared.projection.event_ids, prepared._memory)
+    real_get_event = store.get_event
+    calls, measured = [], []
+
+    def failing_get_event(event_id, *, session_id):
+        calls.append((event_id, session_id))
+        if event_id == prepared.projection.event_ids[failed_index]:
+            raise error_type("PRIVATE archive failure /secret/caller/path")
+        return real_get_event(event_id, session_id=session_id)
+
+    monkeypatch.setattr(store, "get_event", failing_get_event)
+    result = choose(
+        prepared, active, conversation, wire, measure_tokens=lambda m: measured.append(m) or 100
+    )
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "archive_unavailable"
+    assert result.diagnostics["host_fallback"] == "original_request_on_decline"
+    assert result.diagnostics["provider_fit_verified"] is False
+    assert "PRIVATE" not in str(result.diagnostics) and "/secret" not in str(result.diagnostics)
+    assert calls == [
+        (event, "chosen") for event in prepared.projection.event_ids[: failed_index + 1]
+    ]
+    assert measured == []
+    assert (active, conversation, wire) == before
+    assert store.path.read_bytes() == archive and prepared.kernel.path.read_bytes() == checkpoint
+    assert prepared.kernel.view() == tree_view
+    assert (prepared.checkpoint_id, prepared.projection.event_ids, prepared._memory) == generation
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt, SystemExit])
+def test_selection_archive_recheck_does_not_swallow_unexpected_errors(
+    tmp_path, monkeypatch, error_type
+):
+    prepared, active, conversation, wire = selection_fixture(tmp_path)
+    before = copy.deepcopy((active, conversation, wire))
+    store = prepared.projection._archive
+    archive = store.path.read_bytes()
+    checkpoint = prepared.kernel.path.read_bytes()
+    measured = []
+
+    def unexpected_error(event_id, *, session_id):
+        raise error_type("unexpected archive reader failure")
+
+    monkeypatch.setattr(store, "get_event", unexpected_error)
+    with pytest.raises(error_type, match="unexpected archive reader failure"):
+        choose(
+            prepared, active, conversation, wire, measure_tokens=lambda m: measured.append(m) or 100
+        )
+    assert measured == []
+    assert (active, conversation, wire) == before
+    assert store.path.read_bytes() == archive and prepared.kernel.path.read_bytes() == checkpoint
 
 
 def test_empty_requirement_and_common_metadata_allow_exact_selection(tmp_path):

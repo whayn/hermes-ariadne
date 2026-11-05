@@ -134,6 +134,412 @@ def select(engine, conversation, wire, **kwargs):
     )
 
 
+def publish_session(engine, home, rows, session_id, summary):
+    """Identical row identities across sessions deliberately cannot identify scope."""
+    from hermes_ariadne.kernel import MemoryKernel
+    from hermes_ariadne.prepared import publish_prepared
+    from hermes_ariadne.sources import Projection
+    from hermes_ariadne.store import canonical_json
+
+    engine._store.ingest(session_id, rows, origin="hermes_db")
+    projection = Projection(
+        engine._store,
+        session_id,
+        [hashlib.sha256(canonical_json(row)).hexdigest() for row in rows[:2]],
+    )
+    kernel = MemoryKernel(projection, home / f"{session_id}.json", node_bytes=128)
+    kernel.build(lambda _: summary)
+    publish_prepared(kernel, home=home)
+
+
+def test_real_host_reset_only_rebind_loads_new_session(tmp_path, monkeypatch):
+    from run_agent import AIAgent
+
+    engine, home, rows, conversation, wire, _ = engine_fixture(tmp_path)
+    publish_session(engine, home, rows, "second", "second session summary")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "unrelated-profile"))
+    engine.update_from_response({"prompt_tokens": 99, "total_tokens": 101})
+    agent = object.__new__(AIAgent)
+    agent.context_compressor = engine
+    agent._session_db = engine._session_db
+    agent.session_id = "second"
+    agent.reset_session_state()  # The actual /new, /resume, /branch reset-only path.
+    assert engine._session_id == "second"
+    selected = select(engine, conversation, wire)
+    assert selected is not None
+    assert "second session summary" in selected[1]["content"]
+    assert engine._home == home
+    assert engine.last_prompt_tokens == engine.last_total_tokens == 0
+    found = json.loads(engine.handle_tool_call("ariadne_find", {"query": "original"}))
+    assert found["ok"] and found["results"]
+    assert not (tmp_path / "unrelated-profile").exists()
+
+
+def test_reentrant_archive_read_discards_old_scan_before_ingestion(tmp_path):
+    engine, home, rows, _, _, _ = engine_fixture(tmp_path)
+    publish_session(engine, home, rows, "second", "second session summary")
+    db = engine._session_db
+    marker = {"message_uid": "only-first", "role": "user", "content": "first-only marker"}
+    armed = True
+
+    def reader(session_id, **kwargs):
+        nonlocal armed
+        if armed and kwargs.get("include_inactive"):
+            armed = False
+            assert session_id == "chosen"
+            engine.bind_session_state(db, "second")
+            return [copy.deepcopy(marker)]
+        return copy.deepcopy(rows)
+
+    db.get_messages = reader
+    result = json.loads(engine.handle_tool_call("ariadne_find", {"query": "first-only"}))
+    assert not engine._store.search("first-only", session_id="second")
+    assert not engine._store.search("first-only", session_id="chosen")
+    from hermes_ariadne.retrieval import TRUST_LABEL
+
+    assert result == {"trust": TRUST_LABEL, "ok": False, "error": "lifecycle_changed"}
+    assert engine.get_status()["selection"]["status"] == "ready"
+    fresh = json.loads(engine.handle_tool_call("ariadne_find", {"query": "original"}))
+    assert fresh["ok"] and fresh["results"]
+
+
+def test_reentrant_active_read_cannot_return_new_sessions_summary(tmp_path):
+    engine, home, rows, conversation, wire, _ = engine_fixture(tmp_path)
+    publish_session(engine, home, rows, "second", "second session summary")
+    db = engine._session_db
+    armed = True
+
+    def reader(session_id, **kwargs):
+        nonlocal armed
+        if armed and kwargs.get("include_inactive") is False:
+            armed = False
+            assert session_id == "chosen"
+            engine.bind_session_state(db, "second")
+            # Publish a new lifetime's useful diagnostic before old selection resumes.
+            assert select(engine, conversation, wire) is not None
+        return copy.deepcopy(rows)
+
+    db.get_messages = reader
+    assert select(engine, conversation, wire) is None
+    assert engine.get_status()["selection"]["status"] == "selected"
+    fresh = select(engine, conversation, wire)
+    assert "second session summary" in fresh[1]["content"]
+
+
+def test_outer_start_cannot_attach_over_nested_new_lifetime(tmp_path):
+    engine, home, rows, conversation, wire, _ = engine_fixture(tmp_path)
+    publish_session(engine, home, rows, "second", "second session summary")
+    db = engine._session_db
+    armed = True
+
+    def reader(session_id, **kwargs):
+        nonlocal armed
+        if armed:
+            armed = False
+            assert session_id == "chosen"
+            engine.bind_session_state(db, "second")
+            assert select(engine, conversation, wire) is not None
+        return copy.deepcopy(rows)
+
+    db.get_messages = reader
+    engine.on_session_start("chosen", hermes_home=home)
+    assert engine._session_id == "second"
+    assert engine._prepared.projection.session_id == "second"
+    assert engine.get_status()["selection"]["status"] == "selected"
+    assert "second session summary" in select(engine, conversation, wire)[1]["content"]
+
+
+def test_outer_end_cannot_clear_nested_same_session_lifetime(tmp_path):
+    engine, home, rows, conversation, wire, _ = engine_fixture(tmp_path)
+    armed = True
+
+    def reader(session_id, **kwargs):
+        nonlocal armed
+        if armed:
+            armed = False
+            engine.on_session_start("chosen", hermes_home=home)
+            assert select(engine, conversation, wire) is not None
+        return copy.deepcopy(rows)
+
+    engine._session_db.get_messages = reader
+    engine.on_session_end("chosen", [])
+    assert engine._home == home
+    assert engine._prepared is not None
+    assert engine.get_status()["selection"]["status"] == "selected"
+    assert select(engine, conversation, wire) is not None
+
+
+@pytest.mark.parametrize("boundary", ["reset", "end"])
+def test_detached_lifetime_does_not_observe_until_rebind(tmp_path, monkeypatch, boundary):
+    engine, home, rows, conversation, wire, _ = engine_fixture(tmp_path)
+    if boundary == "reset":
+        engine.on_session_reset()
+    else:
+        engine.on_session_end("chosen", [])
+    reads = []
+    db = engine._session_db
+
+    def reader(session_id, **kwargs):
+        reads.append(session_id)
+        return copy.deepcopy(rows)
+
+    db.get_messages = reader
+    engine.on_turn_complete([{"role": "user", "content": "after detach"}])
+    assert reads == []
+    assert select(engine, conversation, wire) is None
+    assert (
+        json.loads(engine.handle_tool_call("ariadne_find", {"query": "original"}))["error"]
+        == "uninitialized"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "other-profile"))
+    engine.bind_session_state(db, "chosen")
+    assert reads == ["chosen"]
+    assert engine._home == home
+    assert select(engine, conversation, wire) is not None
+    assert not (tmp_path / "other-profile" / "ariadne").exists()
+
+
+def test_first_bind_and_static_discovery_do_not_read_or_create_archive(tmp_path, monkeypatch):
+    from hermes_ariadne import store
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("binding/discovery performed archive IO before first start")
+
+    monkeypatch.setattr(store, "EventStore", unexpected)
+    engine = live_class()()
+    db = SimpleNamespace(get_messages=unexpected)
+    engine.bind_session_state(db, "first")
+    engine.bind_session_state(db, "second")
+    assert len(engine.get_tool_schemas()) == 2
+    assert engine._home is engine._profile_home is engine._store is None
+    assert engine.select_context([], conversation_messages=[], budget_tokens=32000) is None
+    assert not (Path(os.environ["HERMES_HOME"]) / "ariadne").exists()
+
+
+def test_identical_binding_freezes_absence_and_loads_once(tmp_path, monkeypatch):
+    from hermes_ariadne.prepared import PreparedView, publish_prepared
+
+    engine, home, _, conversation, wire, kernel = engine_fixture(tmp_path, publish=False)
+    publish_prepared(kernel, home=home)
+    loads = []
+    original = PreparedView.load
+
+    def load(store, session_id, selected_home):
+        loads.append((session_id, selected_home))
+        return original(store, session_id, selected_home)
+
+    monkeypatch.setattr(PreparedView, "load", load)
+    db = engine._session_db
+    engine.bind_session_state(db, "chosen")
+    engine.update_model("fixture", 32000)
+    assert select(engine, conversation, wire) is None
+    assert engine._prepared is None
+    assert json.loads(engine.handle_tool_call("ariadne_find", {"query": "original"}))["ok"]
+    assert loads == []
+    engine.on_session_reset()
+    engine.bind_session_state(db, "chosen")
+    frozen = engine._prepared
+    assert frozen is not None
+    assert loads == [("chosen", home)]
+    engine.bind_session_state(db, "chosen")
+    assert select(engine, conversation, wire) is not None
+    assert engine._prepared is frozen
+    assert loads == [("chosen", home)]
+
+
+def test_explicit_start_remembers_home_and_can_replace_profile(tmp_path, monkeypatch):
+    engine, home, _, conversation, wire, _ = engine_fixture(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "ambient-profile"))
+    engine.on_session_start("chosen")
+    assert engine._home == home
+    assert select(engine, conversation, wire) is not None
+    replacement = tmp_path / "explicit-profile"
+    engine.on_session_start("chosen", hermes_home=replacement)
+    assert engine._home == engine._profile_home == replacement
+    assert engine._prepared is None
+    assert engine._store.path == replacement / "ariadne" / "events.sqlite3"
+    engine.on_session_reset()
+    engine.bind_session_state(engine._session_db, "chosen")
+    assert engine._home == replacement
+    assert not (tmp_path / "ambient-profile" / "ariadne").exists()
+
+
+def test_clone_has_fresh_attachment_and_lock(tmp_path):
+    engine, _, _, _, _, _ = engine_fixture(tmp_path)
+    clone = engine.clone_for_agent()
+    assert clone._lock is not engine._lock
+    assert clone._profile_home is clone._home is clone._prepared is clone._store is None
+    assert clone._session_db is clone._session_id is None
+    assert clone._generation == 0
+    clone.bind_session_state(SimpleNamespace(), "clone")
+    assert clone._home is None
+    assert engine._session_id == "chosen"
+
+
+@pytest.mark.parametrize(
+    "read_kind", ["archive_rows", "archive_error", "active_rows", "active_error"]
+)
+def test_event_barrier_fences_old_reads_and_keeps_new_lifetime_diagnostics(tmp_path, read_kind):
+    import threading
+
+    from hermes_ariadne.retrieval import TRUST_LABEL
+
+    engine, home, rows, conversation, wire, _ = engine_fixture(tmp_path)
+    publish_session(engine, home, rows, "second", "second session summary")
+    db = engine._session_db
+    entered, release = threading.Event(), threading.Event()
+    marker = {"message_uid": "old-thread", "role": "user", "content": "old-thread marker"}
+    output, failures = [], []
+
+    def reader(session_id, **kwargs):
+        archive = read_kind.startswith("archive")
+        if session_id == "chosen" and kwargs["include_inactive"] is archive:
+            entered.set()
+            assert release.wait(10), "test did not release old read"
+            if read_kind.endswith("error"):
+                raise OSError("old lifetime private error")
+            return [copy.deepcopy(marker)] if archive else copy.deepcopy(rows)
+        if session_id == "second" and kwargs["include_inactive"]:
+            return copy.deepcopy(rows) + [{}]  # Preserve new scan's skipped count, too.
+        return copy.deepcopy(rows)
+
+    def old_request():
+        try:
+            if read_kind.startswith("archive"):
+                output.append(
+                    json.loads(engine.handle_tool_call("ariadne_find", {"query": "old-thread"}))
+                )
+            else:
+                output.append(select(engine, conversation, wire))
+        except BaseException as exc:
+            failures.append(exc)
+
+    db.get_messages = reader
+    worker = threading.Thread(target=old_request, daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(10), "old read did not begin"
+        # Must complete while the old callback is blocked: no lock across host IO.
+        engine.bind_session_state(db, "second")
+        assert select(engine, conversation, wire) is not None
+        before = engine.get_status()
+        assert before["archive_skipped_last_scan"] == 1
+    finally:
+        release.set()
+        worker.join(10)
+    assert not worker.is_alive(), "old request did not finish"
+    assert not failures
+    if read_kind.startswith("archive"):
+        assert output == [{"trust": TRUST_LABEL, "ok": False, "error": "lifecycle_changed"}]
+    else:
+        assert output == [None]
+    assert engine.get_status() == before
+    assert not engine._store.search("old-thread", session_id="second")
+    assert not engine._store.search("old-thread", session_id="chosen")
+    fresh = json.loads(engine.handle_tool_call("ariadne_find", {"query": "original"}))
+    assert fresh["ok"] and fresh["results"]
+
+
+def test_loaded_view_cannot_publish_over_nested_start(tmp_path, monkeypatch):
+    from hermes_ariadne.prepared import PreparedView
+
+    engine, home, rows, conversation, wire, _ = engine_fixture(tmp_path)
+    publish_session(engine, home, rows, "second", "second session summary")
+    original = PreparedView.load
+    armed = True
+
+    def load(store, session_id, selected_home):
+        nonlocal armed
+        value = original(store, session_id, selected_home)
+        if armed:
+            armed = False
+            engine.bind_session_state(engine._session_db, "second")
+            assert select(engine, conversation, wire) is not None
+        return value
+
+    monkeypatch.setattr(PreparedView, "load", load)
+    engine.on_session_start("chosen", hermes_home=home)
+    assert engine._prepared.projection.session_id == "second"
+    assert engine.get_status()["selection"]["status"] == "selected"
+
+
+def test_tool_result_is_fenced_after_retrieval_not_only_after_observation(tmp_path, monkeypatch):
+    from hermes_ariadne.retrieval import TRUST_LABEL
+
+    engine, home, rows, conversation, wire, _ = engine_fixture(tmp_path)
+    publish_session(engine, home, rows, "second", "second session summary")
+    original = engine._store.search
+
+    def search(*args, **kwargs):
+        result = original(*args, **kwargs)
+        engine.bind_session_state(engine._session_db, "second")
+        assert select(engine, conversation, wire) is not None
+        return result
+
+    monkeypatch.setattr(engine._store, "search", search)
+    result = json.loads(engine.handle_tool_call("ariadne_find", {"query": "original"}))
+    assert result == {"trust": TRUST_LABEL, "ok": False, "error": "lifecycle_changed"}
+    assert engine.get_status()["selection"]["status"] == "selected"
+
+
+def test_selection_result_is_fenced_after_prepared_selection(tmp_path, monkeypatch):
+    from hermes_ariadne.prepared import PreparedView
+
+    engine, home, rows, conversation, wire, _ = engine_fixture(tmp_path)
+    publish_session(engine, home, rows, "second", "second session summary")
+    original = PreparedView.select
+    armed = True
+
+    def prepared_select(view, *args, **kwargs):
+        nonlocal armed
+        result = original(view, *args, **kwargs)
+        if armed:
+            armed = False
+            engine.bind_session_state(engine._session_db, "second")
+            assert select(engine, conversation, wire) is not None
+        return result
+
+    monkeypatch.setattr(PreparedView, "select", prepared_select)
+    assert select(engine, conversation, wire) is None
+    assert engine.get_status()["selection"]["status"] == "selected"
+    assert "second session summary" in select(engine, conversation, wire)[1]["content"]
+
+
+def test_initialization_error_callback_cannot_clobber_new_diagnostic(tmp_path, monkeypatch):
+    import logging
+
+    from hermes_ariadne import store
+
+    engine, home, rows, conversation, wire, _ = engine_fixture(tmp_path)
+    publish_session(engine, home, rows, "second", "second session summary")
+    original = store.EventStore
+    armed = True
+
+    def archive(path):
+        nonlocal armed
+        if armed:
+            armed = False
+            raise OSError("private initialization failure")
+        return original(path)
+
+    class RebindOnError(logging.Handler):
+        def emit(self, record):
+            engine.bind_session_state(engine._session_db, "second")
+            assert select(engine, conversation, wire) is not None
+
+    monkeypatch.setattr(store, "EventStore", archive)
+    logger = logging.getLogger("hermes_ariadne.engine")
+    handler = RebindOnError()
+    logger.addHandler(handler)
+    try:
+        engine.on_session_start("chosen", hermes_home=home)
+    finally:
+        logger.removeHandler(handler)
+    assert engine._session_id == "second"
+    assert engine.get_status()["selection"]["status"] == "selected"
+    assert engine.get_status()["archive_error"] is None
+
+
 def test_bound_engine_loads_and_selects_frozen_prefix(tmp_path):
     engine, home, rows, conversation, wire, _ = engine_fixture(tmp_path)
     before = copy.deepcopy((rows, conversation, wire))
@@ -258,10 +664,11 @@ def test_archive_failure_clears_preceding_success_diagnostic(tmp_path):
     assert "private path" not in json.dumps(status)
 
 
-def test_rebinding_same_session_to_another_db_invalidates_snapshot(tmp_path):
+def test_rebinding_same_session_to_another_db_reloads_but_checks_active_source(tmp_path):
     engine, _, _, conversation, wire, _ = engine_fixture(tmp_path)
+    frozen = engine._prepared
     engine.bind_session_state(SimpleNamespace(get_messages=lambda *a, **k: []), "chosen")
-    assert engine._prepared is None
+    assert engine._prepared is not None and engine._prepared is not frozen
     assert select(engine, conversation, wire) is None
 
 

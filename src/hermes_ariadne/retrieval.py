@@ -200,6 +200,19 @@ def _find(store, session_id, args):
         if message is None:
             return _error("evidence_unavailable")
         _require_supported_data_use(message)
+        # Recheck the literal against the same content-only text indexed by
+        # EventStore.ingest, without Unicode/escape normalization. A stale hit
+        # invalidates the whole page: skipping it would falsify pagination.
+        content = message.get("content")
+        text = (
+            content
+            if isinstance(content, str)
+            else json.dumps(
+                content, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+            )
+        )
+        if query not in text:
+            return _error("evidence_unavailable")
         role = message.get("role")
         results.append(
             {

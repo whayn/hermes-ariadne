@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -604,6 +605,8 @@ class PreparedView:
             )
         except _UnsupportedDataUse:
             return decline("unsupported_data_use")
+        except (sqlite3.Error, OSError):
+            return decline("archive_unavailable")
         except (ValueError, TypeError, KeyError, IndexError, RecursionError):
             return decline("unsupported_alignment")
         candidate = copy.deepcopy(

@@ -586,6 +586,104 @@ def test_find_hash_checks_every_matching_payload_before_returning_any_evidence(t
         )
 
 
+@pytest.mark.parametrize(
+    "content,query",
+    [
+        ("unrelated PRIVATE", "needle"),
+        (r"\u03bb PRIVATE", "λ"),
+        ("λ PRIVATE", r"\u03bb"),
+        ("\ud83d\ude00 PRIVATE", "😀"),
+        ("😀 PRIVATE", "\ud83d\ude00"),
+        ({"z": "PRIVATE", "a": 1}, '"a": 1'),
+    ],
+)
+def test_find_stale_literal_index_refuses_entire_valid_payload_page(tmp_path, content, query):
+    api = retrieval()
+    store = EventStore(tmp_path / "archive.sqlite3")
+    messages = [
+        {"message_uid": "public", "role": "user", "content": "PUBLIC " + query},
+        {
+            "message_uid": "stale",
+            "role": "tool",
+            "content": content,
+            "metadata": {"not_searchable": query},
+        },
+        {"message_uid": "tail", "role": "assistant", "content": "TAIL " + query},
+    ]
+    originals = copy.deepcopy(messages)
+    store.ingest("attached", messages, origin="fixture")
+    stale_id = identity(messages[1])
+    with store._connection() as connection:
+        connection.execute(
+            "UPDATE events SET search_text=? WHERE event_id=?",
+            (query.encode("utf-8", "surrogatepass"), stale_id),
+        )
+    # Payloads and identities are valid; only the literal-search index is stale.
+    assert store.get_event(stale_id, session_id="attached") == messages[1]
+    assert [row["event_id"] for row in store.search(query, session_id="attached")] == [
+        identity(message) for message in messages
+    ]
+    before = store.path.read_bytes()
+    args = {"query": query, "limit": 3, "offset": 0}
+    result = api.handle_evidence_tool("ariadne_find", args, store=store, session_id="attached")
+    serialized = wire(result)
+    assert result == {"ok": False, "trust": api.TRUST_LABEL, "error": "evidence_unavailable"}
+    assert len(serialized) < 200
+    assert all(marker not in serialized for marker in ["PUBLIC", "PRIVATE", "TAIL"])
+    assert store.path.read_bytes() == before
+    assert messages == originals
+    assert args == {"query": query, "limit": 3, "offset": 0}
+    assert [store.get_event(identity(m), session_id="attached") for m in messages] == originals
+
+
+@pytest.mark.parametrize(
+    "content,query",
+    [
+        ("λ😀漢字", "λ😀"),
+        ("\ud800", "\ud800"),
+        ("\ud83d\ude00", "\ud83d\ude00"),
+        (r"\u03bb", r"\u03bb"),
+        ('"quoted"\ntext', '"quoted"\n'),
+        ({"z": "λ😀\ud800", "a": [True, None]}, '{"a":[true,null],"z":"λ😀\ud800"}'),
+        ([True, None, "λ"], '[true,null,"λ"]'),
+        ({"line": "a\nb"}, r"a\nb"),
+        (None, "null"),
+        (False, "false"),
+        (17, "17"),
+    ],
+)
+def test_find_revalidates_exact_ingested_content_text_without_aliasing(tmp_path, content, query):
+    api = retrieval()
+    store = EventStore(tmp_path / "archive.sqlite3")
+    message = {"message_uid": "source", "role": "user", "content": content}
+    original = copy.deepcopy(message)
+    store.ingest("attached", [message], origin="fixture")
+    before = store.path.read_bytes()
+    args = {"query": query, "limit": 1}
+    found = api.handle_evidence_tool("ariadne_find", args, store=store, session_id="attached")
+    wire(found)
+    assert found["ok"] and found["count"] == 1
+    assert found["offset"] == 0 and found["next_offset"] == 1
+    assert found["results"] == [
+        {
+            "event_ref": "event:" + identity(message),
+            "role": "user",
+            "preview_lossy": api._preview(content),
+        }
+    ]
+    source = api.handle_evidence_tool(
+        "ariadne_zoom",
+        {"ref": found["results"][0]["event_ref"]},
+        store=store,
+        session_id="attached",
+    )
+    wire(source)
+    assert source["ok"]
+    assert base64.b64decode(source["page"]["data_base64"]) == canonical_json(original)
+    assert store.path.read_bytes() == before
+    assert message == original and args == {"query": query, "limit": 1}
+
+
 @pytest.mark.parametrize("unavailable", ["missing-event", "foreign-only"])
 def test_find_unavailable_hit_refuses_entire_matching_page(tmp_path, monkeypatch, unavailable):
     api = retrieval()
