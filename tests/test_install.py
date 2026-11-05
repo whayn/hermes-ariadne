@@ -25,7 +25,8 @@ def test_installer_is_self_contained_and_does_not_modify_configuration(tmp_path)
 
 
 @pytest.mark.parametrize("destination", ["outside", "dangling", "inside"])
-def test_installer_rejects_plugins_symlink_without_outside_writes(tmp_path, destination):
+@pytest.mark.parametrize("prepared", [False, True])
+def test_installer_rejects_plugins_symlink_without_outside_writes(tmp_path, destination, prepared):
     home = tmp_path / "home"
     home.mkdir()
     outside = tmp_path / "outside"
@@ -41,7 +42,7 @@ def test_installer_rejects_plugins_symlink_without_outside_writes(tmp_path, dest
     before = set(home.iterdir())
 
     with pytest.raises(FileExistsError):
-        install(home)
+        install(home, prepared=prepared)
 
     assert plugins.is_symlink()
     assert plugins.readlink() == linked
@@ -52,11 +53,12 @@ def test_installer_rejects_plugins_symlink_without_outside_writes(tmp_path, dest
 
 
 @pytest.mark.parametrize("kind", ["file", "directory", "symlink-file", "symlink-dir", "dangling"])
-def test_installer_preserves_every_preexisting_final_destination(tmp_path, kind):
+@pytest.mark.parametrize("prepared", [False, True])
+def test_installer_preserves_every_preexisting_final_destination(tmp_path, kind, prepared):
     home = tmp_path / "home"
     plugins = home / "plugins"
     plugins.mkdir(parents=True)
-    target = plugins / "ariadne"
+    target = plugins / ("ariadne-prepared" if prepared else "ariadne")
     outside = tmp_path / "outside"
     outside.mkdir()
     sentinel = outside / "sentinel"
@@ -77,7 +79,7 @@ def test_installer_preserves_every_preexisting_final_destination(tmp_path, kind)
     before = target.lstat()
 
     with pytest.raises(FileExistsError):
-        install(home)
+        install(home, prepared=prepared)
 
     assert target.lstat() == before
     assert list(plugins.iterdir()) == [target]
@@ -125,3 +127,61 @@ def test_installed_directory_loads_through_real_hermes_discovery(tmp_path, monke
     # Merely discovering/selecting the plugin must not create the archive.
     assert not (home / "ariadne").exists()
     assert Path(home / "plugins" / "ariadne" / "engine.py").is_file()
+
+
+def test_prepared_install_is_explicit_separate_and_leaves_passive_unchanged(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    config = home / "config.yaml"
+    config.write_text("context:\n  engine: compressor\n")
+    before = config.read_bytes()
+    passive = install(home)
+    passive_bytes = {p.name: p.read_bytes() for p in passive.iterdir()}
+    target = install(home, prepared=True)
+    assert target == home / "plugins" / "ariadne-prepared"
+    assert "PreparedAriadneEngine" in (target / "__init__.py").read_text()
+    assert "ariadne-prepared" in (target / "plugin.yaml").read_text()
+    assert {p.name for p in target.iterdir()} == {
+        "__init__.py",
+        "plugin.yaml",
+        "engine.py",
+        "store.py",
+        "live_engine.py",
+        "prepared.py",
+        "retrieval.py",
+        "kernel.py",
+        "tree.py",
+        "sources.py",
+        "simulation.py",
+    }
+    assert {p.name: p.read_bytes() for p in passive.iterdir()} == passive_bytes
+    assert config.read_bytes() == before
+    assert not (home / "ariadne").exists()
+    with pytest.raises(FileExistsError):
+        install(home, prepared=True)
+
+
+@pytest.mark.parametrize("value", [1, "yes", None])
+def test_installer_rejects_ambiguous_prepared_mode_before_writes(tmp_path, value):
+    home = tmp_path / "no-writes"
+    with pytest.raises(ValueError, match="explicit boolean"):
+        install(home, prepared=value)
+    assert not home.exists()
+
+
+def test_installer_cli_requires_explicit_prepared_flag(tmp_path, monkeypatch, capsys):
+    import importlib
+    import sys
+
+    module = importlib.import_module("hermes_ariadne.install")
+    calls = []
+
+    def observed(home, *, prepared=False):
+        calls.append((home, prepared))
+        return home / "plugins" / "ariadne-prepared"
+
+    monkeypatch.setattr(module, "install", observed)
+    monkeypatch.setattr(sys, "argv", ["ariadne-install", "--home", str(tmp_path), "--prepared"])
+    module.main()
+    assert calls == [(tmp_path.resolve(), True)]
+    assert "context.engine=ariadne-prepared" in capsys.readouterr().out

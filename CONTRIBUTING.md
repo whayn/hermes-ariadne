@@ -2,8 +2,9 @@
 
 Ariadne is a small, experimental Hermes **ContextEngine plugin**. Correctness,
 archive integrity and reviewable changes come before feature count. Read the
-[README](README.md) for shipped behavior. The installed engine remains passive;
-the UniiChat-inspired kernel is an offline development module, not live compaction.
+[README](README.md) for shipped behavior. Ordinary `ariadne` remains passive;
+the separate `ariadne-prepared` engine consumes an operator-published frozen view.
+Neither generates automatic live summaries.
 
 ## Before starting
 
@@ -89,7 +90,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt -e .
 .venv/bin/ruff check src tests
 .venv/bin/ruff format --check src tests
-.venv/bin/python -m pytest tests/test_store.py tests/test_crash.py tests/test_simulation.py tests/test_tree.py tests/test_kernel.py tests/test_kernel_demo.py tests/test_receipts.py tests/test_compaction.py tests/test_compactor_profile.py tests/test_host_site.py -q
+.venv/bin/python -m pytest tests/test_store.py tests/test_crash.py tests/test_simulation.py tests/test_tree.py tests/test_kernel.py tests/test_kernel_demo.py tests/test_receipts.py tests/test_compaction.py tests/test_compactor_profile.py tests/test_host_site.py tests/test_prepared.py tests/test_retrieval.py -q
 .venv/bin/python -m build
 git diff --check
 ```
