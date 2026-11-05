@@ -159,11 +159,42 @@ pages and an empty terminal page is possible. No `has_more` is invented.
 {"ref":"event:<64 lowercase hex characters>","offset":0,"limit":2048}
 ```
 
-`ariadne_zoom` accepts validated event handles or `node:<frozen kernel reference>`
-handles from navigation. Nodes expand into bounded child descriptors; source
-leaves return exact whole-record canonical-JSON byte pages. Sources remain
-session-scoped; foreign/expired node generations fail rather than resolving a new
-range. Byte offsets apply to sources only. Page limits are 1–2048 bytes.
+`ariadne_zoom` accepts validated event handles or generation-bound navigation
+handles with this exact format:
+
+```text
+node:<checkpoint_sha256>:<projection_id>:<start>+<count>
+```
+
+Both digests are 64 lowercase hexadecimal characters. The checkpoint digest is
+SHA-256 of the exact immutable checkpoint bytes selected by the validated
+manifest, not a summary-text hash, summary version, projection ID or path guess.
+`start` is a nonnegative decimal integer and `count` a positive decimal integer,
+each at most ten digits without leading zeros. The unchanged kernel validates
+projection identity and aligned, in-range spans after the wrapper validates the
+attached generation. All returned node/child/leaf descriptors retain the same
+checkpoint digest. Legacy `node:<projection_id>:<start>+<count>` handles are
+refused, never rebound.
+
+Nodes expand into bounded child descriptors; source leaves return exact
+whole-record canonical-JSON byte pages. Sources remain session-scoped. A
+republished checkpoint changes node handles even for the same source event IDs
+and identical summary text when checkpoint settings differ. Loaded views stay
+frozen until explicit lifecycle reload; unchanged checkpoint handles survive
+restart and unrelated archive appends. Old-generation node handles fail after
+loading a different checkpoint. Content-addressed `event:<sha256>` handles do
+not depend on prepared generations and remain usable for unchanged sources.
+Byte offsets apply to sources only. Page limits are 1–2048 bytes.
+
+For framework-free hosts, `PreparedView.checkpoint_id` exposes the exact validated
+manifest checkpoint digest. `handle_evidence_tool(..., kernel=view.kernel,
+checkpoint_id=view.checkpoint_id)` takes it only as trusted host attachment state;
+there is no caller-visible checkpoint/generation argument. The host must supply
+the digest verified for that exact loaded kernel. Missing or malformed trusted
+identity refuses node retrieval with `checkpoint_unavailable`, mismatches with
+`checkpoint_mismatch`; neither error exposes source or summary data. Event
+retrieval does not require a checkpoint. The prepared Hermes engine always
+supplies its attached view's identity and ignores caller lifecycle/scope kwargs.
 
 Every complete result, including envelopes and JSON escaping, is bounded to
 8192 bytes when serialized as compact ASCII JSON. Canonical source pages use

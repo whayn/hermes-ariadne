@@ -88,7 +88,7 @@ def test_prepared_directory_is_discovered_without_archive_io(tmp_path, monkeypat
     assert not (home / "ariadne").exists()
 
 
-def engine_fixture(tmp_path, *, publish=True):
+def engine_fixture(tmp_path, *, publish=True, **kernel_settings):
     from hermes_ariadne.kernel import MemoryKernel
     from hermes_ariadne.prepared import publish_prepared
     from hermes_ariadne.sources import Projection
@@ -108,7 +108,7 @@ def engine_fixture(tmp_path, *, publish=True):
     projection = Projection(
         store, "chosen", [hashlib.sha256(canonical_json(row)).hexdigest() for row in rows[:2]]
     )
-    kernel = MemoryKernel(projection, home / "operator.json", node_bytes=128)
+    kernel = MemoryKernel(projection, home / "operator.json", node_bytes=128, **kernel_settings)
     kernel.build(lambda request: "synthetic summary")
     if publish:
         publish_prepared(kernel, home=home)
@@ -181,6 +181,66 @@ def test_missing_snapshot_is_frozen_until_explicit_session_start(tmp_path):
     assert select(engine, conversation, wire) is None
     engine.on_session_start("chosen", hermes_home=home)
     assert select(engine, conversation, wire) is not None
+
+
+@pytest.mark.parametrize("replacement", ["summary-version-and-text", "same-summary-new-settings"])
+def test_republished_checkpoint_refuses_old_nodes_only_after_lifecycle_reload(
+    tmp_path, replacement
+):
+    from hermes_ariadne.kernel import MemoryKernel
+    from hermes_ariadne.prepared import publish_prepared
+    from hermes_ariadne.store import canonical_json
+
+    engine, home, rows, conversation, wire, kernel = engine_fixture(tmp_path, chat_high=25)
+    selected = select(engine, conversation, wire)
+    assert selected is not None
+    old_memory = selected[1]["content"]
+    root = json.loads(old_memory.splitlines()[1])["ref"]
+
+    def zoom(ref, **kwargs):
+        return json.loads(engine.handle_tool_call("ariadne_zoom", {"ref": ref}, **kwargs))
+
+    expanded = zoom(root)
+    assert expanded["ok"] and expanded["kind"] == "node"
+    refs = [root, *(child["ref"] for child in expanded["children"])]
+    old_responses = [zoom(ref) for ref in refs]
+    assert all(response["ok"] for response in old_responses)
+    event_ref = old_responses[1]["page"]["event_ref"]
+    # An unchanged generation survives a real engine lifecycle reload.
+    engine.on_session_start("chosen", hermes_home=home)
+    assert [zoom(ref) for ref in refs] == old_responses
+    settings = kernel._settings()
+    if replacement == "summary-version-and-text":
+        settings["summary_version"] = "replacement-v2"
+        summary = "replacement summary"
+    else:
+        settings["compactor_high"] += 1
+        summary = "synthetic summary"
+    newer = MemoryKernel(kernel.projection, home / "replacement.json", **settings)
+    newer.build(lambda _: summary)
+    assert newer.projection.projection_id == kernel.projection.projection_id
+    assert newer.projection.event_ids == kernel.projection.event_ids
+    publish_prepared(newer, home=home)
+    # Publication alone must not retarget either selection or retrieval.
+    assert select(engine, conversation, wire)[1]["content"] == old_memory
+    assert [zoom(ref) for ref in refs] == old_responses
+    engine.on_session_start("chosen", hermes_home=home)
+    assert engine._prepared.kernel.view() == newer.view()
+    for ref in refs:
+        response = zoom(ref, checkpoint_id="caller cannot override the attached view")
+        assert not response["ok"], "old node silently rebound to a republished checkpoint"
+        assert set(response) == {"trust", "ok", "error"}
+        assert len(json.dumps(response, ensure_ascii=True)) < 200
+    fresh = select(engine, conversation, wire)
+    assert fresh is not None
+    fresh_root = json.loads(fresh[1]["content"].splitlines()[1])["ref"]
+    assert fresh_root != root
+    assert zoom(fresh_root)["ok"]
+    recovered = zoom(event_ref)
+    assert recovered["ok"]
+    import base64
+
+    assert base64.b64decode(recovered["page"]["data_base64"]) == canonical_json(rows[0])
 
 
 def test_archive_failure_clears_preceding_success_diagnostic(tmp_path):

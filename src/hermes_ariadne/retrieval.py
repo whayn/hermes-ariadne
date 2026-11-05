@@ -28,8 +28,9 @@ PAGINATION_CONTRACT = (
     "candidate, not proof of another match; an empty terminal page is possible"
 )
 _EVENT_REF = re.compile(r"event:([0-9a-f]{64})")
-_NODE_REF = re.compile(r"node:[0-9a-f]{64}:(0|[1-9][0-9]{0,9})\+([1-9][0-9]{0,9})")
-MAX_REF_CHARS = 91
+_CHECKPOINT_ID = re.compile(r"[0-9a-f]{64}")
+_NODE_REF = re.compile(r"node:([0-9a-f]{64}):([0-9a-f]{64}:(0|[1-9][0-9]{0,9})\+([1-9][0-9]{0,9}))")
+MAX_REF_CHARS = len("node:" + "f" * 64 + ":" + "f" * 64 + ":" + "9" * 10 + "+" + "9" * 10)
 _ROLES = frozenset({"system", "developer", "user", "assistant", "tool", "function"})
 
 
@@ -260,9 +261,9 @@ def _source(store, session_id, ref, offset, limit):
     )
 
 
-def _node_descriptor(node):
+def _node_descriptor(node, checkpoint_id):
     return {
-        "ref": "node:" + node["ref"],
+        "ref": f"node:{checkpoint_id}:" + node["ref"],
         "start": node["start"],
         "count": node["count"],
         "ready": node["ready"],
@@ -270,18 +271,25 @@ def _node_descriptor(node):
     }
 
 
-def _zoom(store, session_id, kernel, ref, offset, limit):
+def _zoom(store, session_id, kernel, checkpoint_id, ref, offset, limit):
     if _EVENT_REF.fullmatch(ref):
         return _source(store, session_id, ref, offset, limit)
     if kernel is None:
         return _error("kernel_unavailable")
+    if not isinstance(checkpoint_id, str) or not _CHECKPOINT_ID.fullmatch(checkpoint_id):
+        return _error("checkpoint_unavailable")
+    match = _NODE_REF.fullmatch(ref)
+    if match.group(1) != checkpoint_id:
+        return _error("checkpoint_mismatch")
     if kernel.projection.session_id != session_id:
         return _error("scope_mismatch")
     _require_supported_projection(kernel.projection, store=store)
-    # The kernel validates both projection identity and aligned, in-range spans.
+    # Generation is the host's verified immutable checkpoint attachment, never
+    # inferred from the caller's reference, projection, current manifest or path.
+    # The unchanged kernel then validates projection identity and aligned spans.
     # Never select a new range/generation or accept a raw index on ref failure.
-    expanded = kernel.zoom(ref[5:], offset=offset, limit=limit)
-    node = _node_descriptor(expanded)
+    expanded = kernel.zoom(match.group(2), offset=offset, limit=limit)
+    node = _node_descriptor(expanded, checkpoint_id)
     if expanded["kind"] == "source":
         # Re-read through the host-supplied store and attached scope. Projection's
         # page may carry unbounded session metadata; do not forward that mapping.
@@ -295,13 +303,19 @@ def _zoom(store, session_id, kernel, ref, offset, limit):
         ok=True,
         kind="node",
         node=node,
-        children=[_node_descriptor(child) for child in expanded["children"]],
+        children=[_node_descriptor(child, checkpoint_id) for child in expanded["children"]],
         preview_format=PREVIEW_FORMAT,
     )
 
 
-def handle_evidence_tool(name, args, *, store, session_id, kernel=None) -> dict:
-    """Return a bounded JSON-value envelope. Scope is supplied only by the host."""
+def handle_evidence_tool(name, args, *, store, session_id, kernel=None, checkpoint_id=None) -> dict:
+    """Bounded evidence; scope and verified checkpoint identity come only from the host.
+
+    checkpoint_id must identify the exact immutable checkpoint loaded as kernel,
+    not a caller tool argument or an identity inferred from its projection/path.
+    Without that trusted attachment, node retrieval fails closed; events do not
+    require a kernel or checkpoint.
+    """
     try:
         if name not in ("ariadne_find", "ariadne_zoom"):
             return _error("unknown_tool")
@@ -328,7 +342,7 @@ def handle_evidence_tool(name, args, *, store, session_id, kernel=None) -> dict:
             or not 1 <= limit <= MAX_PAGE_BYTES
         ):
             return _error("invalid_arguments")
-        return _bounded(_zoom(store, session_id, kernel, ref, offset, limit))
+        return _bounded(_zoom(store, session_id, kernel, checkpoint_id, ref, offset, limit))
     except _UnsupportedDataUse:
         return _error("unsupported_data_use")
     except Exception:

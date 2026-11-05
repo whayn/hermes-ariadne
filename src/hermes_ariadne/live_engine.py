@@ -137,6 +137,7 @@ class PreparedAriadneEngine(AriadneEngine):
                 store=store,
                 session_id=self._session_id,
                 kernel=self._prepared.kernel if self._prepared is not None else None,
+                checkpoint_id=self._prepared.checkpoint_id if self._prepared is not None else None,
             )
         return json.dumps(result, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
 

@@ -104,6 +104,19 @@ if MODE.startswith("baseline"):
 else:
     seed = json.loads(seed_path.read_bytes())
 
+if MODE == "republish-restart":
+    # Same immutable source projection, different exact prepared generation.
+    store = EventStore(home / "ariadne" / "events.sqlite3")
+    previous = PreparedView.load(store, SESSION, home)
+    assert previous is not None
+    settings = previous.kernel._settings()
+    settings["summary_version"] = "synthetic-republication-v2"
+    replacement = MemoryKernel(previous.projection, home / "replacement-kernel.json", **settings)
+    replacement.build(
+        lambda req: f"SYNTHETIC REPLACEMENT SUMMARY {req.part.start}+{req.part.count}"
+    )
+    publish_prepared(replacement, home=home)
+
 agent = AIAgent(
     api_key="offline-synthetic-placeholder",
     base_url=BASE_URL,

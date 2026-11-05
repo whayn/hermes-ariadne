@@ -524,14 +524,14 @@ def _alignment(prepared, request, conversation, incoming, active):
     return split
 
 
-def _compile(kernel):
+def _compile(kernel, checkpoint_id):
     lines = []
     for item in kernel.prefix_view(len(kernel.projection.event_ids)):
         count = item["stop"] - item["start"]
         part = Part(count.bit_length() - 1, item["start"] // count)
         lines.append(
             json.dumps(
-                {"ref": "node:" + kernel.reference(part), "text": item["text"]},
+                {"ref": f"node:{checkpoint_id}:" + kernel.reference(part), "text": item["text"]},
                 ensure_ascii=True,
                 sort_keys=True,
                 separators=(",", ":"),
@@ -552,6 +552,7 @@ class SelectionDecision:
 @dataclass(frozen=True)
 class PreparedView:
     kernel: MemoryKernel
+    checkpoint_id: str  # Exact manifest digest, verified against the loaded checkpoint bytes.
     history_bytes: int
     request_bytes: int
     reserve_tokens: int
@@ -673,7 +674,8 @@ class PreparedView:
                 return None
             return cls(
                 kernel,
-                _memory=_compile(kernel),
+                checkpoint_id=sha,
+                _memory=_compile(kernel, sha),
                 **{key: _positive(value) for key, value in limits.items()},
             )
         except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError):

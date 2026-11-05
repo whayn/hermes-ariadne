@@ -838,6 +838,88 @@ def test_invalid_artifacts_never_load_or_create_a_replacement(tmp_path, mutation
     assert {p: p.read_bytes() for p in path.parent.iterdir() if p.is_file()} == before
 
 
+@pytest.mark.parametrize("replacement", ["text", "version-and-text", "same-summary-settings"])
+def test_generation_handles_bind_exact_loaded_checkpoint_across_republication(
+    tmp_path, replacement
+):
+    import base64
+
+    from hermes_ariadne.prepared import PreparedView, publish_prepared
+    from hermes_ariadne.retrieval import handle_evidence_tool, tool_schemas
+    from hermes_ariadne.tree import Part
+
+    store, rows, kernel, manifest_path, old = fixture(tmp_path, count=4)
+    manifest = json.loads(manifest_path.read_bytes())
+    assert old.checkpoint_id == manifest["checkpoint_sha256"]
+    assert old.checkpoint_id == hashlib.sha256(old.kernel.path.read_bytes()).hexdigest()
+    old_memory = old._memory
+    root = f"node:{old.checkpoint_id}:" + kernel.reference(Part(2, 0))
+    pattern = tool_schemas()[1]["parameters"]["properties"]["ref"]["pattern"]
+
+    def zoom(view, ref):
+        import re
+
+        assert re.fullmatch(pattern, ref)
+        result = handle_evidence_tool(
+            "ariadne_zoom",
+            {"ref": ref},
+            store=store,
+            session_id="chosen",
+            kernel=view.kernel,
+            checkpoint_id=view.checkpoint_id,
+        )
+        assert (
+            len(json.dumps(result, ensure_ascii=True, separators=(",", ":")).encode("ascii"))
+            <= 8192
+        )
+        return result
+
+    # Collect every emitted node recursively, including root, internal children and leaves.
+    refs, responses, pending = [], [], [root]
+    while pending:
+        ref = pending.pop()
+        response = zoom(old, ref)
+        assert response["ok"]
+        assert response["node"]["ref"] == ref
+        assert ref.startswith(f"node:{old.checkpoint_id}:")
+        refs.append(ref)
+        responses.append(response)
+        if response["kind"] == "node":
+            pending.extend(child["ref"] for child in response["children"])
+    assert len(refs) == 7
+    # Unrelated archive appends and a fresh load preserve this exact generation.
+    store.ingest("chosen", [{"message_uid": "tail", "role": "user", "content": "new"}], origin="x")
+    same = PreparedView.load(store, "chosen", tmp_path)
+    assert same is not None and same.checkpoint_id == old.checkpoint_id
+    assert [zoom(same, ref) for ref in refs] == responses
+    settings = kernel._settings()
+    if replacement == "version-and-text":
+        settings["summary_version"] = "replacement-v2"
+    elif replacement == "same-summary-settings":
+        settings["compactor_high"] += 1
+    newer = MemoryKernel(kernel.projection, tmp_path / "replacement.json", **settings)
+    prefix = "summary" if replacement == "same-summary-settings" else "replacement"
+    newer.build(lambda req: f"{prefix} {req.part.start}+{req.part.count}")
+    publish_prepared(newer, home=tmp_path)
+    assert old._memory == old_memory
+    assert [zoom(old, ref) for ref in refs] == responses
+    new = PreparedView.load(store, "chosen", tmp_path)
+    assert new is not None and new.checkpoint_id != old.checkpoint_id
+    assert new.projection.projection_id == old.projection.projection_id
+    assert new.projection.event_ids == old.projection.event_ids
+    for ref in refs:
+        result = zoom(new, ref)
+        assert result["ok"] is False and result["error"] == "checkpoint_mismatch"
+        assert set(result) == {"trust", "ok", "error"}
+        fresh_ref = ref.replace(old.checkpoint_id, new.checkpoint_id, 1)
+        assert zoom(new, fresh_ref)["ok"]
+    # Source handles are independent of prepared generations and still recover exact bytes.
+    for row in rows:
+        result = zoom(new, "event:" + digest(row))
+        assert result["ok"]
+        assert base64.b64decode(result["page"]["data_base64"]) == canonical_json(row)
+
+
 def test_republication_keeps_old_generation_and_loaded_view_frozen(tmp_path):
     from hermes_ariadne.prepared import PreparedView, publish_prepared
 
@@ -1207,7 +1289,12 @@ def test_selected_navigation_handles_are_accepted_by_ariadne_zoom(tmp_path):
     for ref in handles:
         assert re.fullmatch(pattern, ref), "compiled handles must satisfy the tool's public schema"
         response = handle_evidence_tool(
-            "ariadne_zoom", {"ref": ref}, store=store, session_id="chosen", kernel=prepared.kernel
+            "ariadne_zoom",
+            {"ref": ref},
+            store=store,
+            session_id="chosen",
+            kernel=prepared.kernel,
+            checkpoint_id=prepared.checkpoint_id,
         )
         assert response["ok"]
         while response["kind"] == "node":
@@ -1217,6 +1304,7 @@ def test_selected_navigation_handles_are_accepted_by_ariadne_zoom(tmp_path):
                 store=store,
                 session_id="chosen",
                 kernel=prepared.kernel,
+                checkpoint_id=prepared.checkpoint_id,
             )
             assert response["ok"]
         recovered.append(response["page"]["event_ref"])
