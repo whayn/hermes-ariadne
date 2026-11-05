@@ -80,6 +80,15 @@ supplies no caller lifetime token with which to identify an old request that
 first enters a hook **after** rebinding. It is not a universal concurrent-request
 or transport-cancellation guarantee.
 
+“Frozen” describes the live engine's attachment policy, not deep immutability of
+arbitrary Python objects. Direct Python users must not build, save or mutate a
+loaded `PreparedView.kernel`; use a separate working kernel to prepare another
+publication. The direct evidence helper's `kernel` and `checkpoint_id` are a
+trusted, matching attachment pair, not model-controlled arguments. Passing a
+mismatched pair or mutating that kernel violates this API precondition. The live
+engine captures both from the same private prepared attachment and never builds
+it; tool arguments and caller-supplied attachment overrides cannot replace them.
+
 ## Deliberately narrow supported mapping
 
 Selection requires a bound active durable source and an exact one-to-one

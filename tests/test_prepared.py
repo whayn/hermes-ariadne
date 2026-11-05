@@ -921,6 +921,126 @@ def test_generation_handles_bind_exact_loaded_checkpoint_across_republication(
         assert base64.b64decode(result["page"]["data_base64"]) == canonical_json(row)
 
 
+def test_publication_validates_captured_bytes_before_replacing_good_manifest(tmp_path, monkeypatch):
+    from threading import Event, Thread
+
+    from hermes_ariadne import prepared as api
+
+    store, _, original, manifest, old = fixture(tmp_path)
+    previous = manifest.read_bytes()
+    building = MemoryKernel(original.projection, tmp_path / "building.json", **original._settings())
+    captured = building.path.read_bytes()
+    started, release, finished = Event(), Event(), Event()
+    errors = []
+    real_save = building._save
+
+    def save_at_boundary():
+        # The sole builder is ready in memory; its pending file is still on disk.
+        started.set()
+        assert release.wait(10), "publisher did not release builder"
+        real_save()
+
+    def build():
+        try:
+            building.build(lambda _: "NEW READY")
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(building, "_save", save_at_boundary)
+    real_checkpoint = api._checkpoint
+
+    def checkpoint(projection, path, settings, **kwargs):
+        # Publication has captured pending bytes. Commit ready bytes before validation.
+        release.set()
+        assert finished.wait(10), "builder did not finish"
+        assert not errors
+        return real_checkpoint(projection, path, settings, **kwargs)
+
+    monkeypatch.setattr(api, "_checkpoint", checkpoint)
+    thread = Thread(target=build)
+    thread.start()
+    try:
+        assert started.wait(10), "builder did not reach save boundary"
+        assert building.view()["usable"]
+        assert building.prefix_view(len(building.projection.event_ids))
+        with pytest.raises(ValueError):
+            api.publish_prepared(building, home=tmp_path)
+    finally:
+        release.set()
+        thread.join(10)
+    assert not thread.is_alive() and not errors
+    assert building.path.read_bytes() != captured
+    assert manifest.read_bytes() == previous
+    monkeypatch.setattr(api, "_checkpoint", real_checkpoint)
+    loaded = api.PreparedView.load(store, "chosen", tmp_path)
+    assert loaded is not None and loaded.checkpoint_id == old.checkpoint_id
+    assert loaded._memory == old._memory
+
+
+def test_prepared_identity_uses_original_noncanonical_checkpoint_bytes(tmp_path, monkeypatch):
+    from hermes_ariadne.prepared import PreparedView, publish_prepared
+
+    store, _, kernel, manifest, _ = fixture(tmp_path)
+    snapshot = json.loads(kernel.path.read_bytes())
+    data = (json.dumps(snapshot, indent=2) + "\n\n").encode("utf-8")
+    assert data != canonical_json(snapshot)
+    kernel.path.write_bytes(data)
+    sha = hashlib.sha256(data).hexdigest()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("prepared snapshot inspection must not load or save a state file")
+
+    monkeypatch.setattr(MemoryKernel, "_load", forbidden)
+    monkeypatch.setattr(MemoryKernel, "_save", forbidden)
+    assert publish_prepared(kernel, home=tmp_path) == manifest
+    loaded = PreparedView.load(store, "chosen", tmp_path)
+    assert loaded is not None and loaded.checkpoint_id == sha
+    assert json.loads(manifest.read_bytes())["checkpoint_sha256"] == sha
+    assert loaded.kernel.path.read_bytes() == data
+    assert loaded.kernel.view() == kernel.view()
+    assert f"node:{sha}:" in loaded._memory
+
+
+@pytest.mark.parametrize("boundary", ["manifest", "checkpoint"])
+def test_load_keeps_captured_generation_during_republication(tmp_path, monkeypatch, boundary):
+    from hermes_ariadne import prepared as api
+
+    store, _, original, manifest, old = fixture(tmp_path)
+    newer = MemoryKernel(original.projection, tmp_path / "new.json", **original._settings())
+    newer.build(lambda _: "NEW GENERATION")
+    real_read = api._read
+    reads = []
+    boundary_path = manifest if boundary == "manifest" else old.kernel.path
+    published = False
+
+    def read(path, limit):
+        nonlocal published
+        data = real_read(path, limit)
+        reads.append(path)
+        if path == boundary_path and not published:
+            published = True
+            api.publish_prepared(newer, home=tmp_path)
+        return data
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("captured checkpoint must not be reread or saved")
+
+    monkeypatch.setattr(api, "_read", read)
+    monkeypatch.setattr(MemoryKernel, "_load", forbidden)
+    monkeypatch.setattr(MemoryKernel, "_save", forbidden)
+    loaded = api.PreparedView.load(store, "chosen", tmp_path)
+    assert published
+    assert loaded is not None and loaded.checkpoint_id == old.checkpoint_id
+    assert loaded.kernel.view() == old.kernel.view() and loaded._memory == old._memory
+    assert reads.count(old.kernel.path) == 1
+    latest = api.PreparedView.load(store, "chosen", tmp_path)
+    assert latest is not None and latest.checkpoint_id != old.checkpoint_id
+    assert latest.kernel.view() == newer.view()
+    assert "NEW GENERATION" in latest._memory
+
+
 def test_republication_keeps_old_generation_and_loaded_view_frozen(tmp_path):
     from hermes_ariadne.prepared import PreparedView, publish_prepared
 

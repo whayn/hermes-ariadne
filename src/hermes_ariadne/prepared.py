@@ -112,10 +112,10 @@ def _atomic(path, value):
             os.unlink(name)
 
 
-def _checkpoint(projection, path, settings):
+def _checkpoint(projection, path, settings, *, snapshot):
     if set(settings) != {"node_bytes", "chat_high", "compactor_high", "summary_version"}:
         raise ValueError("invalid prepared kernel settings")
-    return MemoryKernel(projection, path, **settings)
+    return MemoryKernel.from_snapshot(projection, path, snapshot=snapshot, **settings)
 
 
 def publish_prepared(
@@ -142,7 +142,7 @@ def publish_prepared(
     # Read-only snapshot inspection; never call build/_save or change kernel state.
     if settings != kernel._settings():
         raise ValueError("prepared checkpoint settings differ from the supplied kernel")
-    checked = _checkpoint(kernel.projection, kernel.path, settings)
+    checked = _checkpoint(kernel.projection, kernel.path, settings, snapshot=snapshot)
     count = len(kernel.projection.event_ids)
     if (
         not count
@@ -552,6 +552,12 @@ class SelectionDecision:
 
 @dataclass(frozen=True)
 class PreparedView:
+    """Captured live-attachment generation, not a deeply immutable Python object.
+
+    Trusted callers must not build/save/mutate its kernel; evidence calls must
+    receive the matching kernel/checkpoint_id pair from this same view.
+    """
+
     kernel: MemoryKernel
     checkpoint_id: str  # Exact manifest digest, verified against the loaded checkpoint bytes.
     history_bytes: int
@@ -665,12 +671,12 @@ class PreparedView:
             data = _read(path, MAX_CHECKPOINT_BYTES)
             if hashlib.sha256(data).hexdigest() != sha:
                 return None
-            _json(data)
+            snapshot = _json(data)
             projection = Projection(store, session_id, manifest["event_ids"])
             if projection.projection_id != manifest["projection_id"] or not projection.event_ids:
                 return None
             _require_supported_projection(projection)
-            kernel = _checkpoint(projection, path, manifest["settings"])
+            kernel = _checkpoint(projection, path, manifest["settings"], snapshot=snapshot)
             kernel.prefix_view(len(projection.event_ids))
             limits = manifest["limits"]
             if set(limits) != {"history_bytes", "request_bytes", "reserve_tokens"}:
