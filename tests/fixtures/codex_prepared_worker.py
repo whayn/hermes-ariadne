@@ -128,12 +128,35 @@ def observe_selection(request, **kwargs):
 
 
 engine.select_context = observe_selection
+tool_results, checkpoints = [], []
+original_tool = engine.handle_tool_call
+
+
+def observe_tool_result(name, args, **kwargs):
+    """Read the engine result before host persistence/request assembly, unchanged."""
+    arguments = copy.deepcopy(args)
+    output = original_tool(name, args, **kwargs)
+    tool_results.append(
+        {
+            "turn": current_turn,
+            "name": name,
+            "args": arguments,
+            "output": output,
+        }
+    )
+    return output
+
+
+engine.handle_tool_call = observe_tool_result
 turns = {
     "text": ["first", "second"],
     "tools": ["first", "tools", "aftertools"],
 }.get(MODE, [MODE])
 results = []
 for current_turn in turns:
+    # Authoritative source, captured BEFORE replay loading or request assembly.
+    # A mutually consistent hook/candidate/HTTP omission cannot erase this oracle.
+    checkpoints.append({"turn": current_turn, "durable": copy.deepcopy(db.get_messages(SESSION))})
     history = db.get_messages_as_conversation(SESSION, repair_alternation=True)
     result = agent.run_conversation(
         "SYNTHETIC-CODEX-TURN-" + current_turn,
@@ -151,6 +174,8 @@ report = {
     "pid": os.getpid(),
     "results": results,
     "selections": selections,
+    "checkpoints": checkpoints,
+    "tool_results": tool_results,
     "archive_error": engine.get_status()["archive_error"],
     "original_rows_unchanged": len(seed),
     "original_rows_sha256": hashlib.sha256(canonical_json(original_rows)).hexdigest(),

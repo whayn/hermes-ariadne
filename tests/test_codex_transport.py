@@ -4,6 +4,7 @@ All source, summaries, auth and responses are synthetic; only loopback is allowe
 This proves native replay/selection, not provider fit, model recall or paid routing.
 """
 
+import ast
 import base64
 import copy
 import hashlib
@@ -220,7 +221,11 @@ def codex_worker(tmp_path):
         assert not errors, errors
         assert process.returncode == 0, process.stdout + process.stderr
         report = json.loads(process.stdout.splitlines()[-1])
+        report["expected_steps"] = expected_history_steps(report, trace)
         sent = copy.deepcopy(requests[before:])
+        assert len(report["expected_steps"]) == len(sent), (
+            "every independently expected step must be sent"
+        )
         assert sum(result["api_calls"] for result in report["results"]) == len(sent)
         assert len(report["selections"]) == len(sent), "every request must be observed"
         print(
@@ -253,6 +258,73 @@ def assert_protected_wire(wire, protected):
     assert wire[start : start + 2] == protected, "protected native message order changed"
 
 
+def history_messages(rows, *, loaded=False):
+    """Project only transcript-bearing fields; ignore host row/usage metadata.
+
+    Expected durable rows alone receive SessionDB's audited loaded-view strip.
+    Observations are NEVER normalized. Native call dictionaries stay exact.
+    """
+    projected = []
+    for row in rows:
+        message = {"role": row["role"], "content": row.get("content")}
+        if loaded and row["role"] in {"user", "assistant"} and isinstance(message["content"], str):
+            message["content"] = message["content"].strip()
+        for key in ("tool_calls", "tool_call_id", "codex_message_items"):
+            value = row.get(key)
+            if value:
+                if key in {"tool_calls", "codex_message_items"} and isinstance(value, str):
+                    value = json.loads(value)
+                message[key] = copy.deepcopy(value)
+        projected.append(message)
+    return projected
+
+
+def expected_native_input(rows):
+    """Audited subset of custom Responses formatting, NOT the formatter under test.
+
+    turn_request_assembly strips strings on the send copy. The Responses adapter
+    replays ordinary message carriers, omits empty tool-owner text, and projects
+    tool calls WITHOUT response_item_id. These fixtures have unique short call
+    ids and no reasoning, structured content, cross-issuer or compaction items.
+    """
+    wire = []
+    for row in rows:
+        role, content = row["role"], row.get("content")
+        if isinstance(content, str):
+            content = content.strip()
+        if role == "tool":
+            wire.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": row["tool_call_id"],
+                    "output": content or "",
+                }
+            )
+            continue
+        assert role in {"user", "assistant"}, "unsupported expected fixture role"
+        carrier = row.get("codex_message_items")
+        if isinstance(carrier, str):
+            carrier = json.loads(carrier)
+        if carrier:
+            wire.extend(copy.deepcopy(carrier))
+        elif role == "user" or content:
+            wire.append({"type": "message", "role": role, "content": content})
+        for call in row.get("tool_calls") or []:
+            wire.append(
+                {
+                    "type": "function_call",
+                    "call_id": call["call_id"],
+                    "name": call["function"]["name"],
+                    "arguments": json.dumps(
+                        json.loads(call["function"]["arguments"]),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                }
+            )
+    return wire
+
+
 def assert_baseline(report, sent):
     assert_original_rows(report)
     protected_source = [
@@ -271,7 +343,16 @@ def assert_baseline(report, sent):
     ]
     assert report["selections"], "no baseline hook observations"
     assert len(report["selections"]) == len(sent)
-    for entry, request in zip(report["selections"], sent, strict=True):
+    assert len(report["expected_steps"]) == len(sent), "incomplete independent baseline matrix"
+    for entry, request, expected in zip(
+        report["selections"], sent, report["expected_steps"], strict=True
+    ):
+        assert history_messages(entry["request"][1:]) == history_messages(expected, loaded=True), (
+            "baseline hook history changed"
+        )
+        assert request["body"]["input"] == expected_native_input(expected), (
+            "baseline complete history changed"
+        )
         assert "exception" not in entry, entry
         assert entry["candidate"] is None
         assert entry["request_unchanged"] is True
@@ -298,12 +379,14 @@ def pure_baseline_evidence():
         "original_rows_sha256": "synthetic-seed-digest",
         "seed_sha256": "synthetic-seed-digest",
         "durable": copy.deepcopy(rows),
+        "expected_steps": [copy.deepcopy(rows)],
         "selections": [
             {
                 "candidate": None,
                 "request_unchanged": True,
                 "selection": {"status": "declined", "reason": "prepared_unavailable"},
-                "request": [{"role": "system", "content": "host policy"}] + rows,
+                "request": [{"role": "system", "content": "host policy"}]
+                + [{"role": row["role"], "content": row["content"].strip()} for row in rows],
             }
         ],
     }
@@ -324,6 +407,83 @@ def pure_baseline_evidence():
 
 def test_pure_baseline_accepts_noop_evidence():
     assert_baseline(*pure_baseline_evidence())
+
+
+def test_pure_baseline_accepts_canonical_null_tool_calls():
+    report, sent = pure_baseline_evidence()
+    # Real SessionDB rows include SQL NULL here; restored request messages omit it.
+    for row in report["durable"]:
+        row["tool_calls"] = None
+    for rows in report["expected_steps"]:
+        for row in rows:
+            row["tool_calls"] = None
+    assert_baseline(report, sent)
+
+
+def test_pure_baseline_accepts_complete_seed_incoming_and_replayed_tail():
+    report, sent = pure_baseline_evidence()
+    first = {"role": "user", "content": "SYNTHETIC-CODEX-TURN-first"}
+    answer = {
+        "role": "assistant",
+        "content": "synthetic Codex first",
+        "codex_message_items": [completed_message("first")],
+    }
+    second = {"role": "user", "content": "SYNTHETIC-CODEX-TURN-second"}
+    source = {
+        "checkpoints": [
+            {"turn": "first", "durable": copy.deepcopy(report["durable"])},
+            {"turn": "second", "durable": copy.deepcopy(report["durable"] + [first, answer])},
+        ],
+        "tool_results": [],
+    }
+    report["expected_steps"] = expected_history_steps(source, {"calls": []})
+    initial_hook = copy.deepcopy(report["selections"][0])
+    initial_wire = copy.deepcopy(sent[0])
+    # Explicit source-shaped observations include native carrier, not plain text
+    # reconstructed from the possibly broken request.
+    report["selections"] = [copy.deepcopy(initial_hook), copy.deepcopy(initial_hook)]
+    report["selections"][0]["request"] += [copy.deepcopy(first)]
+    report["selections"][1]["request"] += copy.deepcopy([first, answer, second])
+    sent = [copy.deepcopy(initial_wire), copy.deepcopy(initial_wire)]
+    sent[0]["body"]["input"] += [{"type": "message", **first}]
+    sent[1]["body"]["input"] += [
+        {"type": "message", **first},
+        completed_message("first"),
+        {"type": "message", **second},
+    ]
+    assert_baseline(report, sent)
+
+
+@pytest.mark.parametrize("damage", ["content", "replacement", "duplicate", "order", "missing_tail"])
+@pytest.mark.parametrize("boundary", ["http", "hook", "all"])
+def test_pure_baseline_rejects_complete_history_damage(damage, boundary):
+    report, sent = pure_baseline_evidence()
+    # Independent seeded source, not the HTTP input we are about to corrupt.
+    report["expected_steps"] = [copy.deepcopy(report["durable"])]
+    tail = {"role": "user", "content": "SYNTHETIC-CODEX-TURN-baseline"}
+    report["expected_steps"][0].append(copy.deepcopy(tail))
+    report["selections"][0]["request"].append(copy.deepcopy(tail))
+    wire = sent[0]["body"]["input"]
+    wire.append({"type": "message", **tail})
+    targets = []
+    if boundary in ("http", "all"):
+        targets.append(wire)
+    if boundary in ("hook", "all"):
+        targets.append(report["selections"][0]["request"])
+    for rows in targets:
+        start = 1 if rows is report["selections"][0]["request"] else 0
+        if damage == "content":
+            rows[start + 1]["content"] = "CHANGED early assistant"
+        elif damage == "replacement":
+            rows[start + 1] = copy.deepcopy(rows[start])
+        elif damage == "duplicate":
+            rows.append(copy.deepcopy(rows[start + 1]))
+        elif damage == "order":
+            rows[start], rows[start + 1] = rows[start + 1], rows[start]
+        else:
+            rows.pop()
+    with pytest.raises(AssertionError):
+        assert_baseline(report, sent)
 
 
 @pytest.mark.parametrize(
@@ -405,9 +565,11 @@ def pure_selected_evidence():
     assert_baseline(baseline_report, original)
     report = copy.deepcopy(baseline_report)
     report["selections"] = []
+    report["expected_steps"] = []
     sent = []
     for turn in ("selected", "tool", "restarted"):
         incoming = {"role": "user", "content": "SYNTHETIC-CODEX-TURN-" + turn}
+        report["expected_steps"].append(copy.deepcopy(baseline_report["durable"] + [incoming]))
         request = copy.deepcopy(baseline_report["selections"][0]["request"]) + [incoming]
         candidate = (
             request[:1]
@@ -520,7 +682,22 @@ def assert_native_replay(report, sent, baseline):
     # Use the observed no-op transport items, independently checked against the
     # seeded durable source by assert_baseline, never the candidate under test.
     protected = copy.deepcopy(baseline["input"][4:6])
-    for entry, request in zip(report["selections"], sent, strict=True):
+    assert len(report["expected_steps"]) == len(sent), (
+        "incomplete independent retained-history matrix"
+    )
+    for entry, request, expected in zip(
+        report["selections"], sent, report["expected_steps"], strict=True
+    ):
+        assert history_messages(entry["request"][1:]) == history_messages(expected, loaded=True), (
+            "complete hook history changed"
+        )
+        # Only the published four-row prefix may disappear; retained tool pairs
+        # added after it must survive even if all observed boundaries agree to
+        # omit the same pair. Native response-item ids are checked HERE, not on
+        # HTTP, where the audited host intentionally omits them.
+        assert history_messages(entry["candidate"][2:]) == history_messages(
+            expected[4:], loaded=True
+        ), "complete candidate history changed"
         wire = request["body"]["input"]
         # prepared.py emits a plain assistant summary without a replay carrier.
         # turn_request_assembly applies selection first (145-147), then strips
@@ -538,6 +715,9 @@ def assert_native_replay(report, sent, baseline):
         }
         assert wire[:1] == [navigation], "prepared navigation missing, changed or moved"
         assert wire.count(navigation) == 1, "prepared navigation duplicated"
+        assert wire == [navigation] + expected_native_input(expected[4:]), (
+            "complete HTTP retained history changed"
+        )
         assert_protected_wire(wire, protected)
         assert request["body"]["instructions"] == baseline["instructions"]
         assert sorted(tool["name"] for tool in request["body"]["tools"]) == [
@@ -604,6 +784,212 @@ def test_completed_codex_carrier_selects_again_next_user_turn_and_restart(codex_
     assert_selected(live)
     assert_selected(restarted)
     assert resumed[0]["body"]["input"][:-2] == sent[-1]["body"]["input"]
+
+
+def test_pure_worker_tool_observer_preserves_return_and_snapshots_source():
+    # Execute ONLY the observer definition, never the worker module or host SDK.
+    path = Path(__file__).parent / "fixtures" / "codex_prepared_worker.py"
+    tree = ast.parse(path.read_text())
+    observer = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "observe_tool_result"
+        ),
+        None,
+    )
+    assert observer is not None, "worker needs an independent preassembly tool result observer"
+    args, outputs = {"ref": "event:synthetic", "offset": 1024}, []
+    calls = []
+
+    def original(name, arguments, **kwargs):
+        calls.append((name, copy.deepcopy(arguments), kwargs))
+        return '{"ok":true,"synthetic":"EXACT café  "}'
+
+    namespace = {
+        "copy": copy,
+        "original_tool": original,
+        "tool_results": outputs,
+        "current_turn": "tools",
+    }
+    exec(compile(ast.Module(body=[observer], type_ignores=[]), str(path), "exec"), namespace)
+    result = namespace["observe_tool_result"]("ariadne_zoom", args, synthetic=True)
+    assert result == '{"ok":true,"synthetic":"EXACT café  "}'
+    assert calls == [("ariadne_zoom", args, {"synthetic": True})]
+    assert outputs == [{"turn": "tools", "name": "ariadne_zoom", "args": args, "output": result}]
+    args["offset"] = 9999
+    assert outputs[0]["args"]["offset"] == 1024
+
+
+def expected_history_steps(report, trace):
+    """Independent matrix: BEFORE-run canonical checkpoints + server call constants.
+
+    Tool output is observed at the engine handler return, before the host appends
+    it or assembles the next request. Never use hook/conversation/candidate/HTTP
+    observations to decide what should have survived.
+    """
+    calls = trace["calls"]
+    results = report["tool_results"]
+    assert len(calls) == len(results), "scripted call/result source mismatch"
+    pairs = []
+    for call, result in zip(calls, results, strict=True):
+        assert result["turn"] == "tools"
+        assert result["name"] == call["name"]
+        assert result["args"] == json.loads(call["arguments"])
+        pairs.append(
+            [
+                # _normalize_codex_response returns empty final_text for a call-only
+                # response; build_assistant_message stores that empty string.
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": call["call_id"],
+                            "call_id": call["call_id"],
+                            "response_item_id": call["id"],
+                            "type": "function",
+                            "function": {"name": call["name"], "arguments": call["arguments"]},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": call["call_id"], "content": result["output"]},
+            ]
+        )
+    steps = []
+    tool_turns = 0
+    for checkpoint in report["checkpoints"]:
+        turn = checkpoint["turn"]
+        history = copy.deepcopy(checkpoint["durable"]) + [
+            {
+                "role": "user",
+                "content": "SYNTHETIC-CODEX-TURN-" + turn,
+            }
+        ]
+        steps.append(copy.deepcopy(history))
+        if turn == "tools":
+            tool_turns += 1
+            for pair in pairs:
+                history.extend(copy.deepcopy(pair))
+                steps.append(copy.deepcopy(history))
+    assert tool_turns == (1 if pairs else 0), "tool results outside scripted turn"
+    return steps
+
+
+def test_pure_expected_matrix_uses_preassembly_sources_not_observations():
+    seed = pure_baseline_evidence()[0]["durable"]
+    history, calls = pure_tool_history_evidence()
+    source = {
+        "checkpoints": [
+            {"turn": "tools", "durable": copy.deepcopy(seed)},
+            {"turn": "aftertools", "durable": copy.deepcopy(seed + history["durable"])},
+        ],
+        "tool_results": [
+            {
+                "turn": "tools",
+                "name": call["name"],
+                "args": json.loads(call["arguments"]),
+                "output": f"source result {index}",
+            }
+            for index, call in enumerate(calls)
+        ],
+        # Poison every tempting circular source. The constructor must not read it.
+        "selections": [{"request": [], "candidate": []}],
+        "durable": [],
+        "replay": [],
+    }
+    expected = expected_history_steps(source, {"calls": calls})
+    assert len(expected) == 4
+    assert expected[0] == seed + [{"role": "user", "content": "SYNTHETIC-CODEX-TURN-tools"}]
+    assert expected[-1] == seed + history["durable"] + [
+        {"role": "user", "content": "SYNTHETIC-CODEX-TURN-aftertools"}
+    ]
+    for index, call in enumerate(calls):
+        owner, result = expected[index + 1][-2:]
+        assert owner["tool_calls"] == history["durable"][index * 2]["tool_calls"]
+        assert result == {
+            "role": "tool",
+            "tool_call_id": call["call_id"],
+            "content": f"source result {index}",
+        }
+    assert expected[1][:-2] == expected[0]
+    assert expected[2][:-2] == expected[1]
+    expected[2][0]["content"] = "mutated derived expectation"
+    assert source["checkpoints"][0]["durable"][0] == seed[0]
+    assert expected[0][0] == seed[0]
+
+
+def pure_retained_tool_evidence():
+    """Expected post-prefix pairs come from a scripted source, not hook/HTTP."""
+    report, sent, baseline = pure_selected_evidence()
+    history, _ = pure_tool_history_evidence()
+    pairs = copy.deepcopy(history["replay"])
+    for index in range(2):
+        pairs[index * 2]["content"] = None
+        # Match the scripted server's already-canonical argument constants.
+        function = pairs[index * 2]["tool_calls"][0]["function"]
+        function["arguments"] = json.dumps(
+            json.loads(function["arguments"]), sort_keys=True, separators=(",", ":")
+        )
+        pairs[index * 2 + 1]["content"] = "synthetic result " + str(index)
+    report.update(copy.deepcopy(history))
+    report["expected_steps"] = []
+    for index, (entry, request, turn) in enumerate(
+        zip(report["selections"], sent, ("selected", "tool", "restarted"), strict=True)
+    ):
+        retained = pairs[:2] if index == 0 else pairs
+        incoming = {"role": "user", "content": "SYNTHETIC-CODEX-TURN-" + turn}
+        # Seed source + explicit scripted calls/results, never the request being
+        # checked. First step has one pair; subsequent/restarted steps have both.
+        report["expected_steps"].append(
+            copy.deepcopy(pure_baseline_evidence()[0]["durable"] + retained + [incoming])
+        )
+        for key in ("request", "candidate"):
+            entry[key][-1:-1] = copy.deepcopy(retained)
+        request["body"]["input"][-1:-1] = expected_native_input(retained)
+    return report, sent, baseline
+
+
+def test_pure_retained_tool_matrix_accepts_complete_inflight_and_restarted_history():
+    report, sent, baseline = pure_retained_tool_evidence()
+    assert_selected(report)
+    assert_native_replay(report, sent, baseline)
+
+
+@pytest.mark.parametrize("step", [1, 2], ids=["subsequent", "restarted"])
+@pytest.mark.parametrize("boundary", ["hook", "candidate", "http", "all"])
+@pytest.mark.parametrize("damage", ["omitted_pair", "duplicate_pair", "pair_order", "native_id"])
+def test_pure_retained_tool_matrix_rejects_damage(step, boundary, damage):
+    report, sent, baseline = pure_retained_tool_evidence()
+    entry = report["selections"][step]
+    for key in ("request", "candidate"):
+        if boundary not in (key if key == "candidate" else "hook", "all"):
+            continue
+        rows = entry[key]
+        start = next(i for i, row in enumerate(rows) if row.get("tool_calls"))
+        if damage == "omitted_pair":
+            del rows[start : start + 2]
+        elif damage == "duplicate_pair":
+            rows[start:start] = copy.deepcopy(rows[start : start + 2])
+        elif damage == "pair_order":
+            rows[start : start + 4] = rows[start + 2 : start + 4] + rows[start : start + 2]
+        else:
+            rows[start]["tool_calls"][0]["response_item_id"] = "fc_native_WRONG"
+    if boundary in ("http", "all"):
+        wire = sent[step]["body"]["input"]
+        start = next(i for i, row in enumerate(wire) if row.get("type") == "function_call")
+        if damage == "omitted_pair":
+            del wire[start : start + 2]
+        elif damage == "duplicate_pair":
+            wire[start:start] = copy.deepcopy(wire[start : start + 2])
+        elif damage == "pair_order":
+            wire[start : start + 4] = wire[start + 2 : start + 4] + wire[start : start + 2]
+        elif boundary == "http":
+            # HTTP legitimately has NO response-item id. Alter its actual native
+            # identity instead; hook/candidate native_id cases alter the fc id.
+            wire[start]["call_id"] = wire[start + 1]["call_id"] = "call_WRONG"
+    with pytest.raises(AssertionError):
+        assert_native_replay(report, sent, baseline)
 
 
 def pure_tool_history_evidence():
