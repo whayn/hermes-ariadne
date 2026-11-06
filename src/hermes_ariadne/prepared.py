@@ -244,13 +244,73 @@ def _safe_json(value):
             raise ValueError("non-JSON value")
 
 
-def _provider(message, *, wire=False):
+def _ordinary_codex_message(message, *, wire=False, durable=False):
+    """Validate only one reasoning-free, completed assistant output-text item.
+
+    codex_responses_adapter._OutputScan._message stores this shape and
+    _replay_message_items replays its text/status/id/phase. Deliberately accept
+    only clean ASCII msg_* ids (narrower than the host's msg prefix rule), so
+    no provider id/phase/status repair is needed or hidden by comparison.
+    """
+    items = message["codex_message_items"]
+    if durable and type(items) is str:
+        # SessionDB._reasoning_json_text persists this column as JSON TEXT;
+        # _rows_to_conversation decodes it. Decode ONLY canonical active rows
+        # for comparison, never arbitrary restored/request substitutions.
+        items = _json(items.encode("utf-8", "surrogatepass"))
+    if (
+        message["role"] != "assistant"
+        or any(
+            message.get(key) is not None
+            for key in ("tool_calls", "tool_call_id", "tool_name", "effect_disposition")
+        )
+        or type(items) is not list
+        or len(items) != 1
+    ):
+        raise ValueError("unsupported ordinary Codex message")
+    item = items[0]
+    required = {"type", "role", "status", "content"}
+    if (
+        type(item) is not dict
+        or not required <= item.keys()
+        or item.keys() - required - {"id", "phase"}
+        or item["type"] != "message"
+        or item["role"] != "assistant"
+        or item["status"] != "completed"
+        or ("phase" in item and item["phase"] != "final_answer")
+    ):
+        raise ValueError("unsupported Codex message item")
+    if "id" in item and (
+        type(item["id"]) is not str or re.fullmatch(r"msg_[A-Za-z0-9_-]{1,60}", item["id"]) is None
+    ):
+        raise ValueError("unsupported Codex message identity")
+    parts = item["content"]
+    if type(parts) is not list or len(parts) != 1:
+        raise ValueError("unsupported Codex message content")
+    part = parts[0]
+    if (
+        type(part) is not dict
+        or set(part) != {"type", "text"}
+        or part["type"] != "output_text"
+        or type(part["text"]) is not str
+        or not part["text"]
+    ):
+        raise ValueError("contradictory Codex message text")
+    if part["text"] != message["content"] and not (
+        (wire or message.get("_db_persisted") is True)
+        and part["text"].strip() == message["content"]
+    ):
+        raise ValueError("contradictory Codex message text")
+    return items
+
+
+def _provider(message, *, wire=False, durable=False):
     if type(message) is not dict:
         raise ValueError("message must be a mapping")
     # At select_context this is assembled, not final HTTP: Hermes strips the
     # born-durable marker only in the later chat-completions transport.
     allowed = (
-        _WIRE | {"_db_persisted", "tool_name", "effect_disposition"}
+        _WIRE | {"_db_persisted", "tool_name", "effect_disposition", "codex_message_items"}
         if wire
         else _WIRE | _METADATA | _CARRIERS | _IDENTITIES
     )
@@ -265,11 +325,15 @@ def _provider(message, *, wire=False):
         role == "assistant" and content is None and message.get("tool_calls")
     ):
         raise ValueError("only text and assistant tool-call messages are supported")
+    codex_items = None
     for key in _CARRIERS & message.keys():
         value = message[key]
         if key == "api_content" and value == content:
             continue  # An identical sidecar cannot change this supported wire mapping.
         if value not in (None, "", False, [], {}):
+            if key == "codex_message_items":
+                codex_items = _ordinary_codex_message(message, wire=wire, durable=durable)
+                continue
             raise ValueError("unsupported replay carrier")
     for key in ("_absorbed_message_uids", "absorbed_message_uids"):
         if message.get(key) not in (None, [], "[]", ""):
@@ -281,6 +345,10 @@ def _provider(message, *, wire=False):
         for key, value in message.items()
         if key in _WIRE and (key in {"role", "content"} or value is not None)
     }
+    if codex_items is not None:
+        # A real replay payload, never a redundant text sidecar: compare every
+        # validated field across active, restored and assembled views unchanged.
+        result["codex_message_items"] = codex_items
     if "tool_calls" in result and role != "assistant":
         raise ValueError("cross-role tool calls")
     if "tool_call_id" in result and role != "tool":
@@ -288,7 +356,7 @@ def _provider(message, *, wire=False):
     return result
 
 
-def _comparison(message, *, wire=False):
+def _comparison(message, *, wire=False, durable=False):
     """Audited pretransport comparison only; never returned as request/source.
 
     _assistant_tool_call_dict adds these two Responses sidecars, then
@@ -296,7 +364,7 @@ def _comparison(message, *, wire=False):
     the deterministic no-native-item-id case is supported here; a signed or
     independently assigned provider item is not interchangeable evidence.
     """
-    result = _provider(message, wire=wire)
+    result = _provider(message, wire=wire, durable=durable)
     # make_tool_result_message writes name + tool_name; SessionDB restores only
     # tool_name. Reconcile this alias ONLY for tool results, never speakers.
     for key in ("tool_name", "effect_disposition"):
@@ -389,13 +457,13 @@ def _identity_value(message, name):
     return values[0] if values else None
 
 
-def _occurrences(messages):
+def _occurrences(messages, *, durable=False):
     _tool_sequence(messages)
     pending = {}
     seen = set()
     identities = []
     for message in messages:
-        calls = _comparison(message).get("tool_calls")
+        calls = _comparison(message, durable=durable).get("tool_calls")
         mapping = _identity_value(message, "tool_call_uids")
         result_uid = _identity_value(message, "tool_call_uid")
         if mapping is not None and (message["role"] != "assistant" or not calls):
@@ -474,7 +542,16 @@ def _alignment(prepared, request, conversation, incoming, active):
     raw_payload = [_comparison(m) for m in history]
     if any(m["role"] not in {"user", "assistant", "tool"} for m in raw_payload):
         raise ValueError("host role inside history")
-    active_payload = [_comparison(m) for m in active]
+    active_payload = [_comparison(m, durable=True) for m in active]
+    for index, replay in enumerate(raw_payload):
+        items = replay.get("codex_message_items")
+        if items:
+            text = items[0]["content"][0]["text"]
+            # Bind every replay carrier to an exact canonical active text too;
+            # only the outer restored content may strip. A stamp alone is not
+            # source evidence. Comparisons below bind the untrimmed carrier.
+            if index >= len(active_payload) or active_payload[index]["content"] != text:
+                raise ValueError("Codex replay requires exact active source")
     for source, replay, message in zip(active_payload, raw_payload, history):
         if canonical_json(source) == canonical_json(replay):
             continue
@@ -519,7 +596,9 @@ def _alignment(prepared, request, conversation, incoming, active):
             "retain the previous exchange and complete current turn at a user boundary"
         )
     occurrences = _occurrences(history)
-    if canonical_json(_occurrences(active)) != canonical_json(occurrences[: len(active)]):
+    if canonical_json(_occurrences(active, durable=True)) != canonical_json(
+        occurrences[: len(active)]
+    ):
         raise ValueError("active/conversation occurrence mismatch")
     _tool_sequence(raw_payload[count:])
     return split

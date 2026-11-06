@@ -115,6 +115,20 @@ by Hermes's outer-whitespace trimming; interior edits and tool-result trimming
 are not admitted. None of these comparison projections rewrites source bytes or
 the returned protected request suffix.
 
+One ordinary native Codex final-answer carrier is also supported: exactly one
+completed assistant `message`, containing exactly one nonempty `output_text`
+part matching the canonical answer. Its optional ID must be a clean ASCII
+`msg_`-prefixed value within 64 characters; its phase must be absent or
+`final_answer`. The complete validated item (including ID, status, phase and
+untrimmed text) remains part of comparison identity. Hermes stores this carrier
+as JSON text in canonical durable rows and restores it as a list. Only canonical
+active rows receive strict comparison-only JSON decoding; duplicate keys,
+nonfinite values and malformed shapes decline. Request/replay strings are not
+silently decoded. Source hashes still cover the exact stored representation,
+and the actual retained assembled suffix is not rewritten. Nonempty reasoning
+carriers, commentary, multiple-message outputs, signatures and unknown or
+contradictory fields remain unsupported.
+
 Archive retention does not prove active-branch membership. A valid summary is not
 evidence that every old natural-language restriction or preference survived
 semantically.

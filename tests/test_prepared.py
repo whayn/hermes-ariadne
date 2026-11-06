@@ -127,6 +127,525 @@ def test_select_exact_prefix_preserves_actual_request_and_sources(tmp_path):
     assert (active, conversation, wire) == original
 
 
+def ordinary_codex_fixture(tmp_path, *, text='{"current_ship":"2042-04-09"}'):
+    conversation: list[dict]
+    wire: list[dict]
+    prepared, _, conversation, wire = selection_fixture(tmp_path)
+    carrier = [
+        {
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": text}],
+            "id": "msg_ordinary_completed_12",
+            "phase": "final_answer",
+        }
+    ]
+    conversation[3].update(content=text, codex_message_items=carrier)
+    active = copy.deepcopy(conversation)
+    wire[5].update(content=text, codex_message_items=copy.deepcopy(carrier))
+    return prepared, active, conversation, wire
+
+
+def test_ordinary_completed_codex_message_preserves_exact_retained_carrier(tmp_path):
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path)
+    before = copy.deepcopy((active, conversation, wire))
+    archive = prepared.projection._archive.path.read_bytes()
+    checkpoint = prepared.kernel.path.read_bytes()
+
+    def measure(candidate):
+        candidate[4]["codex_message_items"][0]["content"][0]["text"] = "counter mutation"
+        return 100
+
+    result = choose(prepared, active, conversation, wire, measure_tokens=measure)
+
+    assert result.status == "selected" and result.messages is not None
+    assert result.messages[:2] == wire[:2]
+    assert result.messages[3:] == wire[4:]
+    result.messages[4]["codex_message_items"][0]["id"] = "msg_return_mutation"
+    assert (active, conversation, wire) == before
+    assert prepared.projection._archive.path.read_bytes() == archive
+    assert prepared.kernel.path.read_bytes() == checkpoint
+
+
+@pytest.mark.parametrize("text", ["ordinary reply λ", " \n\tordinary reply λ \n"])
+def test_durable_serialized_codex_carrier_aligns_with_restored_lists(tmp_path, text):
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path, text=text)
+    # SessionDB._reasoning_json_text stores JSON TEXT; _rows_to_conversation
+    # decodes it and _loaded_view_content strips only the outer replay content.
+    active[3]["codex_message_items"] = json.dumps(active[3]["codex_message_items"])
+    conversation[3].update(content=text.strip(), _db_persisted=True)
+    wire[5].update(content=text.strip(), _db_persisted=True)
+    before = copy.deepcopy((active, conversation, wire))
+    source_hash = digest(active[3])
+    archive = prepared.projection._archive.path.read_bytes()
+    checkpoint = prepared.kernel.path.read_bytes()
+
+    result = choose(prepared, active, conversation, wire)
+
+    assert result.status == "selected" and result.messages is not None
+    assert result.messages[3:] == wire[4:]
+    assert result.messages[4]["codex_message_items"] == json.loads(active[3]["codex_message_items"])
+    assert digest(active[3]) == source_hash
+    assert (active, conversation, wire) == before
+    assert prepared.projection._archive.path.read_bytes() == archive
+    assert prepared.kernel.path.read_bytes() == checkpoint
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "malformed",
+        "object",
+        "null",
+        "boolean",
+        "empty",
+        "double_encoded",
+        "duplicate_id",
+        "duplicate_status",
+        "duplicate_phase",
+        "duplicate_content",
+        "duplicate_text",
+        "unknown_item_key",
+        "unknown_part_key",
+        "nan",
+        "infinity",
+        "overflow",
+        "role",
+        "status",
+        "phase",
+        "id",
+        "text",
+    ],
+)
+def test_durable_serialized_codex_carrier_decoding_stays_strict(tmp_path, mutation):
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path, text="ordinary λ")
+    items = copy.deepcopy(active[3]["codex_message_items"])
+    encoded = json.dumps(items)
+    if mutation == "malformed":
+        encoded = encoded[:-1]
+    elif mutation in {"object", "null", "boolean", "empty"}:
+        encoded = {"object": "{}", "null": "null", "boolean": "true", "empty": "[]"}[mutation]
+    elif mutation == "double_encoded":
+        encoded = json.dumps(encoded)
+    elif mutation.startswith("duplicate_"):
+        key = mutation.removeprefix("duplicate_")
+        value = items[0]["content"][0][key] if key == "text" else items[0][key]
+        field = json.dumps(key) + ": " + json.dumps(value)
+        encoded = encoded.replace(field, field + ", " + field)
+    elif mutation == "unknown_item_key":
+        items[0]["unknown"] = "opaque"
+        encoded = json.dumps(items)
+    elif mutation == "unknown_part_key":
+        items[0]["content"][0]["annotations"] = []
+        encoded = json.dumps(items)
+    elif mutation in {"nan", "infinity", "overflow"}:
+        number = {"nan": "NaN", "infinity": "-Infinity", "overflow": "1e999"}[mutation]
+        encoded = encoded.replace('"msg_ordinary_completed_12"', number)
+    else:
+        if mutation == "text":
+            items[0]["content"][0]["text"] = "substituted"
+            active[3]["content"] = "substituted"
+        else:
+            items[0][mutation] = {
+                "role": "user",
+                "status": "in_progress",
+                "phase": "commentary",
+                "id": "msg_other_valid_id",
+            }[mutation]
+        encoded = json.dumps(items)
+    active[3]["codex_message_items"] = encoded
+    before = copy.deepcopy((active, conversation, wire))
+    measured = []
+
+    result = choose(
+        prepared, active, conversation, wire, measure_tokens=lambda m: measured.append(m) or 100
+    )
+
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment"
+    assert measured == []
+    assert (active, conversation, wire) == before
+
+
+@pytest.mark.parametrize("location", ["conversation", "request", "both"])
+@pytest.mark.parametrize("serialized_active", [False, True])
+def test_serialized_codex_carrier_is_not_an_arbitrary_replay_view(
+    tmp_path, location, serialized_active
+):
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path)
+    encoded = json.dumps(active[3]["codex_message_items"])
+    if serialized_active:
+        active[3]["codex_message_items"] = encoded
+    for target, row in (("conversation", conversation[3]), ("request", wire[5])):
+        row["_db_persisted"] = True
+        if location in {target, "both"}:
+            row["codex_message_items"] = encoded
+    before = copy.deepcopy((active, conversation, wire))
+    measured = []
+
+    result = choose(
+        prepared, active, conversation, wire, measure_tokens=lambda m: measured.append(m) or 100
+    )
+
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment"
+    assert measured == []
+    assert (active, conversation, wire) == before
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("role", "user"),
+        ("tool_calls", []),
+        ("reasoning", "opaque"),
+        ("codex_reasoning_items", '[{"type":"reasoning"}]'),
+    ],
+)
+def test_durable_serialized_codex_carrier_does_not_authorize_other_shapes(tmp_path, field, value):
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path)
+    active[3]["codex_message_items"] = json.dumps(active[3]["codex_message_items"])
+    active[3][field] = value
+    measured = []
+
+    result = choose(
+        prepared, active, conversation, wire, measure_tokens=lambda m: measured.append(m) or 100
+    )
+
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment"
+    assert measured == []
+
+
+def test_ordinary_codex_carrier_requires_active_source_coverage(tmp_path):
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path)
+    result = choose(prepared, active[:2], conversation, wire)
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment"
+
+
+@pytest.mark.parametrize("request_marker", [False, True])
+def test_restored_codex_outer_whitespace_keeps_exact_carrier(tmp_path, request_marker):
+    prepared, active, conversation, wire = ordinary_codex_fixture(
+        tmp_path, text=" \n\tordinary answer λ \n"
+    )
+    conversation[3].update(content=conversation[3]["content"].strip(), _db_persisted=True)
+    wire[5]["content"] = conversation[3]["content"]
+    if request_marker:
+        wire[5]["_db_persisted"] = True
+    before = copy.deepcopy((active, conversation, wire))
+
+    result = choose(prepared, active, conversation, wire)
+
+    assert result.status == "selected" and result.messages is not None
+    assert result.messages[3:] == wire[4:]
+    assert result.messages[4]["codex_message_items"] == active[3]["codex_message_items"]
+    assert result.messages[4]["codex_message_items"][0]["content"][0]["text"].startswith(" \n\t")
+    assert (active, conversation, wire) == before
+
+
+@pytest.mark.parametrize("source", ["uncovered", "already_trimmed"])
+def test_restored_codex_whitespace_requires_exact_active_source(tmp_path, source):
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path, text=" answer \n")
+    conversation[3].update(content="answer", _db_persisted=True)
+    wire[5].update(content="answer")
+    if source == "uncovered":
+        active = active[:2]
+    else:
+        active[3].update(content="answer", _db_persisted=True)
+    before = copy.deepcopy((active, conversation, wire))
+    measured = []
+
+    result = choose(
+        prepared, active, conversation, wire, measure_tokens=lambda m: measured.append(m) or 100
+    )
+
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment"
+    assert measured == []
+    assert (active, conversation, wire) == before
+
+
+@pytest.mark.parametrize(
+    "optional",
+    [
+        {},
+        {"phase": "final_answer"},
+        {"id": "msg_x"},
+        {"id": "msg_" + "x" * 60, "phase": "final_answer"},
+    ],
+)
+def test_ordinary_codex_optional_identity_fields_are_preserved(tmp_path, optional):
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path)
+    for row in (active[3], conversation[3], wire[5]):
+        item = row["codex_message_items"][0]
+        item.pop("id")
+        item.pop("phase")
+        item.update(optional)
+    result = choose(prepared, active, conversation, wire)
+    assert result.status == "selected" and result.messages is not None
+    assert result.messages[3:] == wire[4:]
+
+
+@pytest.mark.parametrize("location", ["active", "conversation", "request"])
+@pytest.mark.parametrize(
+    "path,value",
+    [
+        ((), "serialized carrier"),
+        ((), {"type": "message"}),
+        ((), True),
+        ((), [None]),
+        ((), [{}, {}]),
+        ((0, "type"), "reasoning"),
+        ((0, "role"), "user"),
+        ((0, "status"), "in_progress"),
+        ((0, "status"), None),
+        ((0, "phase"), "commentary"),
+        ((0, "phase"), "analysis"),
+        ((0, "phase"), "final"),
+        ((0, "phase"), " final_answer "),
+        ((0, "phase"), None),
+        ((0, "id"), " msg_x "),
+        ((0, "id"), "msg_x\n"),
+        ((0, "id"), "msg_λ"),
+        ((0, "id"), "msg_" + "x" * 61),
+        ((0, "id"), "msg_"),
+        ((0, "id"), "msgforeign"),
+        ((0, "id"), "fc_x"),
+        ((0, "id"), 1),
+        ((0, "id"), None),
+        ((0, "extra"), "opaque"),
+        ((0, "content"), []),
+        ((0, "content"), "ordinary text"),
+        ((0, "content"), [None]),
+        ((0, "content"), [{"type": "output_text", "text": "a"}] * 2),
+        ((0, "content", 0, "type"), "text"),
+        ((0, "content", 0, "text"), ""),
+        ((0, "content", 0, "text"), None),
+        ((0, "content", 0, "text"), 1),
+        ((0, "content", 0, "annotations"), []),
+        ((0, "content", 0, "extra"), "opaque"),
+    ],
+)
+def test_malformed_ordinary_codex_carrier_declines_without_measurement(
+    tmp_path, location, path, value
+):
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path)
+    row = {"active": active[3], "conversation": conversation[3], "request": wire[5]}[location]
+    if not path:
+        row["codex_message_items"] = copy.deepcopy(value)
+    else:
+        target = row["codex_message_items"]
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = copy.deepcopy(value)
+    before = copy.deepcopy((active, conversation, wire))
+    archive = prepared.projection._archive.path.read_bytes()
+    measured = []
+    result = choose(
+        prepared, active, conversation, wire, measure_tokens=lambda m: measured.append(m) or 100
+    )
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment"
+    assert measured == []
+    assert (active, conversation, wire) == before
+    assert prepared.projection._archive.path.read_bytes() == archive
+
+
+@pytest.mark.parametrize("field", ["type", "role", "status", "content"])
+def test_ordinary_codex_required_fields_cannot_be_omitted(tmp_path, field):
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path)
+    for row in (active[3], conversation[3], wire[5]):
+        row["codex_message_items"][0].pop(field)
+    result = choose(prepared, active, conversation, wire)
+    assert result.status == "declined" and result.messages is None
+
+
+@pytest.mark.parametrize("location", ["active", "conversation", "request"])
+@pytest.mark.parametrize("change", ["missing", "empty", "id", "phase", "text", "outer_text"])
+def test_ordinary_codex_carrier_requires_exact_three_view_correspondence(
+    tmp_path, location, change
+):
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path)
+    row = {"active": active[3], "conversation": conversation[3], "request": wire[5]}[location]
+    if change == "missing":
+        row.pop("codex_message_items")
+    elif change == "empty":
+        row["codex_message_items"] = []
+    elif change == "id":
+        row["codex_message_items"][0]["id"] = "msg_other_valid_id"
+    elif change == "phase":
+        row["codex_message_items"][0].pop("phase")
+    elif change == "text":
+        row["content"] = "different but internally consistent"
+        row["codex_message_items"][0]["content"][0]["text"] = row["content"]
+    else:
+        row["content"] = "contradicts carrier text"
+    before = copy.deepcopy((active, conversation, wire))
+    measured = []
+    result = choose(
+        prepared, active, conversation, wire, measure_tokens=lambda m: measured.append(m) or 100
+    )
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment"
+    assert measured == []
+    assert (active, conversation, wire) == before
+
+
+@pytest.mark.parametrize("mutation", ["unstamped", "interior", "carrier_trim", "wire_outer"])
+def test_restored_codex_whitespace_cannot_repair_or_detach_carrier(tmp_path, mutation):
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path, text=" answer text \n")
+    conversation[3].update(content="answer text", _db_persisted=True)
+    wire[5].update(content="answer text")
+    if mutation == "unstamped":
+        conversation[3].pop("_db_persisted")
+    elif mutation == "interior":
+        conversation[3]["content"] = wire[5]["content"] = "answer  text"
+    elif mutation == "carrier_trim":
+        for row in (conversation[3], wire[5]):
+            row["codex_message_items"][0]["content"][0]["text"] = "answer text"
+    else:
+        wire[5]["content"] = active[3]["content"]
+    before = copy.deepcopy((active, conversation, wire))
+    result = choose(prepared, active, conversation, wire)
+    assert result.status == "declined" and result.messages is None
+    assert (active, conversation, wire) == before
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        (
+            "tool_calls",
+            [
+                {
+                    "id": "ordinary_must_not_call",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+        ),
+        ("tool_calls", []),
+        ("tool_call_id", "ordinary_must_not_result"),
+        ("tool_name", "lookup"),
+        ("effect_disposition", "none"),
+        ("reasoning", "opaque"),
+        ("reasoning_content", "opaque"),
+        ("reasoning_details", [{"type": "reasoning"}]),
+        ("codex_reasoning_items", [{"type": "reasoning", "encrypted_content": "opaque"}]),
+        ("thinking", "opaque"),
+        ("_anthropic_content_blocks", [{"thinking": "opaque"}]),
+        ("api_content", "different replay"),
+        ("_compressed_summary", True),
+        ("_merged_turn_prefix", "opaque"),
+    ],
+)
+def test_ordinary_codex_carrier_does_not_authorize_tools_or_other_replay(tmp_path, field, value):
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path)
+    for row in (active[3], conversation[3], wire[5]):
+        row[field] = copy.deepcopy(value)
+    result = choose(prepared, active, conversation, wire)
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment"
+
+
+@pytest.mark.parametrize("role,index", [("user", 2), ("tool", 3)])
+def test_ordinary_codex_carrier_is_assistant_only(tmp_path, role, index):
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path)
+    carrier = copy.deepcopy(conversation[3]["codex_message_items"])
+    for rows, offset in ((active, 0), (conversation, 0), (wire, 2)):
+        row = rows[index + offset]
+        row.update(
+            role=role,
+            content=conversation[3]["content"],
+            codex_message_items=copy.deepcopy(carrier),
+        )
+    result = choose(prepared, active, conversation, wire)
+    assert result.status == "declined" and result.messages is None
+
+
+@pytest.mark.parametrize("revision", [False, True])
+@pytest.mark.parametrize("serialized", [False, True])
+def test_archived_ordinary_codex_prefix_retains_exact_source_hashes(tmp_path, revision, serialized):
+    from hermes_ariadne.prepared import PreparedView, publish_prepared
+
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path)
+    item = copy.deepcopy(active[3]["codex_message_items"][0])
+    item["content"][0]["text"] = active[1]["content"]
+    for row in (active[1], conversation[1], wire[3]):
+        row["codex_message_items"] = [copy.deepcopy(item)]
+    if serialized:
+        active[1]["codex_message_items"] = json.dumps(active[1]["codex_message_items"])
+    sources = copy.deepcopy(active[:2])
+    events = tuple(digest(row) for row in sources)
+    store = prepared.projection._archive
+    store.ingest("chosen", sources, origin="hermes_db")
+    kernel = MemoryKernel(
+        Projection(store, "chosen", events), tmp_path / "ordinary-prefix.json", node_bytes=128
+    )
+    kernel.build(lambda _: "ordinary Codex navigation")
+    publish_prepared(kernel, home=tmp_path)
+    prepared = PreparedView.load(store, "chosen", tmp_path)
+    assert prepared is not None
+    if revision:
+        # Agreement of all three views cannot substitute for the frozen hash.
+        for row in (conversation[1], wire[3]):
+            row["codex_message_items"][0]["id"] = "msg_revision"
+        revised = copy.deepcopy(conversation[1]["codex_message_items"])
+        active[1]["codex_message_items"] = json.dumps(revised) if serialized else revised
+    before = copy.deepcopy((active, conversation, wire))
+    archive = store.path.read_bytes()
+    checkpoint = prepared.kernel.path.read_bytes()
+
+    result = choose(prepared, active, conversation, wire)
+
+    if revision:
+        assert result.status == "declined" and result.messages is None
+        assert result.diagnostics["reason"] == "unsupported_alignment"
+    else:
+        assert result.status == "selected" and result.messages is not None
+        assert result.messages[3:] == wire[4:]
+    assert prepared.projection.event_ids == events
+    assert [store.get_event(event, session_id="chosen") for event in events] == sources
+    assert (active, conversation, wire) == before
+    assert store.path.read_bytes() == archive
+    assert prepared.kernel.path.read_bytes() == checkpoint
+
+
+@pytest.mark.parametrize("location", ["active", "conversation", "request"])
+def test_ordinary_codex_replay_still_refuses_machine_data_use_restrictions(tmp_path, location):
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path)
+    row = {"active": active[3], "conversation": conversation[3], "request": wire[5]}[location]
+    row["data_use"] = ["no_training"]
+    before = copy.deepcopy((active, conversation, wire))
+    measured = []
+    result = choose(
+        prepared, active, conversation, wire, measure_tokens=lambda m: measured.append(m) or 100
+    )
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_data_use"
+    assert measured == []
+    assert (active, conversation, wire) == before
+
+
+def test_ordinary_codex_durable_nullable_fields_do_not_change_replay(tmp_path):
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path)
+    active[3].update(
+        tool_calls=None,
+        tool_call_id=None,
+        tool_name=None,
+        effect_disposition=None,
+        reasoning=None,
+        reasoning_content=None,
+        reasoning_details=None,
+        codex_reasoning_items=None,
+    )
+    result = choose(prepared, active, conversation, wire)
+    assert result.status == "selected" and result.messages is not None
+    assert result.messages[3:] == wire[4:]
+
+
 def test_restored_db_persisted_marker_allows_exact_host_mapping(tmp_path):
     prepared, active, conversation, wire = selection_fixture(tmp_path)
     for row in conversation:
