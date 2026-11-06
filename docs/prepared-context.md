@@ -140,6 +140,16 @@ and the actual retained assembled suffix is not rewritten. Nonempty reasoning
 carriers, commentary, multiple-message outputs, signatures and unknown or
 contradictory fields remain unsupported.
 
+A routine archive lookup can still produce a native assistant tool call with
+nonempty encrypted `codex_reasoning_items` and reasoning-summary fields. This is
+outside this reasoning-free slice even when its text is empty and the tool ID
+is otherwise supported. In the final synthetic pilot, selection continued after
+restart until that carrier appeared, then declined without changing the request;
+later answers used original-history fallback, not compressed recall. This is not
+the ordinary-carrier size limit, and stripping the reasoning fields is not a fix.
+A separately audited extension is tracked in
+[issue #14](https://github.com/whayn/hermes-ariadne/issues/14).
+
 Canonical stored carrier JSON has a separate **1,048,576-byte UTF-8 admission
 limit**, including any JSON whitespace. Selection first checks character length,
 then encoded length before strict JSON decoding; oversized carriers decline
