@@ -140,6 +140,22 @@ and the actual retained assembled suffix is not rewritten. Nonempty reasoning
 carriers, commentary, multiple-message outputs, signatures and unknown or
 contradictory fields remain unsupported.
 
+Canonical stored carrier JSON has a separate **1,048,576-byte UTF-8 admission
+limit**, including any JSON whitespace. Selection first checks character length,
+then encoded length before strict JSON decoding; oversized carriers decline
+without rewriting history. This is not the candidate `request_bytes` allowance,
+a whole-source/process-memory bound, or a dispatch veto: Hermes can still send
+the original request after a decline. Original strings and source hashes remain
+unchanged, and no decoded-carrier cache survives a selection.
+
+Legacy empty-as-absent markers (`None`, `""`, `False`, `[]`, `{}`, `0`, `0.0`)
+keep their previous comparison semantics. Hermes normally persists these as SQL
+NULL and omits them from native replay. They are not nonempty replay payloads
+whose identity was dropped. Nonempty canonical JSON strings such as `"[]"`,
+`"false"`, `"{}"`, `"null"` or `"0"` are not this exception: they fail the strict
+one-message carrier check. Nonempty carrier omission or substitution between
+canonical, restored and assembled views still declines.
+
 Archive retention does not prove active-branch membership. A valid summary is not
 evidence that every old natural-language restriction or preference survived
 semantically.

@@ -34,6 +34,7 @@ FORMAT = "hermes-ariadne-prepared"
 VERSION = 1
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_CHECKPOINT_BYTES = 16 * 1024 * 1024
+_MAX_CANONICAL_CODEX_JSON_BYTES = 1_048_576
 
 
 def _positive(value):
@@ -257,7 +258,13 @@ def _ordinary_codex_message(message, *, wire=False, durable=False):
         # SessionDB._reasoning_json_text persists this column as JSON TEXT;
         # _rows_to_conversation decodes it. Decode ONLY canonical active rows
         # for comparison, never arbitrary restored/request substitutions.
-        items = _json(items.encode("utf-8", "surrogatepass"))
+        # UTF-8 cannot be shorter than its input: reject before allocating bytes.
+        if len(items) > _MAX_CANONICAL_CODEX_JSON_BYTES:
+            raise ValueError("canonical Codex JSON exceeds its admission bound")
+        encoded = items.encode("utf-8", "surrogatepass")
+        if len(encoded) > _MAX_CANONICAL_CODEX_JSON_BYTES:
+            raise ValueError("canonical Codex JSON exceeds its admission bound")
+        items = _json(encoded)
     if (
         message["role"] != "assistant"
         or any(

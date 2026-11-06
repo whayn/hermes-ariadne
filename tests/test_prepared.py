@@ -192,6 +192,149 @@ def test_durable_serialized_codex_carrier_aligns_with_restored_lists(tmp_path, t
     assert prepared.kernel.path.read_bytes() == checkpoint
 
 
+@pytest.mark.parametrize("marker", [None, "", False, [], {}, 0, 0.0])
+def test_legacy_empty_codex_markers_remain_absent_in_comparison(tmp_path, marker):
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path)
+    for message in (active[3], conversation[3], wire[5]):
+        message["codex_message_items"] = copy.deepcopy(marker)
+    before = copy.deepcopy((active, conversation, wire))
+    hashes = [digest(row) for row in active]
+    result = choose(prepared, active, conversation, wire)
+    assert result.status == "selected" and result.messages is not None
+    assert result.messages[3:] == wire[4:]
+    assert (active, conversation, wire) == before
+    assert [digest(row) for row in active] == hashes
+
+
+def test_canonical_null_codex_marker_aligns_with_absent_native_replay(tmp_path):
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path)
+    active[3]["codex_message_items"] = None
+    conversation[3].pop("codex_message_items")
+    wire[5].pop("codex_message_items")
+    before = copy.deepcopy((active, conversation, wire))
+    result = choose(prepared, active, conversation, wire)
+    assert result.status == "selected" and result.messages is not None
+    assert result.messages[3:] == wire[4:]
+    assert (active, conversation, wire) == before
+
+
+@pytest.mark.parametrize("encoded", ["[]", "false", "{}", "null", "0"])
+def test_serialized_empty_codex_values_are_not_legacy_absent_markers(tmp_path, encoded):
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path)
+    active[3]["codex_message_items"] = encoded
+    conversation[3].pop("codex_message_items")
+    wire[5].pop("codex_message_items")
+    before = copy.deepcopy((active, conversation, wire))
+    result = choose(prepared, active, conversation, wire)
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment"
+    assert (active, conversation, wire) == before
+
+
+def test_durable_codex_json_character_bound_precedes_strict_decode(tmp_path, monkeypatch):
+    import hermes_ariadne.prepared as module
+
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path)
+    encoded = json.dumps(active[3]["codex_message_items"])
+    # Valid trailing JSON whitespace exceeds the default policy without making
+    # the candidate request large: request_bytes is not a source-carrier bound.
+    encoded += " " * (1_048_576 + 1 - len(encoded))
+    active[3]["codex_message_items"] = encoded
+    before = copy.deepcopy((active, conversation, wire))
+    hashes = [digest(row) for row in active]
+    archive = prepared.projection._archive.path.read_bytes()
+    checkpoint = prepared.kernel.path.read_bytes()
+    decoded = []
+    strict_json = module._json
+
+    def decode(value):
+        decoded.append(value)
+        return strict_json(value)
+
+    monkeypatch.setattr(module, "_json", decode)
+    result = choose(prepared, active, conversation, wire)
+
+    assert decoded == [], "oversized canonical JSON reached the strict decoder"
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment"
+    assert (active, conversation, wire) == before
+    assert [digest(row) for row in active] == hashes
+    assert prepared.projection._archive.path.read_bytes() == archive
+    assert prepared.kernel.path.read_bytes() == checkpoint
+
+
+def test_durable_codex_json_default_byte_boundary_is_admitted(tmp_path, monkeypatch):
+    import hermes_ariadne.prepared as module
+
+    assert module._MAX_CANONICAL_CODEX_JSON_BYTES == 1_048_576
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path)
+    encoded = json.dumps(active[3]["codex_message_items"])
+    encoded += " " * (module._MAX_CANONICAL_CODEX_JSON_BYTES - len(encoded))
+    assert len(encoded.encode("utf-8", "surrogatepass")) == 1_048_576
+    active[3]["codex_message_items"] = encoded
+    before = copy.deepcopy((active, conversation, wire))
+    hashes = [digest(row) for row in active]
+    archive = prepared.projection._archive.path.read_bytes()
+    checkpoint = prepared.kernel.path.read_bytes()
+    decoded = []
+    strict_json = module._json
+
+    def decode(value):
+        decoded.append(value)
+        return strict_json(value)
+
+    monkeypatch.setattr(module, "_json", decode)
+    result = choose(prepared, active, conversation, wire)
+
+    assert decoded and all(value == encoded.encode("utf-8", "surrogatepass") for value in decoded)
+    assert result.status == "selected" and result.messages is not None
+    assert result.messages[:2] == wire[:2]
+    assert canonical_json(result.messages[3:]) == canonical_json(wire[4:])
+    assert result.diagnostics["request_bytes"] < prepared.request_bytes < len(encoded)
+    assert (active, conversation, wire) == before
+    assert [digest(row) for row in active] == hashes
+    assert prepared.projection._archive.path.read_bytes() == archive
+    assert prepared.kernel.path.read_bytes() == checkpoint
+
+
+@pytest.mark.parametrize("character", ["λ", "😀", "\ud800"])
+def test_durable_codex_json_utf8_byte_bound_precedes_strict_decode(
+    tmp_path, monkeypatch, character
+):
+    import hermes_ariadne.prepared as module
+
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path, text=character * 32)
+    encoded = json.dumps(active[3]["codex_message_items"], ensure_ascii=False)
+    limit = len(encoded) + 1
+    assert len(encoded) < limit < len(encoded.encode("utf-8", "surrogatepass"))
+    active[3]["codex_message_items"] = encoded
+    before = copy.deepcopy((active, conversation, wire))
+    hashes = [digest(row) for row in active]
+    archive = prepared.projection._archive.path.read_bytes()
+    checkpoint = prepared.kernel.path.read_bytes()
+    decoded, measured = [], []
+    strict_json = module._json
+
+    def decode(value):
+        decoded.append(value)
+        return strict_json(value)
+
+    monkeypatch.setattr(module, "_MAX_CANONICAL_CODEX_JSON_BYTES", limit)
+    monkeypatch.setattr(module, "_json", decode)
+    result = choose(
+        prepared, active, conversation, wire, measure_tokens=lambda m: measured.append(m) or 100
+    )
+
+    assert decoded == [], "oversized UTF-8 canonical JSON reached the strict decoder"
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment"
+    assert measured == []
+    assert (active, conversation, wire) == before
+    assert [digest(row) for row in active] == hashes
+    assert prepared.projection._archive.path.read_bytes() == archive
+    assert prepared.kernel.path.read_bytes() == checkpoint
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
