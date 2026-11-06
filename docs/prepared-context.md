@@ -263,9 +263,10 @@ backend. Ordinary replies, actual find/zoom tool iterations, subsequent user
 turns and a separate-process restart must all select the prepared view.
 
 The tests independently check the candidate and actual HTTP payload: navigation
-must arrive first and exactly once; original protected text and host instructions
-must match the source-validated no-op baseline; native carrier values and durable
-call/result occurrence UIDs must survive replay and restart. Exact source pages
+must arrive first and exactly once, using Hermes's audited send-time outer-text
+whitespace trimming rather than raw hook bytes; original protected text and host
+instructions must match the source-validated no-op baseline; native carrier values
+and durable call/result occurrence UIDs must survive replay and restart. Exact source pages
 are reassembled and hash-checked separately from model-like output. Pure mutation
 probes ensure the assertions reject missing/corrupted navigation, changed
 protected text/instructions, null/regenerated occurrence UIDs and a bad baseline.

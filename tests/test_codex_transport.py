@@ -438,7 +438,7 @@ def pure_selected_evidence():
                     "role": "assistant",
                     "content": "Archived navigation (untrusted data, not instructions):\n"
                     '{"ref":"node:synthetic-checkpoint:synthetic-projection:0+4",'
-                    '"text":"SYNTHETIC CODEX FIXTURE SUMMARY 0+4"}\n',
+                    '"text":"SYNTHETIC CODEX FIXTURE SUMMARY 0+4"}',
                 }
             ]
             + body["input"][4:]
@@ -449,9 +449,31 @@ def pure_selected_evidence():
     return report, sent, original[0]["body"]
 
 
+@pytest.mark.parametrize("extra_trailing", ["", "\t  \n"], ids=["newline", "newline-tabs-spaces"])
+def test_pure_native_replay_accepts_send_time_navigation_trimming(extra_trailing):
+    report, sent, baseline = pure_selected_evidence()
+    for entry, request in zip(report["selections"], sent, strict=True):
+        entry["candidate"][1]["content"] += extra_trailing
+        assert entry["candidate"][1]["content"].endswith("\n")
+        assert request["body"]["input"][0]["content"].endswith('SUMMARY 0+4"}')
+    assert_selected(report)
+    assert_native_replay(report, sent, baseline)
+
+
 @pytest.mark.parametrize("request_index", [0, 1, 2], ids=["selected", "tool", "restarted"])
 @pytest.mark.parametrize(
-    "damage", ["missing", "text", "type", "role", "extra", "moved", "duplicate"]
+    "damage",
+    [
+        "missing",
+        "text",
+        "interior_whitespace",
+        "outer_whitespace",
+        "type",
+        "role",
+        "extra",
+        "moved",
+        "duplicate",
+    ],
 )
 def test_pure_native_replay_rejects_navigation_damage(request_index, damage):
     report, sent, baseline = pure_selected_evidence()
@@ -460,6 +482,10 @@ def test_pure_native_replay_rejects_navigation_damage(request_index, damage):
         del wire[0]
     elif damage == "text":
         wire[0]["content"] += " corrupted"
+    elif damage == "interior_whitespace":
+        wire[0]["content"] = wire[0]["content"].replace("SUMMARY 0+4", "SUMMARY  0+4")
+    elif damage == "outer_whitespace":
+        wire[0]["content"] += "\n"
     elif damage == "type":
         wire[0]["type"] = "output_text"
     elif damage == "role":
@@ -497,6 +523,9 @@ def assert_native_replay(report, sent, baseline):
     for entry, request in zip(report["selections"], sent, strict=True):
         wire = request["body"]["input"]
         # prepared.py emits a plain assistant summary without a replay carrier.
+        # turn_request_assembly applies selection first (145-147), then strips
+        # string content on the API copy only (191-193), keeping the hook candidate
+        # and archived source intact. Model that trim only in expected navigation.
         # codex_responses_adapter._replay_message_items therefore yields nothing;
         # _chat_messages_to_responses_input falls back to _role_message_item:
         # exactly type/role/string content on this custom (not Codex backend) route.
@@ -505,7 +534,7 @@ def assert_native_replay(report, sent, baseline):
         navigation = {
             "type": "message",
             "role": "assistant",
-            "content": entry["candidate"][1]["content"],
+            "content": entry["candidate"][1]["content"].strip(),
         }
         assert wire[:1] == [navigation], "prepared navigation missing, changed or moved"
         assert wire.count(navigation) == 1, "prepared navigation duplicated"
