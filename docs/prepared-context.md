@@ -115,6 +115,17 @@ by Hermes's outer-whitespace trimming; interior edits and tool-result trimming
 are not admitted. None of these comparison projections rewrites source bytes or
 the returned protected request suffix.
 
+Independently assigned native Codex tool-item IDs are supported when they are
+clean unsigned ASCII `fc_`-prefixed values within 64 characters and the call's
+`call_id` agrees with its `id`. Unlike deterministic sidecars, a non-derived
+native item ID remains in comparison identity: all available canonical,
+restored and assembled views must retain the same value. Missing or swapped
+IDs, changed argument bytes, signatures and unknown call fields decline.
+Parallel/reused call-ID occurrence checks still apply. This concerns the
+assembled selection-hook message: Hermes's native formatter subsequently omits
+that item ID from HTTP function-call items while preserving the call/result
+link. Ariadne neither changes that formatting nor rebuilds the retained suffix.
+
 One ordinary native Codex final-answer carrier is also supported: exactly one
 completed assistant `message`, containing exactly one nonempty `output_text`
 part matching the canonical answer. Its optional ID must be a clean ASCII

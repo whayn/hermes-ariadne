@@ -361,8 +361,8 @@ def _comparison(message, *, wire=False, durable=False):
 
     _assistant_tool_call_dict adds these two Responses sidecars, then
     reasoning_params strips them before the selection hook off Codex. Only
-    the deterministic no-native-item-id case is supported here; a signed or
-    independently assigned provider item is not interchangeable evidence.
+    deterministic sidecars remain a projection, but an independently assigned
+    native item ID is comparison identity and must agree across all views.
     """
     result = _provider(message, wire=wire, durable=durable)
     # make_tool_result_message writes name + tool_name; SessionDB restores only
@@ -397,6 +397,7 @@ def _comparison(message, *, wire=False, durable=False):
                 "response_item_id",
             }:
                 raise ValueError("unsupported tool call")
+            native_item = False
             if {"call_id", "response_item_id"} & call.keys():
                 ident = call["id"]
                 if not isinstance(ident, str) or not ident or ident != ident.strip():
@@ -419,9 +420,23 @@ def _comparison(message, *, wire=False, durable=False):
                 else:
                     expected = "fc_" + hashlib.sha1(ident.encode("utf-8")).hexdigest()[:24]
                 if "response_item_id" in call and call["response_item_id"] != expected:
-                    raise ValueError("unsupported native response item")
+                    # _assistant_tool_call_dict preserves the provider's item ID
+                    # independently of call_id. _replay_tool_call_items may omit
+                    # it on HTTP, but the selection hook still carries it.
+                    item_id = call["response_item_id"]
+                    if (
+                        "call_id" not in call
+                        or type(item_id) is not str
+                        or re.fullmatch(r"fc_[A-Za-z0-9_-]{1,61}", item_id) is None
+                    ):
+                        raise ValueError("unsupported native response item")
+                    native_item = True
             projected.append(
-                {k: v for k, v in call.items() if k not in {"call_id", "response_item_id"}}
+                {
+                    k: v
+                    for k, v in call.items()
+                    if k != "call_id" and (k != "response_item_id" or native_item)
+                }
             )
         result["tool_calls"] = projected
     return result
@@ -482,7 +497,8 @@ def _occurrences(messages, *, durable=False):
             for call in calls:
                 if (
                     type(call) is not dict
-                    or set(call) != {"id", "type", "function"}
+                    or not {"id", "type", "function"} <= call.keys()
+                    or call.keys() - {"id", "type", "function", "response_item_id"}
                     or call["type"] != "function"
                 ):
                     raise ValueError("unsupported tool call")
