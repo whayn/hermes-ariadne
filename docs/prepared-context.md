@@ -253,6 +253,24 @@ order before UTF-8/surrogatepass decoding and JSON parsing; a page can split a
 Unicode code point. Previews cannot reconstruct the original. The bound limits
 outbound results, not archive scan cost or reader memory.
 
+## Native Codex transport regression
+
+`tests/test_codex_transport.py` uses actual `AIAgent`, `SessionDB`, installed-plugin
+discovery, OpenAI SDK HTTP and Responses SSE with an isolated custom loopback
+endpoint in `codex_responses` mode. Replies and summaries are explicitly scripted
+synthetic fixtures, not real model output or a connection to OpenAI's Codex
+backend. Ordinary replies, actual find/zoom tool iterations, subsequent user
+turns and a separate-process restart must all select the prepared view.
+
+The tests independently check the candidate and actual HTTP payload: navigation
+must arrive first and exactly once; original protected text and host instructions
+must match the source-validated no-op baseline; native carrier values and durable
+call/result occurrence UIDs must survive replay and restart. Exact source pages
+are reassembled and hash-checked separately from model-like output. Pure mutation
+probes ensure the assertions reject missing/corrupted navigation, changed
+protected text/instructions, null/regenerated occurrence UIDs and a bad baseline.
+The actual provider pilot remains a separate opt-in verification step.
+
 ## Rollback and limits of evidence
 
 ```bash
