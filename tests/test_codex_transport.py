@@ -1022,19 +1022,148 @@ def pure_tool_history_evidence():
                 {"role": "tool", "tool_call_id": call_id, "tool_call_uid": f"occurrence-{index}"},
             ]
         )
-    return {"durable": durable, "replay": copy.deepcopy(durable)}, calls
+    # SessionDB's durable rows keep the JSON column names; conversation replay
+    # restores identity under the live metadata keys, decoding the owner map.
+    replay = copy.deepcopy(durable)
+    for owner, result in zip(replay[::2], replay[1::2], strict=True):
+        owner["_tool_call_uids"] = json.loads(owner.pop("tool_call_uids"))
+        result["_tool_call_uid"] = result.pop("tool_call_uid")
+    return {"durable": durable, "replay": replay}, calls
 
 
 def replace_occurrence_uid(report, index, uid):
-    owner, result = report["durable"][index * 2 : index * 2 + 2]
-    owner["tool_call_uids"] = json.dumps({result["tool_call_id"]: uid})
-    result["tool_call_uid"] = uid
+    for snapshot in ("durable", "replay"):
+        owner, result = report[snapshot][index * 2 : index * 2 + 2]
+        mapping = {result["tool_call_id"]: uid}
+        if snapshot == "durable":
+            owner["tool_call_uids"] = json.dumps(mapping)
+            result["tool_call_uid"] = uid
+        else:
+            owner["_tool_call_uids"] = mapping
+            result["_tool_call_uid"] = uid
+
+
+def test_pure_native_uid_rejects_missing_restored_mapping():
+    report, calls = pure_tool_history_evidence()
+    report["replay"][0].pop("_tool_call_uids")
+    with pytest.raises(AssertionError):
+        assert_native_tool_history(report, calls)
+
+
+@pytest.mark.parametrize("snapshot", ["durable", "replay"])
+@pytest.mark.parametrize(
+    "damage", ["missing", "null", "empty", "malformed", "list", "wrong_key", "extra", "wrong_shape"]
+)
+def test_pure_native_uid_rejects_invalid_occurrence_mapping(snapshot, damage):
+    report, calls = pure_tool_history_evidence()
+    owner = report[snapshot][0]
+    key = "tool_call_uids" if snapshot == "durable" else "_tool_call_uids"
+    call_id = calls[0]["call_id"]
+    if damage == "missing":
+        owner.pop(key)
+    elif damage == "malformed":
+        owner[key] = "{invalid-json"
+    elif damage == "wrong_shape":
+        mapping = {call_id: "occurrence-0"}
+        owner[key] = mapping if snapshot == "durable" else json.dumps(mapping)
+    else:
+        mapping = {
+            "null": None,
+            "empty": {},
+            "list": ["occurrence-0"],
+            "wrong_key": {"call_WRONG": "occurrence-0"},
+            "extra": {call_id: "occurrence-0", "call_EXTRA": "occurrence-extra"},
+        }[damage]
+        owner[key] = json.dumps(mapping) if snapshot == "durable" else mapping
+    with pytest.raises(AssertionError, match="tool occurrence mapping"):
+        assert_native_tool_history(report, calls)
+
+
+@pytest.mark.parametrize("side", ["owner", "result"])
+@pytest.mark.parametrize(
+    "damage",
+    ["null", "empty", "blank", "number", "list", "dict", "reused", "mismatching", "regenerated"],
+)
+def test_pure_native_uid_rejects_invalid_restored_occurrences(side, damage):
+    report, calls = pure_tool_history_evidence()
+    index = 1 if damage == "reused" else 0
+    uid = {
+        "null": None,
+        "empty": "",
+        "blank": " \t ",
+        "number": 42,
+        "list": ["occurrence-0"],
+        "dict": {"uid": "occurrence-0"},
+        "reused": "occurrence-0",
+        "mismatching": "another-valid-native-uid",
+        "regenerated": "regenerated-after-restart",
+    }[damage]
+    if side == "owner":
+        report["replay"][index * 2]["_tool_call_uids"][calls[index]["call_id"]] = uid
+    else:
+        report["replay"][index * 2 + 1]["_tool_call_uid"] = uid
+    with pytest.raises(AssertionError, match="replay .*UID"):
+        assert_native_tool_history(report, calls)
+
+
+def test_pure_native_uid_rejects_missing_restored_result_uid():
+    report, calls = pure_tool_history_evidence()
+    report["replay"][1].pop("_tool_call_uid")
+    with pytest.raises(AssertionError, match="replay .*UID"):
+        assert_native_tool_history(report, calls)
+
+
+@pytest.mark.parametrize("damage", ["missing", "duplicate"])
+def test_pure_native_uid_rejects_invalid_restored_result_count(damage):
+    report, calls = pure_tool_history_evidence()
+    if damage == "missing":
+        del report["replay"][1]
+    else:
+        report["replay"].insert(1, copy.deepcopy(report["replay"][1]))
+    with pytest.raises(AssertionError, match="replay tool result count"):
+        assert_native_tool_history(report, calls)
+
+
+@pytest.mark.parametrize("snapshot", ["durable", "replay"])
+@pytest.mark.parametrize("damage", ["regenerated", "swapped"])
+def test_pure_native_uid_rejects_cross_view_occurrence_mismatch(snapshot, damage):
+    report, calls = pure_tool_history_evidence()
+    alternative = copy.deepcopy(report)
+    if damage == "regenerated":
+        replace_occurrence_uid(alternative, 0, "another-valid-native-uid")
+    else:
+        replace_occurrence_uid(alternative, 0, "occurrence-1")
+        replace_occurrence_uid(alternative, 1, "occurrence-0")
+    # Each view is independently well-formed and binds every result correctly.
+    report[snapshot] = alternative[snapshot]
+    with pytest.raises(AssertionError, match="durable/replay tool occurrence UIDs differ"):
+        assert_native_tool_history(report, calls)
 
 
 def test_pure_native_uid_accepts_unique_stable_occurrences():
     live, calls = pure_tool_history_evidence()
     restarted = copy.deepcopy(live)
-    assert assert_native_tool_history(live, calls) == assert_native_tool_history(restarted, calls)
+    expected = tuple(
+        (item["call_id"], f"occurrence-{i}", f"occurrence-{i}") for i, item in enumerate(calls)
+    )
+    assert assert_native_tool_history(live, calls) == expected
+    assert assert_native_tool_history(restarted, calls) == expected
+
+
+def test_pure_native_uid_accepts_consistent_alternative_occurrence():
+    live, calls = pure_tool_history_evidence()
+    replace_occurrence_uid(live, 0, "arbitrary-native-occurrence-not-derived-from-call-id")
+    restarted = copy.deepcopy(live)
+    expected = (
+        (
+            calls[0]["call_id"],
+            "arbitrary-native-occurrence-not-derived-from-call-id",
+            "arbitrary-native-occurrence-not-derived-from-call-id",
+        ),
+        (calls[1]["call_id"], "occurrence-1", "occurrence-1"),
+    )
+    assert assert_native_tool_history(live, calls) == expected
+    assert assert_native_tool_history(restarted, calls) == expected
 
 
 @pytest.mark.parametrize("uid", [None, "", "   "])
@@ -1056,17 +1185,31 @@ def test_pure_native_uid_rejects_regenerated_restart_occurrences():
     live, calls = pure_tool_history_evidence()
     restarted = copy.deepcopy(live)
     replace_occurrence_uid(restarted, 0, "regenerated-after-restart")
-    with pytest.raises(AssertionError):
-        assert assert_native_tool_history(live, calls) == assert_native_tool_history(
-            restarted, calls
-        )
+    # Both snapshots within each report must pass; only restart identity differs.
+    live_uids = assert_native_tool_history(live, calls)
+    restarted_uids = assert_native_tool_history(restarted, calls)
+    with pytest.raises(AssertionError, match="restart regenerated existing call/result UIDs"):
+        assert live_uids == restarted_uids, "restart regenerated existing call/result UIDs"
 
 
 def assert_native_tool_history(report, calls):
+    snapshots = {}
     for key in ("durable", "replay"):
+        occurrences, seen = [], set()
         owners = [m for m in report[key] if m.get("tool_calls")]
         assert len(owners) == len(calls)
         for owner, item in zip(owners, calls, strict=True):
+            mapping_key = "tool_call_uids" if key == "durable" else "_tool_call_uids"
+            mapping = owner.get(mapping_key)
+            if key == "durable":
+                assert isinstance(mapping, str), "invalid durable tool occurrence mapping"
+                try:
+                    mapping = json.loads(mapping)
+                except json.JSONDecodeError as exc:
+                    raise AssertionError("malformed durable tool occurrence mapping") from exc
+            assert isinstance(mapping, dict) and set(mapping) == {item["call_id"]}, (
+                f"invalid {key} tool occurrence mapping"
+            )
             assert owner["tool_calls"] == [
                 {
                     "id": item["call_id"],
@@ -1077,21 +1220,23 @@ def assert_native_tool_history(report, calls):
                 }
             ]
             assert item["id"] != "fc_" + item["call_id"].removeprefix("call_")
-    # SessionDB must retain occurrence identity, not merely matching textual ids.
-    occurrences, seen = [], set()
-    for owner in (m for m in report["durable"] if m.get("tool_calls")):
-        call = owner["tool_calls"][0]
-        mapping = json.loads(owner["tool_call_uids"])
-        uid = mapping[call["id"]]
-        assert isinstance(uid, str) and uid.strip(), "missing durable tool occurrence UID"
-        assert uid not in seen, "durable tool occurrence UID reused"
-        seen.add(uid)
-        results = [m for m in report["durable"] if m.get("tool_call_id") == call["id"]]
-        assert len(results) == 1
-        result_uid = results[0]["tool_call_uid"]
-        assert uid == result_uid
-        occurrences.append((call["id"], uid, result_uid))
-    return tuple(occurrences)
+            # Both views must bind each call to exactly one result occurrence.
+            uid = mapping[item["call_id"]]
+            assert isinstance(uid, str) and uid.strip(), f"missing {key} tool occurrence UID"
+            assert uid not in seen, f"{key} tool occurrence UID reused"
+            seen.add(uid)
+            results = [m for m in report[key] if m.get("tool_call_id") == item["call_id"]]
+            assert len(results) == 1, f"{key} tool result count must be one per call"
+            result_key = "tool_call_uid" if key == "durable" else "_tool_call_uid"
+            result_uid = results[0].get(result_key)
+            assert isinstance(result_uid, str) and result_uid.strip(), (
+                f"missing {key} tool result occurrence UID"
+            )
+            assert uid == result_uid, f"{key} tool occurrence UID mismatch"
+            occurrences.append((item["call_id"], uid, result_uid))
+        snapshots[key] = tuple(occurrences)
+    assert snapshots["durable"] == snapshots["replay"], "durable/replay tool occurrence UIDs differ"
+    return snapshots["durable"]
 
 
 def test_native_codex_tool_cycle_and_restart_keep_selection_and_exact_source(codex_worker):
