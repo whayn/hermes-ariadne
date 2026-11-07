@@ -121,6 +121,19 @@ clean unsigned ASCII `fc_`-prefixed values within 64 characters and the call's
 native item ID remains in comparison identity: all available canonical,
 restored and assembled views must retain the same value. Missing or swapped
 IDs, changed argument bytes, signatures and unknown call fields decline.
+Within each single assistant `tool_calls` array, duplicate IDs admitted through
+this **non-derived native-item path** also decline before candidate measurement,
+even when all three views agree. The comparison resets this check for every
+message: reuse across assistant messages remains supported with distinct
+occurrence UIDs, for the same or different provider call IDs. This is a
+response-local supported-envelope admission rule, not history/session-wide
+uniqueness, issuer provenance or provider certification. Values matching the
+host's deterministic derivation still follow the legacy sidecar path, including
+repeated derived IDs and mixed derived/independent collisions. The available
+fields cannot distinguish a native ID equal to that derivation or establish a
+response/issuer namespace across historical messages; this rule does not resolve
+that ambiguity by imposing a broader uniqueness policy.
+
 Parallel/reused call-ID occurrence checks still apply. This concerns the
 assembled selection-hook message: Hermes's native formatter subsequently omits
 that item ID from HTTP function-call items while preserving the call/result

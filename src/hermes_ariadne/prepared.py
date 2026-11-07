@@ -395,6 +395,7 @@ def _comparison(message, *, wire=False, durable=False):
         if type(calls) is not list or not calls:
             raise ValueError("tool calls must be a nonempty list")
         projected = []
+        native_item_ids = set()  # Response-local; deterministic sidecars are not native identity.
         for call in calls:
             if type(call) is not dict or set(call) - {
                 "id",
@@ -437,6 +438,9 @@ def _comparison(message, *, wire=False, durable=False):
                         or re.fullmatch(r"fc_[A-Za-z0-9_-]{1,61}", item_id) is None
                     ):
                         raise ValueError("unsupported native response item")
+                    if item_id in native_item_ids:
+                        raise ValueError("duplicate native response item")
+                    native_item_ids.add(item_id)
                     native_item = True
             projected.append(
                 {

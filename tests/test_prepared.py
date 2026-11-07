@@ -1130,6 +1130,120 @@ def test_native_codex_tool_ids_preserve_parallel_reused_occurrences_and_argument
     assert prepared.kernel.path.read_bytes() == checkpoint
 
 
+@pytest.mark.parametrize("location", ["all", "active", "conversation", "request"])
+def test_native_codex_tool_ids_decline_response_local_duplicates(tmp_path, location):
+    from hermes_ariadne.prepared import _comparison
+
+    prepared, active, conversation, wire = native_codex_tool_fixture(tmp_path)
+    views = {"active": active, "conversation": conversation, "request": wire[2:]}
+    for rows in views.values() if location == "all" else [views[location]]:
+        calls = rows[5]["tool_calls"]
+        calls[1]["response_item_id"] = calls[0]["response_item_id"]
+    before = canonical_json((active, conversation, wire))
+    source_hashes = [digest(row) for row in active]
+    store = prepared.projection._archive
+    sources = [
+        store.get_event(event, session_id="chosen") for event in prepared.projection.event_ids
+    ]
+    archive = store.path.read_bytes()
+    checkpoint = prepared.kernel.path.read_bytes()
+    measured = []
+
+    result = choose(
+        prepared, active, conversation, wire, measure_tokens=lambda m: measured.append(m) or 100
+    )
+
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment"
+    assert measured == []
+    # Each individual view must fail its own envelope check, not just disagree
+    # with the other two views when only one contains the duplicate.
+    for name, rows in views.items():
+        if location == "all" or name == location:
+            with pytest.raises(ValueError, match="duplicate native response item"):
+                _comparison(rows[5], wire=name == "request", durable=name == "active")
+    assert canonical_json((active, conversation, wire)) == before
+    assert [digest(row) for row in active] == source_hashes
+    assert [
+        store.get_event(event, session_id="chosen") for event in prepared.projection.event_ids
+    ] == sources
+    assert store.path.read_bytes() == archive
+    assert prepared.kernel.path.read_bytes() == checkpoint
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("call_id", ["repeat", "re:peat"])
+def test_tool_item_ids_allow_cross_response_reuse_with_distinct_occurrence_uids(
+    tmp_path, native, call_id
+):
+    prepared, _, conversation, _ = native_codex_tool_fixture(tmp_path)
+    first = conversation[5]["tool_calls"][0]
+    if not native:
+        first["response_item_id"] = "fc_repeat"
+    later = conversation[8]
+    later["tool_calls"][0].update(
+        id=call_id, call_id=call_id, response_item_id=first["response_item_id"]
+    )
+    later["_tool_call_uids"] = {call_id: "occ3"}
+    conversation[9]["tool_call_id"] = call_id
+    active = copy.deepcopy(conversation)
+    wire = copy.deepcopy(as_wire(conversation))
+    before = canonical_json((active, conversation, wire))
+    source_hashes = [digest(row) for row in active]
+    archive = prepared.projection._archive.path.read_bytes()
+    checkpoint = prepared.kernel.path.read_bytes()
+
+    result = choose(prepared, active, conversation, wire)
+
+    assert result.status == "selected" and result.messages is not None
+    assert result.messages[:2] == wire[:2]
+    assert result.messages[3:] == wire[4:]
+    assert active[5]["_tool_call_uids"]["repeat"] == "occ1"
+    assert active[8]["_tool_call_uids"][call_id] == "occ3"
+    result.messages[-2]["tool_calls"][0]["response_item_id"] = "fc_return_mutation"
+    assert canonical_json((active, conversation, wire)) == before
+    assert [digest(row) for row in active] == source_hashes
+    assert prepared.projection._archive.path.read_bytes() == archive
+    assert prepared.kernel.path.read_bytes() == checkpoint
+
+
+@pytest.mark.parametrize("independent", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_tool_item_ids_do_not_extend_duplicate_guard_to_derived_sidecars(
+    tmp_path, independent, reverse
+):
+    prepared, _, conversation, _ = native_codex_tool_fixture(tmp_path)
+    row = conversation[5]
+    first, second = row["tool_calls"]
+    first["response_item_id"] = second["response_item_id"] = "fc_repeat"
+    if not independent:
+        # Both call IDs derive fc_repeat; this legacy collision remains supported.
+        second.update(id="call_repeat", call_id="call_repeat")
+        row["_tool_call_uids"] = {"repeat": "occ1", "call_repeat": "occ2"}
+        conversation[7]["tool_call_id"] = "call_repeat"
+    # In the mixed case only the second ID is independent. Neither ordering
+    # extends the non-derived-only set to the matching deterministic sidecar.
+    if reverse:
+        row["tool_calls"].reverse()
+    active = copy.deepcopy(conversation)
+    wire = copy.deepcopy(as_wire(conversation))
+    before = canonical_json((active, conversation, wire))
+    source_hashes = [digest(row) for row in active]
+    archive = prepared.projection._archive.path.read_bytes()
+    checkpoint = prepared.kernel.path.read_bytes()
+
+    result = choose(prepared, active, conversation, wire)
+
+    assert result.status == "selected" and result.messages is not None
+    assert result.messages[:2] == wire[:2]
+    assert result.messages[3:] == wire[4:]
+    result.messages[6]["tool_calls"][0]["response_item_id"] = "fc_return_mutation"
+    assert canonical_json((active, conversation, wire)) == before
+    assert [digest(row) for row in active] == source_hashes
+    assert prepared.projection._archive.path.read_bytes() == archive
+    assert prepared.kernel.path.read_bytes() == checkpoint
+
+
 @pytest.mark.parametrize(
     "locations",
     [
