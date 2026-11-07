@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -75,6 +76,7 @@ def test_native_compaction_and_receipt_only_rebuild_across_processes(tmp_path):
     env.update(
         HOME=str(root),
         HERMES_HOME=str(root),
+        HERMES_MANAGED_DIR=tempfile.mkdtemp(prefix="managed-", dir=tmp_path),
         HERMES_CONFIG=str(root / "config.yaml"),
         HERMES_ENV=str(root / ".env"),
         HERMES_PROFILE="default",

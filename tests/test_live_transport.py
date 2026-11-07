@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -37,6 +38,7 @@ def prepared_worker(tmp_path):
     env.update(
         HOME=str(tmp_path),
         HERMES_HOME=str(home),
+        HERMES_MANAGED_DIR=tempfile.mkdtemp(prefix="managed-", dir=tmp_path),
         TZ="UTC",
         PYTHONPATH=os.pathsep.join(
             (source, str(Path(__file__).resolve().parents[1] / "src"), env.get("PYTHONPATH", ""))

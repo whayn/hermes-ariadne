@@ -37,6 +37,27 @@ MAX_CHECKPOINT_BYTES = 16 * 1024 * 1024
 _MAX_CANONICAL_CODEX_JSON_BYTES = 1_048_576
 
 
+@dataclass(frozen=True)
+class ReasoningReplayPolicy:
+    """Trusted host label binding, not issuer authentication or provider-fit proof."""
+
+    issuer_kind: str
+    issuer_model: str
+
+
+def _require_reasoning_policy(policy):
+    if (
+        type(policy) is not ReasoningReplayPolicy
+        or type(policy.issuer_kind) is not str
+        or policy.issuer_kind != "codex_backend"
+        or type(policy.issuer_model) is not str
+        or not policy.issuer_model
+        or policy.issuer_model != policy.issuer_model.strip()
+    ):
+        raise ValueError("unsupported reasoning replay policy")
+    policy.issuer_model.encode("utf-8")
+
+
 def _positive(value):
     if type(value) is not int or value <= 0:
         raise ValueError("prepared limits must be positive integers")
@@ -119,6 +140,17 @@ def _checkpoint(projection, path, settings, *, snapshot):
     return MemoryKernel.from_snapshot(projection, path, snapshot=snapshot, **settings)
 
 
+def _require_reasoning_free_prefix(projection):
+    """Exclude machine reasoning from exact frozen sources, without decoding it."""
+    for index in range(len(projection.event_ids)):
+        message = projection.message(index)
+        for key in ("reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items"):
+            # Match the provider codec's legacy empty-as-absent semantics,
+            # including numeric values equal to False. JSON text stays text.
+            if message.get(key) not in (None, "", False, [], {}):
+                raise ValueError("unsupported_prepared_prefix_reasoning")
+
+
 def publish_prepared(
     kernel, *, home, history_bytes=8192, request_bytes=65536, reserve_tokens=4096
 ) -> Path:
@@ -137,6 +169,7 @@ def publish_prepared(
     }
     directory = _directory(kernel.projection._archive, kernel.projection.session_id, home)
     _require_supported_projection(kernel.projection)
+    _require_reasoning_free_prefix(kernel.projection)
     data = _read(kernel.path, MAX_CHECKPOINT_BYTES)
     snapshot = _json(data)
     settings = snapshot["settings"]
@@ -311,13 +344,67 @@ def _ordinary_codex_message(message, *, wire=False, durable=False):
     return items
 
 
-def _provider(message, *, wire=False, durable=False):
+def _encrypted_codex_reasoning(message, policy, *, durable=False):
+    """Validate an opaque replay envelope, without interpreting its ciphertext."""
+    _require_reasoning_policy(policy)
+    items = message["codex_reasoning_items"]
+    if durable and type(items) is str:
+        if len(items) > _MAX_CANONICAL_CODEX_JSON_BYTES:
+            raise ValueError("canonical Codex JSON exceeds its admission bound")
+        encoded = items.encode("utf-8")
+        if len(encoded) > _MAX_CANONICAL_CODEX_JSON_BYTES:
+            raise ValueError("canonical Codex JSON exceeds its admission bound")
+        items = _json(encoded)
+    if type(items) is not list or len(items) != 1 or message["role"] != "assistant":
+        raise ValueError("unsupported encrypted reasoning envelope")
+    item = items[0]
+    if type(item) is not dict or set(item) != {
+        "type",
+        "encrypted_content",
+        "id",
+        "summary",
+        "_issuer_kind",
+        "_issuer_model",
+    }:
+        raise ValueError("unsupported encrypted reasoning fields")
+    if (
+        item["type"] != "reasoning"
+        or type(item["encrypted_content"]) is not str
+        or not item["encrypted_content"]
+        or not item["encrypted_content"].isascii()
+        or type(item["id"]) is not str
+        or re.fullmatch(r"rs_[A-Za-z0-9_-]{1,61}", item["id"]) is None
+        or item["id"].startswith("rs_tmp_")
+        or type(item["_issuer_kind"]) is not str
+        or item["_issuer_kind"] != policy.issuer_kind
+        or type(item["_issuer_model"]) is not str
+        or item["_issuer_model"] != policy.issuer_model
+        or type(item["summary"]) is not list
+    ):
+        raise ValueError("unsupported encrypted reasoning item")
+    for part in item["summary"]:
+        if (
+            type(part) is not dict
+            or set(part) != {"type", "text"}
+            or part["type"] != "summary_text"
+            or type(part["text"]) is not str
+        ):
+            raise ValueError("unsupported reasoning summary")
+        part["text"].encode("utf-8")
+    if len(canonical_json(items)) > _MAX_CANONICAL_CODEX_JSON_BYTES:
+        raise ValueError("Codex reasoning list exceeds its admission bound")
+    return items
+
+
+def _provider(message, *, wire=False, durable=False, reasoning_policy=None):
     if type(message) is not dict:
         raise ValueError("message must be a mapping")
     # At select_context this is assembled, not final HTTP: Hermes strips the
     # born-durable marker only in the later chat-completions transport.
     allowed = (
-        _WIRE | {"_db_persisted", "tool_name", "effect_disposition", "codex_message_items"}
+        _WIRE
+        | {"_db_persisted", "tool_name", "effect_disposition", "codex_message_items"}
+        | ({"codex_reasoning_items"} if reasoning_policy is not None else set())
         if wire
         else _WIRE | _METADATA | _CARRIERS | _IDENTITIES
     )
@@ -332,9 +419,18 @@ def _provider(message, *, wire=False, durable=False):
         role == "assistant" and content is None and message.get("tool_calls")
     ):
         raise ValueError("only text and assistant tool-call messages are supported")
+    reasoning_items = None
+    if message.get("codex_reasoning_items") not in (None, "", False, [], {}):
+        reasoning_items = _encrypted_codex_reasoning(message, reasoning_policy, durable=durable)
     codex_items = None
     for key in _CARRIERS & message.keys():
         value = message[key]
+        if reasoning_items is not None and key in {
+            "codex_reasoning_items",
+            "reasoning",
+            "reasoning_content",
+        }:
+            continue  # Companions are checked independently before this projection.
         if key == "api_content" and value == content:
             continue  # An identical sidecar cannot change this supported wire mapping.
         if value not in (None, "", False, [], {}):
@@ -356,6 +452,10 @@ def _provider(message, *, wire=False, durable=False):
         # A real replay payload, never a redundant text sidecar: compare every
         # validated field across active, restored and assembled views unchanged.
         result["codex_message_items"] = codex_items
+    if reasoning_items is not None:
+        if codex_items is None and not message.get("tool_calls"):
+            raise ValueError("reasoning requires a completed answer or tool-call envelope")
+        result["codex_reasoning_items"] = reasoning_items
     if "tool_calls" in result and role != "assistant":
         raise ValueError("cross-role tool calls")
     if "tool_call_id" in result and role != "tool":
@@ -363,7 +463,7 @@ def _provider(message, *, wire=False, durable=False):
     return result
 
 
-def _comparison(message, *, wire=False, durable=False):
+def _comparison(message, *, wire=False, durable=False, reasoning_policy=None):
     """Audited pretransport comparison only; never returned as request/source.
 
     _assistant_tool_call_dict adds these two Responses sidecars, then
@@ -371,7 +471,7 @@ def _comparison(message, *, wire=False, durable=False):
     deterministic sidecars remain a projection, but an independently assigned
     native item ID is comparison identity and must agree across all views.
     """
-    result = _provider(message, wire=wire, durable=durable)
+    result = _provider(message, wire=wire, durable=durable, reasoning_policy=reasoning_policy)
     # make_tool_result_message writes name + tool_name; SessionDB restores only
     # tool_name. Reconcile this alias ONLY for tool results, never speakers.
     for key in ("tool_name", "effect_disposition"):
@@ -483,13 +583,17 @@ def _identity_value(message, name):
     return values[0] if values else None
 
 
-def _occurrences(messages, *, durable=False):
+def _occurrences(messages, *, durable=False, reasoning_policies=None):
     _tool_sequence(messages)
     pending = {}
     seen = set()
     identities = []
-    for message in messages:
-        calls = _comparison(message, durable=durable).get("tool_calls")
+    for index, message in enumerate(messages):
+        calls = _comparison(
+            message,
+            durable=durable,
+            reasoning_policy=reasoning_policies[index] if reasoning_policies else None,
+        ).get("tool_calls")
         mapping = _identity_value(message, "tool_call_uids")
         result_uid = _identity_value(message, "tool_call_uid")
         if mapping is not None and (message["role"] != "assistant" or not calls):
@@ -536,8 +640,60 @@ def _occurrences(messages, *, durable=False):
     return identities
 
 
-def _alignment(prepared, request, conversation, incoming, active):
+def _reasoning_permissions(history, active, request, count, policy):
+    """Bind readable companions before excluding them from comparison-only views."""
+    permissions = [None] * len(history)
+    if policy is None:
+        return permissions  # Preserve the legacy reasoning-free comparison path.
+    _require_reasoning_policy(policy)
+    for index in range(max(len(history), len(active), len(request))):
+        rows = [rows[index] for rows in (active, history, request) if index < len(rows)]
+        if not any(m.get("codex_reasoning_items") not in (None, "", False, [], {}) for m in rows):
+            continue
+        if not count <= index < min(len(active), len(history), len(request)):
+            raise ValueError("encrypted reasoning requires a retained active source")
+        source, restored, assembled = active[index], history[index], request[index]
+        for key in ("reasoning", "reasoning_content"):
+            value = source[key]  # Both canonical SQL columns are required.
+            if value is not None and type(value) is not str:
+                raise ValueError("invalid canonical reasoning companion")
+            if type(value) is str:
+                value.encode("utf-8")
+            if key in assembled:
+                raise ValueError("readable reasoning in assembled request")
+            if value is None:
+                if restored.get(key) is not None:
+                    raise ValueError("NULL reasoning companion mismatch")
+            elif key not in restored:
+                if not (
+                    key == "reasoning" and value == "" and restored.get("_db_persisted") is True
+                ):
+                    raise ValueError("missing reasoning companion")
+            elif type(restored[key]) is not str or restored[key] != value:
+                raise ValueError("reasoning companion mismatch")
+        permissions[index] = policy
+    return permissions
+
+
+def _comparison_payloads(messages, policies, *, wire=False, durable=False):
+    """Use a separate request-local reasoning ID set for each compared view."""
+    payloads = []
+    reasoning_ids = set()
+    for index, message in enumerate(messages):
+        payload = _comparison(message, wire=wire, durable=durable, reasoning_policy=policies[index])
+        items = payload.get("codex_reasoning_items")
+        if items:
+            ident = items[0]["id"]
+            if ident in reasoning_ids:
+                raise ValueError("duplicate retained reasoning identity")
+            reasoning_ids.add(ident)
+        payloads.append(payload)
+    return payloads
+
+
+def _alignment(prepared, request, conversation, incoming, active, reasoning_policy=None):
     _require_supported_projection(prepared.projection)
+    _require_reasoning_free_prefix(prepared.projection)
     for messages in (request, conversation, active):
         if type(messages) is not list or not messages or any(type(m) is not dict for m in messages):
             raise ValueError("nonempty message lists required")
@@ -566,10 +722,11 @@ def _alignment(prepared, request, conversation, incoming, active):
         != prepared.projection.event_ids
     ):
         raise ValueError("prepared source is not the exact active prefix")
-    raw_payload = [_comparison(m) for m in history]
+    policies = _reasoning_permissions(history, active, request[split:], count, reasoning_policy)
+    raw_payload = _comparison_payloads(history, policies)
     if any(m["role"] not in {"user", "assistant", "tool"} for m in raw_payload):
         raise ValueError("host role inside history")
-    active_payload = [_comparison(m, durable=True) for m in active]
+    active_payload = _comparison_payloads(active, policies, durable=True)
     for index, replay in enumerate(raw_payload):
         items = replay.get("codex_message_items")
         if items:
@@ -594,7 +751,7 @@ def _alignment(prepared, request, conversation, incoming, active):
         ):
             continue
         raise ValueError("active/conversation payload mismatch")
-    if canonical_json([_comparison(m, wire=True) for m in request[split:]]) != canonical_json(
+    if canonical_json(_comparison_payloads(request[split:], policies, wire=True)) != canonical_json(
         raw_payload
     ):
         raise ValueError("request must be an exact one-to-one mapping")
@@ -622,10 +779,10 @@ def _alignment(prepared, request, conversation, incoming, active):
         raise ValueError(
             "retain the previous exchange and complete current turn at a user boundary"
         )
-    occurrences = _occurrences(history)
-    if canonical_json(_occurrences(active, durable=True)) != canonical_json(
-        occurrences[: len(active)]
-    ):
+    occurrences = _occurrences(history, reasoning_policies=policies)
+    if canonical_json(
+        _occurrences(active, durable=True, reasoning_policies=policies)
+    ) != canonical_json(occurrences[: len(active)]):
         raise ValueError("active/conversation occurrence mismatch")
     _tool_sequence(raw_payload[count:])
     return split
@@ -684,6 +841,7 @@ class PreparedView:
         active_messages,
         budget_tokens,
         measure_tokens,
+        reasoning_policy=None,
     ) -> SelectionDecision:
         """Propose an isolated request, never a dispatch veto or provider-fit claim.
 
@@ -713,7 +871,12 @@ class PreparedView:
         count = len(self.projection.event_ids)
         try:
             split = _alignment(
-                self, request_messages, conversation_messages, incoming_message, active_messages
+                self,
+                request_messages,
+                conversation_messages,
+                incoming_message,
+                active_messages,
+                reasoning_policy,
             )
         except _UnsupportedDataUse:
             return decline("unsupported_data_use")
@@ -782,6 +945,7 @@ class PreparedView:
             if projection.projection_id != manifest["projection_id"] or not projection.event_ids:
                 return None
             _require_supported_projection(projection)
+            _require_reasoning_free_prefix(projection)
             kernel = _checkpoint(projection, path, manifest["settings"], snapshot=snapshot)
             kernel.prefix_view(len(projection.event_ids))
             limits = manifest["limits"]

@@ -134,6 +134,158 @@ def select(engine, conversation, wire, **kwargs):
     )
 
 
+def reasoning_engine_fixture(tmp_path):
+    """Native-shaped canonical TEXT, restored/list, assembled/list and SQL NULLs."""
+    engine, home, rows, conversation, wire, kernel = engine_fixture(tmp_path)
+    items = [
+        {
+            "type": "reasoning",
+            "encrypted_content": "synthetic opaque : ! retained bytes",
+            "id": "rs_live_14",
+            "summary": [{"type": "summary_text", "text": "summary λ"}],
+            "_issuer_kind": "codex_backend",
+            "_issuer_model": "gpt-6.1-sol",
+        }
+    ]
+    answer = [
+        {
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": rows[3]["content"]}],
+            "id": "msg_live_14",
+            "phase": "final_answer",
+        }
+    ]
+    rows[3].update(
+        codex_reasoning_items=json.dumps(items),
+        codex_message_items=json.dumps(answer),
+        reasoning=None,
+        reasoning_content=None,
+    )
+    conversation[3].update(
+        codex_reasoning_items=copy.deepcopy(items),
+        codex_message_items=copy.deepcopy(answer),
+        _db_persisted=True,
+    )
+    wire[4].update(
+        codex_reasoning_items=copy.deepcopy(items), codex_message_items=copy.deepcopy(answer)
+    )
+    return engine, home, rows, conversation, wire, kernel
+
+
+def bind_codex(engine, **overrides):
+    fields = dict(
+        model="gpt-6.1-sol-900k",
+        context_length=32000,
+        base_url="https://chatgpt.com/backend-api/codex",
+        provider="openai-codex",
+        api_mode="codex_responses",
+    )
+    fields.update(overrides)
+    engine.update_model(**fields)
+
+
+def test_native_bound_route_enables_retained_reasoning_without_changing_inputs(tmp_path):
+    engine, _, rows, conversation, wire, _ = reasoning_engine_fixture(tmp_path)
+    before = copy.deepcopy((rows, conversation, wire))
+    assert select(engine, conversation, wire) is None
+    scope = engine._capture()
+    bind_codex(engine)
+    selected = select(engine, conversation, wire)
+    assert selected is not None
+    assert selected[0] == wire[0] and selected[2:] == wire[3:]
+    assert (rows, conversation, wire) == before
+    assert engine._capture() == scope  # Model labels do not refresh the frozen source.
+    assert engine.get_status()["selection"]["provider_fit_verified"] is False
+
+
+@pytest.mark.parametrize("change", ["same", "away_back", "unsupported"])
+@pytest.mark.parametrize("raises", [False, True])
+def test_route_update_during_measurement_discards_candidate_and_old_diagnostic(
+    tmp_path, monkeypatch, change, raises
+):
+    from agent import model_metadata
+
+    engine, _, _, conversation, wire, _ = reasoning_engine_fixture(tmp_path)
+    bind_codex(engine)
+    original = model_metadata.estimate_request_tokens_rough
+    armed = True
+    latest = []
+
+    def measure(messages):
+        nonlocal armed
+        if armed:
+            armed = False
+            if change != "same":
+                bind_codex(engine, provider="openai")
+            if change != "unsupported":
+                bind_codex(engine)
+                assert select(engine, conversation, wire) is not None
+            latest.append(engine.get_status())
+            if raises:
+                raise OSError("old measurement private details")
+        return original(messages)
+
+    monkeypatch.setattr(model_metadata, "estimate_request_tokens_rough", measure)
+    assert select(engine, conversation, wire) is None
+    assert engine.get_status() == latest[0]
+
+
+@pytest.mark.parametrize("boundary", ["observation", "active", "observe_return"])
+@pytest.mark.parametrize("change", ["same", "away_back"])
+@pytest.mark.parametrize("raises", [False, True])
+def test_route_reentry_during_reads_preserves_latest_selection(
+    tmp_path, monkeypatch, boundary, change, raises
+):
+    from hermes_ariadne.prepared import PreparedView
+
+    engine, _, rows, conversation, wire, _ = reasoning_engine_fixture(tmp_path)
+    bind_codex(engine)
+    selections = []
+    prepared_select = PreparedView.select
+
+    def choosing(*args, **kwargs):
+        selections.append(kwargs["reasoning_policy"])
+        return prepared_select(*args, **kwargs)
+
+    monkeypatch.setattr(PreparedView, "select", choosing)
+    original = engine._session_db.get_messages
+    observe = engine._observe
+    armed = True
+    latest = []
+
+    def update():
+        nonlocal armed
+        armed = False
+        if change == "away_back":
+            bind_codex(engine, provider="openai")
+        bind_codex(engine)
+        assert select(engine, conversation, wire) is not None
+        latest.append(engine.get_status())
+
+    def reader(session_id, **kwargs):
+        if armed and kwargs["include_inactive"] is (boundary == "observation"):
+            update()
+            if raises:
+                raise OSError("old read private details")
+            return copy.deepcopy(rows) + ([{}] if boundary == "observation" else [])
+        return original(session_id, **kwargs)
+
+    def observed(*args, **kwargs):
+        observe(*args, **kwargs)
+        if armed:
+            update()
+
+    if boundary == "observe_return":
+        monkeypatch.setattr(engine, "_observe", observed)
+    else:
+        engine._session_db.get_messages = reader
+    assert select(engine, conversation, wire) is None
+    assert engine.get_status() == latest[0]
+    assert len(selections) == 1  # Only the new revision reaches selection/measurement.
+
+
 def publish_session(engine, home, rows, session_id, summary):
     """Identical row identities across sessions deliberately cannot identify scope."""
     from hermes_ariadne.kernel import MemoryKernel
@@ -795,3 +947,447 @@ def test_real_host_uses_original_request_on_decline(tmp_path, failure):
             "active_read_failure": "selection_unavailable",
         }[failure]
     )
+
+
+@pytest.mark.parametrize("field", ["model", "base_url", "provider", "api_mode"])
+@pytest.mark.parametrize("value", ["", None, 7, " "])
+def test_incomplete_update_revokes_preceding_reasoning_permission(tmp_path, field, value):
+    engine, _, rows, conversation, wire, _ = reasoning_engine_fixture(tmp_path)
+    bind_codex(engine)
+    assert select(engine, conversation, wire) is not None
+    before = copy.deepcopy((rows, conversation, wire))
+    bind_codex(engine, **{field: value})
+    assert engine._reasoning_policy is None
+    assert select(engine, conversation, wire) is None
+    assert engine.get_status()["selection"]["reason"] == "unsupported_alignment"
+    assert (rows, conversation, wire) == before
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"model": "gpt-6-astra"},
+        {"model": "GPT-6.1-SOL"},
+        {"provider": "OpenAI-Codex"},
+        {"provider": "codex"},
+        {"api_mode": "responses"},
+        {"base_url": "https://api.x.ai/v1"},
+    ],
+)
+def test_foreign_bound_route_or_model_declines_without_rewriting_tail(tmp_path, fields):
+    engine, _, rows, conversation, wire, _ = reasoning_engine_fixture(tmp_path)
+    before = copy.deepcopy((rows, conversation, wire))
+    bind_codex(engine, **fields)
+    assert select(engine, conversation, wire) is None
+    assert engine.get_status()["selection"]["reason"] == "unsupported_alignment"
+    assert (rows, conversation, wire) == before
+
+
+def test_legacy_model_only_update_disables_reasoning_not_reasoning_free_selection(tmp_path):
+    engine, _, _, conversation, wire, _ = reasoning_engine_fixture(tmp_path / "reasoning")
+    bind_codex(engine)
+    engine.update_model("gpt-6.1-sol", 32000)
+    assert engine._reasoning_policy is None and select(engine, conversation, wire) is None
+    plain, _, _, conversation, wire, _ = engine_fixture(tmp_path / "plain")
+    assert select(plain, conversation, wire) is not None
+    plain.update_model("fixture", 32000)
+    assert select(plain, conversation, wire) is not None
+
+
+@pytest.mark.parametrize(
+    "helper",
+    [
+        "classify_responses_route",
+        "_classify_responses_issuer",
+        "_wire_model_identity",
+        "responses_endpoint_quirks",
+    ],
+)
+@pytest.mark.parametrize("failure", ["missing", "raises"])
+def test_native_route_helper_failures_revoke_permission(tmp_path, monkeypatch, helper, failure):
+    from agent import codex_responses_adapter as native
+
+    engine, _, _, conversation, wire, _ = reasoning_engine_fixture(tmp_path)
+    bind_codex(engine)
+    assert select(engine, conversation, wire) is not None
+
+    def broken(*args, **kwargs):
+        raise LookupError("private lookup failure")
+
+    if failure == "missing":
+        monkeypatch.delattr(native, helper)
+    else:
+        monkeypatch.setattr(native, helper, broken)
+    bind_codex(engine)
+    assert engine._reasoning_policy is None
+    assert select(engine, conversation, wire) is None
+    assert "private" not in json.dumps(engine.get_status())
+
+
+@pytest.mark.parametrize(
+    "helper,value",
+    [
+        ("_classify_responses_issuer", "unknown_native_issuer"),
+        ("_classify_responses_issuer", "other:https://secret.invalid"),
+        ("_wire_model_identity", None),
+        ("_wire_model_identity", " unnormalized "),
+        ("_wire_model_identity", "\ud800"),
+    ],
+)
+def test_unknown_native_route_results_never_create_permission(tmp_path, monkeypatch, helper, value):
+    from agent import codex_responses_adapter as native
+
+    engine, _, _, conversation, wire, _ = reasoning_engine_fixture(tmp_path)
+    bind_codex(engine)
+    monkeypatch.setattr(native, helper, lambda *args, **kwargs: value)
+    bind_codex(engine)
+    assert engine._reasoning_policy is None
+    assert select(engine, conversation, wire) is None
+
+
+def test_native_profile_lookup_exception_disables_reasoning(tmp_path, monkeypatch):
+    import providers
+
+    engine, _, _, conversation, wire, _ = reasoning_engine_fixture(tmp_path)
+    bind_codex(engine)
+
+    def broken(*args, **kwargs):
+        raise OSError("private profile lookup")
+
+    monkeypatch.setattr(providers, "profile_for_host", broken)
+    bind_codex(engine)
+    assert engine._reasoning_policy is None
+    assert select(engine, conversation, wire) is None
+
+
+def test_native_callback_uses_actual_home_profiles_and_xai_precedence(tmp_path):
+    import hermes_constants
+    import providers
+    from agent.codex_responses_adapter import _classify_responses_issuer, classify_responses_route
+
+    engine, _, _, conversation, wire, _ = reasoning_engine_fixture(tmp_path)
+    callback_home = tmp_path / "callback-profile"
+    plugin = callback_home / "plugins" / "model-providers" / "issue14"
+    plugin.mkdir(parents=True)
+    (plugin / "__init__.py").write_text(
+        "from providers import register_provider\nfrom providers.base import ProviderProfile\n"
+        "register_provider(ProviderProfile(name='issue14-home-profile', api_mode='codex_responses',\n"
+        "    hostnames=('issuer-conflict.invalid', 'api.x.ai'),\n"
+        "    responses_issuer_kind='synthetic_profile_issuer'))\n"
+    )
+    # An explicit native context overrides ambient HOME and the engine's archive
+    # attachment. It is the caller's route context, never a probe registry/home.
+    token = hermes_constants.set_hermes_home_override(callback_home)
+    try:
+        assert hermes_constants.get_hermes_home() == callback_home
+        for url, expected in [
+            ("https://child.issuer-conflict.invalid/v1", "synthetic_profile_issuer"),
+            ("https://api.x.ai/v1", "xai_responses"),
+        ]:
+            profile = providers.profile_for_host(url)
+            assert profile is not None and profile.name == "issue14-home-profile"
+            flags = classify_responses_route(SimpleNamespace(provider="openai-codex", base_url=url))
+            assert _classify_responses_issuer(base_url=url, **flags._asdict()) == expected
+            bind_codex(engine, base_url=url)
+            assert engine._reasoning_policy is None
+            assert select(engine, conversation, wire) is None
+    finally:
+        hermes_constants.reset_hermes_home_override(token)
+    # Native per-home registry must not leak that profile into this callback.
+    url = "https://child.issuer-conflict.invalid/v1"
+    assert providers.profile_for_host(url) is None
+    bind_codex(engine, base_url=url)
+    assert select(engine, conversation, wire) is not None
+
+
+def test_bound_policy_never_inspects_or_retains_credentials(tmp_path):
+    import gc
+    import weakref
+
+    engine, _, _, conversation, wire, _ = reasoning_engine_fixture(tmp_path)
+
+    class NeverInspect:
+        def __bool__(self):
+            pytest.fail("API key inspected")
+
+        def __str__(self) -> str:
+            raise AssertionError("API key inspected")
+
+        __repr__ = __str__
+
+    key = NeverInspect()
+    ref = weakref.ref(key)
+    bind_codex(
+        engine, api_key=key, base_url="https://synthetic-user:synthetic-password@proxy.invalid/v1"
+    )
+    del key
+    gc.collect()
+    assert ref() is None
+    assert vars(engine._reasoning_policy) == {
+        "issuer_kind": "codex_backend",
+        "issuer_model": "gpt-6.1-sol",
+    }
+    assert select(engine, conversation, wire) is not None
+    retained = repr(vars(engine))
+    assert all(
+        secret not in retained
+        for secret in ("synthetic-user", "synthetic-password", "proxy.invalid")
+    )
+
+
+def test_reasoning_binding_is_agent_scoped_but_clones_start_unbound(tmp_path, monkeypatch):
+    from hermes_ariadne.prepared import PreparedView
+
+    engine, _, rows, conversation, wire, _ = reasoning_engine_fixture(tmp_path)
+    bind_codex(engine)
+    assert select(engine, conversation, wire) is not None
+    binding = engine._reasoning_policy
+    scope = engine._capture()
+    frozen = engine._prepared
+    clone = engine.clone_for_agent()
+    assert clone._reasoning_policy is None and clone._route_revision == 0
+    clone.bind_session_state(engine._session_db, "chosen")
+    clone.on_session_start("chosen", hermes_home=engine._home)
+    assert select(clone, conversation, wire) is None
+
+    def no_reload(*args, **kwargs):
+        pytest.fail("model update reloaded prepared source")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(PreparedView, "load", no_reload)
+        revision = engine._route_revision
+        bind_codex(engine)
+        assert engine._route_revision > revision
+        assert engine._capture() == scope and engine._prepared is frozen
+    engine.on_session_reset()
+    assert engine._reasoning_policy == binding
+    engine.bind_session_state(engine._session_db, "chosen")
+    assert engine._capture().generation > scope.generation
+    assert select(engine, conversation, wire) is not None
+    replacement = SimpleNamespace(get_messages=lambda *a, **k: copy.deepcopy(rows))
+    engine.bind_session_state(replacement, "chosen")
+    assert engine._reasoning_policy == binding
+    assert select(engine, conversation, wire) is not None
+
+
+@pytest.mark.parametrize("latest_enabled", [False, True])
+@pytest.mark.parametrize("raises", [False, True])
+def test_native_classification_reentry_cannot_overwrite_newer_binding(
+    tmp_path, monkeypatch, latest_enabled, raises
+):
+    from agent import codex_responses_adapter as native
+
+    engine, _, _, conversation, wire, _ = reasoning_engine_fixture(tmp_path)
+    original = native.classify_responses_route
+    armed = True
+    latest = []
+
+    def classify(agent):
+        nonlocal armed
+        result = original(agent)
+        if armed:
+            armed = False
+            bind_codex(
+                engine,
+                provider="openai-codex" if latest_enabled else "openai",
+                context_length=64000,
+            )
+            assert (select(engine, conversation, wire) is not None) is latest_enabled
+            latest.append((engine._reasoning_policy, engine.get_status()))
+            if raises:
+                raise OSError("private old classification failure")
+        return result
+
+    monkeypatch.setattr(native, "classify_responses_route", classify)
+    bind_codex(engine, model="different-model")
+    assert (engine._reasoning_policy, engine.get_status()) == latest[0]
+    assert engine.context_length == 64000
+    assert (select(engine, conversation, wire) is not None) is latest_enabled
+
+
+@pytest.mark.parametrize("boundary", ["classification", "observation", "active", "measurement"])
+@pytest.mark.parametrize("change", ["same", "away_back"])
+@pytest.mark.parametrize("raises", [False, True])
+def test_route_event_barrier_discards_stale_work_without_clobbering_new_status(
+    tmp_path, monkeypatch, boundary, change, raises
+):
+    import threading
+
+    from agent import codex_responses_adapter as native
+    from agent import model_metadata
+
+    engine, _, rows, conversation, wire, _ = reasoning_engine_fixture(tmp_path)
+    bind_codex(engine)
+    entered, release = threading.Event(), threading.Event()
+    output, failures = [], []
+    old_thread = None
+    reader = engine._session_db.get_messages
+    classify = native.classify_responses_route
+    measure = model_metadata.estimate_request_tokens_rough
+    marker = {"message_uid": "stale-route", "role": "user", "content": "stale-route marker"}
+
+    def barrier():
+        entered.set()
+        assert release.wait(10), "new model update blocked behind old callback"
+        if raises:
+            raise OSError("private stale route callback")
+
+    def reading(session_id, **kwargs):
+        if threading.current_thread() is old_thread and boundary in {"observation", "active"}:
+            if kwargs["include_inactive"] is (boundary == "observation"):
+                barrier()
+                if boundary == "observation":
+                    return copy.deepcopy(rows) + [marker, {}]
+        return reader(session_id, **kwargs)
+
+    def classifying(agent):
+        result = classify(agent)
+        if boundary == "classification" and threading.current_thread() is old_thread:
+            barrier()
+        return result
+
+    def measuring(messages):
+        if boundary == "measurement" and threading.current_thread() is old_thread:
+            barrier()
+        return measure(messages)
+
+    def old_work():
+        try:
+            if boundary == "classification":
+                bind_codex(engine, model="different-model")
+            else:
+                output.append(select(engine, conversation, wire))
+        except BaseException as exc:
+            failures.append(exc)
+
+    engine._session_db.get_messages = reading
+    monkeypatch.setattr(native, "classify_responses_route", classifying)
+    monkeypatch.setattr(model_metadata, "estimate_request_tokens_rough", measuring)
+    old_thread = threading.Thread(target=old_work, daemon=True)
+    old_thread.start()
+    try:
+        assert entered.wait(10), "old callback never reached the barrier"
+        if change == "away_back":
+            bind_codex(engine, provider="openai")
+        bind_codex(engine)
+        assert select(engine, conversation, wire) is not None
+        latest = (engine._reasoning_policy, engine.get_status())
+    finally:
+        release.set()
+        old_thread.join(10)
+    assert not old_thread.is_alive() and not failures
+    assert output == ([] if boundary == "classification" else [None])
+    assert (engine._reasoning_policy, engine.get_status()) == latest
+    assert not engine._store.search("stale-route marker", session_id="chosen")
+    assert select(engine, conversation, wire) is not None
+
+
+def test_initial_route_binding_precedes_session_attachment_and_freezes_source(tmp_path):
+    engine, home, _, conversation, wire, _ = reasoning_engine_fixture(tmp_path)
+    initial = live_class()()
+    bind_codex(initial)
+    policy = initial._reasoning_policy
+    assert policy is not None and initial._home is initial._store is None
+    initial.bind_session_state(engine._session_db, "chosen")
+    initial.on_session_start("chosen", hermes_home=home)
+    assert initial._reasoning_policy is policy
+    assert select(initial, conversation, wire) is not None
+
+
+@pytest.mark.parametrize("field", ["model", "base_url", "provider", "api_mode"])
+def test_route_binding_requires_exact_str_not_subclasses(tmp_path, field):
+    class StringSubclass(str):
+        pass
+
+    engine, _, _, conversation, wire, _ = reasoning_engine_fixture(tmp_path)
+    values = dict(
+        model="gpt-6.1-sol-900k",
+        base_url="https://chatgpt.com/backend-api/codex",
+        provider="openai-codex",
+        api_mode="codex_responses",
+    )
+    bind_codex(engine, **{field: StringSubclass(values[field])})
+    assert engine._reasoning_policy is None
+    assert select(engine, conversation, wire) is None
+
+
+@pytest.mark.parametrize("failure", ["module_import", "profile_bypass"])
+def test_unavailable_native_binding_context_disables_old_permission(tmp_path, monkeypatch, failure):
+    import sys
+
+    from agent import safe_worker_policy
+
+    engine, _, _, conversation, wire, _ = reasoning_engine_fixture(tmp_path)
+    bind_codex(engine)
+    if failure == "module_import":
+        monkeypatch.setitem(sys.modules, "agent.codex_responses_adapter", None)
+    else:
+        monkeypatch.setattr(safe_worker_policy, "safe_worker_enabled", lambda: True)
+    bind_codex(engine)
+    assert engine._reasoning_policy is None
+    assert select(engine, conversation, wire) is None
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("_issuer_kind", "xai_responses"),
+        ("_issuer_model", "gpt-6-astra"),
+    ],
+)
+def test_explicit_binding_never_admits_foreign_retained_stamps(tmp_path, field, value):
+    engine, _, rows, conversation, wire, _ = reasoning_engine_fixture(tmp_path)
+    bind_codex(engine)
+    for messages, index in ((rows, 3), (conversation, 3), (wire, 4)):
+        row: dict = messages[index]
+        items = (
+            json.loads(row["codex_reasoning_items"])
+            if messages is rows
+            else copy.deepcopy(row["codex_reasoning_items"])
+        )
+        assert isinstance(items, list)
+        items[0][field] = value
+        row["codex_reasoning_items"] = json.dumps(items) if messages is rows else items
+    before = copy.deepcopy((rows, conversation, wire))
+    assert select(engine, conversation, wire) is None
+    assert engine.get_status()["selection"]["reason"] == "unsupported_alignment"
+    assert (rows, conversation, wire) == before
+
+
+def test_model_updates_do_not_turn_evidence_tool_reads_into_route_fences(tmp_path):
+    engine, _, rows, _, _, _ = engine_fixture(tmp_path)
+    armed = True
+
+    def reader(*args, **kwargs):
+        nonlocal armed
+        if armed:
+            armed = False
+            bind_codex(engine)
+        return copy.deepcopy(rows)
+
+    engine._session_db.get_messages = reader
+    result = json.loads(engine.handle_tool_call("ariadne_find", {"query": "original"}))
+    assert result["ok"] and result["results"]
+    assert engine.get_status()["selection"]["status"] == "unmeasured"
+
+
+def test_route_revision_also_fences_reasoning_free_measurement(tmp_path, monkeypatch):
+    from agent import model_metadata
+
+    engine, _, _, conversation, wire, _ = engine_fixture(tmp_path)
+    original = model_metadata.estimate_request_tokens_rough
+    armed = True
+    latest = []
+
+    def measure(messages):
+        nonlocal armed
+        if armed:
+            armed = False
+            engine.update_model("fixture", 32000)
+            assert select(engine, conversation, wire) is not None
+            latest.append(engine.get_status())
+        return original(messages)
+
+    monkeypatch.setattr(model_metadata, "estimate_request_tokens_rough", measure)
+    assert select(engine, conversation, wire) is None
+    assert engine.get_status() == latest[0]

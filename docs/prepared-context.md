@@ -36,6 +36,8 @@ The archive must be exactly `home/ariadne/events.sqlite3`. The prefix must later
 match the active durable rows byte-for-byte, including metadata. It must end at
 a user-turn boundary and leave at least the previous exchange and current user
 turn plus subsequent tools raw. A partial/pending tree is not publishable.
+Nonempty reasoning-bearing prefix sources are refused at publication, loading
+and selection; archived originals can still retain them exactly.
 
 The private artifact directory is
 `home/ariadne/prepared/<sha256(session_id UTF-8)>/`. `manifest.json` atomically
@@ -103,7 +105,7 @@ identities, including reused provider call IDs.
 
 Text messages and ordinary function-call/result envelopes are supported. Missing
 or duplicated UIDs, absorbed identities, inactive/rewound/revised prefixes,
-multimodal messages, nontrivial replay/thinking carriers, changed `api_content`,
+multimodal messages, replay/thinking carriers outside the finite contracts below, changed `api_content`,
 extra prefills and ambiguous persistence shapes decline selection. An identical
 `api_content` sidecar is supported. Audited comparison-only projections admit
 `_db_persisted=True`, tool-result `tool_name`/`effect_disposition` and agreeing
@@ -149,19 +151,83 @@ as JSON text in canonical durable rows and restores it as a list. Only canonical
 active rows receive strict comparison-only JSON decoding; duplicate keys,
 nonfinite values and malformed shapes decline. Request/replay strings are not
 silently decoded. Source hashes still cover the exact stored representation,
-and the actual retained assembled suffix is not rewritten. Nonempty reasoning
-carriers, commentary, multiple-message outputs, signatures and unknown or
-contradictory fields remain unsupported.
+and the actual retained assembled suffix is not rewritten. Commentary,
+multiple-message outputs, signatures and unknown or contradictory fields remain
+unsupported. The additional retained-tail reasoning contract is below.
 
-A routine archive lookup can still produce a native assistant tool call with
-nonempty encrypted `codex_reasoning_items` and reasoning-summary fields. This is
-outside this reasoning-free slice even when its text is empty and the tool ID
-is otherwise supported. In the final synthetic pilot, selection continued after
-restart until that carrier appeared, then declined without changing the request;
-later answers used original-history fallback, not compressed recall. This is not
-the ordinary-carrier size limit, and stripping the reasoning fields is not a fix.
-A separately audited extension is tracked in
-[issue #14](https://github.com/whayn/hermes-ariadne/issues/14).
+### Source-bound encrypted reasoning in the recent tail
+
+Some ordinary answers and archive lookups also carry provider-issued sealed
+continuation state in `codex_reasoning_items`. This is not a user memory store.
+Ariadne does not decrypt, summarize, regenerate or strip it. The experimental
+[issue #14](https://github.com/whayn/hermes-ariadne/issues/14) implementation admits
+one finite envelope on an otherwise supported **retained assistant answer or
+tool-call message**, while returning the actual assembled recent messages
+unchanged. Native continuation/restart and installed-artifact verification are
+separate gates; the pure checks alone do not establish those results.
+
+The item must have exactly six keys: `type`, `encrypted_content`, `id`, `summary`,
+`_issuer_kind` and `_issuer_model`. Its type is `reasoning`; ciphertext is nonempty
+ASCII, preserved without decoding or interpreting it. The ID must be a clean
+ASCII `rs_` value within 64 characters, excluding `rs_tmp_` IDs. Summary parts are
+ordered exact `{type: "summary_text", text: str}` objects, including empty lists
+or text. All new text must be valid UTF-8. Unknown fields, unrelated nonempty
+`reasoning_details`, unsupported shapes and missing issuer/model stamps decline.
+Both stored JSON text and decoded list envelopes have a separate 1 MiB admission
+bound; strict canonical decoding rejects duplicate keys and nonfinite values.
+
+Every admitted reasoning-bearing row must have canonical active-source coverage
+and exact UID/session/order correspondence. Its complete encrypted item must agree
+across canonical JSON text, restored conversation lists and assembled request
+lists. Repeated reasoning IDs across different retained rows in one candidate
+request decline because the native formatter can suppress repeated item IDs.
+This is a request-local reasoning rule, not a global/session ID namespace or a
+change to existing function-call occurrence semantics.
+
+Readable companions are checked independently rather than inferred from the
+summary or merged. Both canonical SQL columns `reasoning` and `reasoning_content`
+must exist and be NULL or UTF-8 strings. Each field follows this exact mapping:
+
+| Canonical value | Supported restored value |
+| --- | --- |
+| NULL | key absent or explicitly `None` |
+| Empty `reasoning` string | exact empty string, or absent only with `_db_persisted is True` |
+| Empty `reasoning_content` string | present exact empty string |
+| Nonempty string | present exact string, including whitespace |
+
+The two fields may contain different strings. The assembled message must omit
+**both readable keys entirely**, matching native assembly; even a present NULL or
+empty value declines. This comparison-only omission never rewrites the archive
+or conversation. Missing canonical coverage or a one-view mutation declines.
+
+The live engine needs complete metadata from Hermes's real `update_model`
+callback: exact provider `openai-codex`, API mode `codex_responses`, a nonempty
+base URL/model, native issuer classification `codex_backend`, and the exact
+native-normalized bound model. Native xAI/profile precedence applies in the
+callback's Hermes context. Missing helpers, incomplete/unsupported bindings and
+safe-worker profile bypass disable reasoning permission. No API key is inspected
+or retained, and no raw base URL is retained. Direct Python callers of
+`PreparedView.select` have no permission by default; its optional
+`ReasoningReplayPolicy` is a trusted host argument, not a model-controlled tool
+parameter.
+
+Each model update advances a separate route revision, even for identical values.
+Selection fences callback-capable reads, measurement and result/diagnostic
+publication against that revision as well as its session attachment generation.
+A stale classification cannot overwrite a newer binding. Model updates do not
+refresh the frozen prefix. Clones start without reasoning permission; same-agent
+reset/rebind may retain the latest explicit route binding.
+
+**Issuer/model stamps are labels, not authentication.** This contract establishes
+source correspondence plus the latest bound-route label match—not endpoint or
+account authenticity, decryptability, provider acceptance, final physical-wire
+model identity or context fit. Later request/model/input overrides and recovery
+remain Hermes-owned. A selection decline leaves the original request available
+to Hermes; it does not veto dispatch or change native filtering.
+
+Reasoning-bearing **older prefixes remain unsupported** at publication, load and
+direct selection. Keep those messages in the raw recent tail; this milestone does
+not compact reasoning state or automatically advance the prepared frontier.
 
 Canonical stored carrier JSON has a separate **1,048,576-byte UTF-8 admission
 limit**, including any JSON whitespace. Selection first checks character length,
@@ -176,7 +242,7 @@ keep their previous comparison semantics. Hermes normally persists these as SQL
 NULL and omits them from native replay. They are not nonempty replay payloads
 whose identity was dropped. Nonempty canonical JSON strings such as `"[]"`,
 `"false"`, `"{}"`, `"null"` or `"0"` are not this exception: they fail the strict
-one-message carrier check. Nonempty carrier omission or substitution between
+supported-carrier checks. Nonempty carrier omission or substitution between
 canonical, restored and assembled views still declines.
 
 Archive retention does not prove active-branch membership. A valid summary is not

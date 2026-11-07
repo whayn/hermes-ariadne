@@ -9,12 +9,35 @@ import os
 import socket
 import sqlite3
 import sys
+from importlib.metadata import version
 from pathlib import Path
 
 home = Path(os.environ["HERMES_HOME"])
 assert home.name == "isolated-home"
 assert Path(os.environ["HOME"]) == home.parent
 assert not any("proxy" in key.lower() for key in os.environ)
+managed = Path(os.environ["HERMES_MANAGED_DIR"])
+assert managed.is_dir() and not list(managed.iterdir())
+
+
+def credential_read_guard(event, args):
+    """Refuse shared credential/config opens BEFORE any host bootstrap imports."""
+    if event != "open" or not isinstance(args[0], (str, bytes, os.PathLike)):
+        return
+    requested = Path(os.fsdecode(args[0]))
+    path = requested.resolve()
+    protected = {"auth.json", ".env", ".op.env", "config.yaml", "credentials.json"}
+    if requested.name in protected or path.name in protected:
+        # Native bootstrap attempts nonexistent project dotenv layers unconditionally.
+        # Let the OS return ENOENT; an existing shared file is NEVER opened.
+        assert (
+            not path.exists()
+            or path.is_relative_to(home.parent.resolve())
+            or path.is_relative_to(managed.resolve())
+        ), "shared credential/config read forbidden"
+
+
+sys.addaudithook(credential_read_guard)
 _connect, _getaddrinfo = socket.socket.connect, socket.getaddrinfo
 
 
@@ -37,6 +60,10 @@ socket.getaddrinfo = loopback_getaddrinfo
 import httpx  # noqa: E402
 import openai  # noqa: E402
 
+sdk_distributions = {"openai": version("openai"), "httpx": version("httpx")}
+assert openai.__version__ == sdk_distributions["openai"]
+assert httpx.__version__ == sdk_distributions["httpx"]
+
 import hermes_ariadne  # noqa: E402
 from hermes_ariadne.kernel import MemoryKernel  # noqa: E402
 from hermes_ariadne.prepared import PreparedView, publish_prepared  # noqa: E402
@@ -47,6 +74,8 @@ from run_agent import AIAgent  # noqa: E402
 # isort: on
 
 MODE, BASE_URL = sys.argv[1:]
+NATIVE = MODE.startswith("native-")
+MODE = MODE.removeprefix("native-")
 SESSION = "synthetic-codex-prepared"
 EXACT = "SYNTHETIC-CODEX-ARCHIVED café 😀\n\t" + "λ exact  spacing\n" * 180 + "  "
 seed_path = home / "codex-seed.json"
@@ -76,12 +105,20 @@ if MODE == "baseline":
 else:
     seed = json.loads(seed_path.read_bytes())
 
+prepared_memory = None
+if MODE != "baseline":
+    # Independent operator-artifact checkpoint, before AIAgent assembly/hooks.
+    operator_store = EventStore(home / "ariadne" / "events.sqlite3")
+    operator_view = PreparedView.load(operator_store, SESSION, home)
+    assert operator_view is not None
+    prepared_memory = operator_view._memory
+
 agent = AIAgent(
     api_key="offline-synthetic-placeholder",
     base_url=BASE_URL,
-    provider="custom",
+    provider="openai-codex" if NATIVE and MODE != "foreignissuer" else "custom",
     api_mode="codex_responses",
-    model="ariadne/test",
+    model="ariadne/foreign" if MODE == "foreignmodel" else "ariadne/test",
     max_iterations=24,
     quiet_mode=True,
     skip_context_files=True,
@@ -93,10 +130,34 @@ agent = AIAgent(
     max_tokens=256,
 )
 assert agent.api_mode == "codex_responses"
+assert agent.base_url.rstrip("/") == BASE_URL
 assert isinstance(agent.client, openai.OpenAI), type(agent.client)
 assert isinstance(agent.client._client, httpx.Client), type(agent.client._client)
+
 engine = agent.context_compressor
 assert engine.name == "ariadne-prepared"
+if MODE == "disabledpolicy":
+    # Exercise the genuine incomplete host callback; no private policy substitution.
+    engine.update_model(agent.model, context_length=128000)
+if MODE == "disabledreplay":
+    agent._codex_reasoning_replay_enabled = False
+if MODE == "latemodel":
+    agent.request_overrides = {"model": "ariadne/late"}
+if MODE == "latebody":
+    agent.request_overrides = {
+        "extra_body": {
+            "model": "ariadne/late-body",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "SYNTHETIC-CODEX-TURN-latebody"},
+                    ],
+                }
+            ],
+        }
+    }
 engine_origin = str(sys.modules[type(engine).__module__].__file__)
 assert "plugins/ariadne-prepared" in engine_origin
 assert agent._context_engine_tool_names == {"ariadne_find", "ariadne_zoom"}
@@ -158,6 +219,7 @@ for current_turn in turns:
     # A mutually consistent hook/candidate/HTTP omission cannot erase this oracle.
     checkpoints.append({"turn": current_turn, "durable": copy.deepcopy(db.get_messages(SESSION))})
     history = db.get_messages_as_conversation(SESSION, repair_alternation=True)
+    checkpoints[-1]["restored"] = copy.deepcopy(history)
     result = agent.run_conversation(
         "SYNTHETIC-CODEX-TURN-" + current_turn,
         conversation_history=history,
@@ -171,6 +233,12 @@ original_rows = db.get_messages(SESSION)[: len(seed)]
 assert original_rows == seed, "canonical original rows changed"
 report = {
     "mode": MODE,
+    "prepared_memory": prepared_memory,
+    "native": NATIVE,
+    "provider": agent.provider,
+    "api_mode": agent.api_mode,
+    "bound_model": agent.model,
+    "native_replay_enabled": agent._codex_reasoning_replay_enabled,
     "pid": os.getpid(),
     "results": results,
     "selections": selections,
@@ -187,7 +255,24 @@ report = {
     "operator_package_origin": hermes_ariadne.__file__,
     "engine_origin": engine_origin,
     "openai_version": openai.__version__,
+    "sdk_distributions_before_host": sdk_distributions,
     "httpx_version": httpx.__version__,
+    "openai_origin": openai.__file__,
+    "httpx_origin": httpx.__file__,
+    "source_fingerprints": {
+        name: {
+            "path": module.__file__,
+            "sha256": hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest(),
+        }
+        for name in (
+            "run_agent",
+            "agent.agent_init",
+            "agent.codex_responses_adapter",
+            "agent.transports.codex",
+            type(engine).__module__,
+        )
+        if (module := sys.modules.get(name)) is not None
+    },
 }
 agent.close()
 db.close()
