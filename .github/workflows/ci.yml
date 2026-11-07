@@ -60,7 +60,7 @@ jobs:
           python -m pytest tests/test_store.py tests/test_crash.py tests/test_simulation.py
           tests/test_tree.py tests/test_kernel.py tests/test_kernel_demo.py
           tests/test_receipts.py tests/test_compaction.py tests/test_compactor_profile.py
-          tests/test_host_site.py tests/test_prepared.py tests/test_retrieval.py -q
+          tests/test_host_site.py tests/test_prepared.py tests/test_retrieval.py -q -rs
 
   hermes:
     name: Hermes integration
@@ -97,7 +97,7 @@ jobs:
           TMPDIR: ${{ runner.temp }}
         run: |
           "$HERMES_PYTHON" -c 'import openai, httpx; print("PM baseline:", "openai=" + openai.__version__, "httpx=" + httpx.__version__)'
-          bash scripts/test.sh tests/test_engine.py tests/test_host_contract.py tests/test_restart.py tests/test_install.py -q
+          bash scripts/test.sh tests/test_engine.py tests/test_host_contract.py tests/test_restart.py tests/test_install.py -q -rs
       - name: Align disposable CI host with source-validated native SDK versions
         env:
           HERMES_PYTHON: ${{ runner.temp }}/hermes-python/bin/python
@@ -121,7 +121,7 @@ jobs:
           HERMES_SOURCE: ${{ github.workspace }}/.ci/hermes
           HERMES_PYTHON: ${{ runner.temp }}/hermes-python/bin/python
           TMPDIR: ${{ runner.temp }}
-        run: bash scripts/test.sh -q
+        run: bash scripts/test.sh -q -rs
 
   secrets:
     name: Secrets

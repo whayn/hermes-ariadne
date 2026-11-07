@@ -115,6 +115,70 @@ by Hermes's outer-whitespace trimming; interior edits and tool-result trimming
 are not admitted. None of these comparison projections rewrites source bytes or
 the returned protected request suffix.
 
+Independently assigned native Codex tool-item IDs are supported when they are
+clean unsigned ASCII `fc_`-prefixed values within 64 characters and the call's
+`call_id` agrees with its `id`. Unlike deterministic sidecars, a non-derived
+native item ID remains in comparison identity: all available canonical,
+restored and assembled views must retain the same value. Missing or swapped
+IDs, changed argument bytes, signatures and unknown call fields decline.
+Within each single assistant `tool_calls` array, duplicate IDs admitted through
+this **non-derived native-item path** also decline before candidate measurement,
+even when all three views agree. The comparison resets this check for every
+message: reuse across assistant messages remains supported with distinct
+occurrence UIDs, for the same or different provider call IDs. This is a
+response-local supported-envelope admission rule, not history/session-wide
+uniqueness, issuer provenance or provider certification. Values matching the
+host's deterministic derivation still follow the legacy sidecar path, including
+repeated derived IDs and mixed derived/independent collisions. The available
+fields cannot distinguish a native ID equal to that derivation or establish a
+response/issuer namespace across historical messages; this rule does not resolve
+that ambiguity by imposing a broader uniqueness policy.
+
+Parallel/reused call-ID occurrence checks still apply. This concerns the
+assembled selection-hook message: Hermes's native formatter subsequently omits
+that item ID from HTTP function-call items while preserving the call/result
+link. Ariadne neither changes that formatting nor rebuilds the retained suffix.
+
+One ordinary native Codex final-answer carrier is also supported: exactly one
+completed assistant `message`, containing exactly one nonempty `output_text`
+part matching the canonical answer. Its optional ID must be a clean ASCII
+`msg_`-prefixed value within 64 characters; its phase must be absent or
+`final_answer`. The complete validated item (including ID, status, phase and
+untrimmed text) remains part of comparison identity. Hermes stores this carrier
+as JSON text in canonical durable rows and restores it as a list. Only canonical
+active rows receive strict comparison-only JSON decoding; duplicate keys,
+nonfinite values and malformed shapes decline. Request/replay strings are not
+silently decoded. Source hashes still cover the exact stored representation,
+and the actual retained assembled suffix is not rewritten. Nonempty reasoning
+carriers, commentary, multiple-message outputs, signatures and unknown or
+contradictory fields remain unsupported.
+
+A routine archive lookup can still produce a native assistant tool call with
+nonempty encrypted `codex_reasoning_items` and reasoning-summary fields. This is
+outside this reasoning-free slice even when its text is empty and the tool ID
+is otherwise supported. In the final synthetic pilot, selection continued after
+restart until that carrier appeared, then declined without changing the request;
+later answers used original-history fallback, not compressed recall. This is not
+the ordinary-carrier size limit, and stripping the reasoning fields is not a fix.
+A separately audited extension is tracked in
+[issue #14](https://github.com/whayn/hermes-ariadne/issues/14).
+
+Canonical stored carrier JSON has a separate **1,048,576-byte UTF-8 admission
+limit**, including any JSON whitespace. Selection first checks character length,
+then encoded length before strict JSON decoding; oversized carriers decline
+without rewriting history. This is not the candidate `request_bytes` allowance,
+a whole-source/process-memory bound, or a dispatch veto: Hermes can still send
+the original request after a decline. Original strings and source hashes remain
+unchanged, and no decoded-carrier cache survives a selection.
+
+Legacy empty-as-absent markers (`None`, `""`, `False`, `[]`, `{}`, `0`, `0.0`)
+keep their previous comparison semantics. Hermes normally persists these as SQL
+NULL and omits them from native replay. They are not nonempty replay payloads
+whose identity was dropped. Nonempty canonical JSON strings such as `"[]"`,
+`"false"`, `"{}"`, `"null"` or `"0"` are not this exception: they fail the strict
+one-message carrier check. Nonempty carrier omission or substitution between
+canonical, restored and assembled views still declines.
+
 Archive retention does not prove active-branch membership. A valid summary is not
 evidence that every old natural-language restriction or preference survived
 semantically.
@@ -227,6 +291,25 @@ base64, not lossy text clipping. Concatenate **base64-decoded bytes** in offset
 order before UTF-8/surrogatepass decoding and JSON parsing; a page can split a
 Unicode code point. Previews cannot reconstruct the original. The bound limits
 outbound results, not archive scan cost or reader memory.
+
+## Native Codex transport regression
+
+`tests/test_codex_transport.py` uses actual `AIAgent`, `SessionDB`, installed-plugin
+discovery, OpenAI SDK HTTP and Responses SSE with an isolated custom loopback
+endpoint in `codex_responses` mode. Replies and summaries are explicitly scripted
+synthetic fixtures, not real model output or a connection to OpenAI's Codex
+backend. Ordinary replies, actual find/zoom tool iterations, subsequent user
+turns and a separate-process restart must all select the prepared view.
+
+The tests independently check the candidate and actual HTTP payload: navigation
+must arrive first and exactly once, using Hermes's audited send-time outer-text
+whitespace trimming rather than raw hook bytes; original protected text and host
+instructions must match the source-validated no-op baseline; native carrier values
+and durable call/result occurrence UIDs must survive replay and restart. Exact source pages
+are reassembled and hash-checked separately from model-like output. Pure mutation
+probes ensure the assertions reject missing/corrupted navigation, changed
+protected text/instructions, null/regenerated occurrence UIDs and a bad baseline.
+The actual provider pilot remains a separate opt-in verification step.
 
 ## Rollback and limits of evidence
 
