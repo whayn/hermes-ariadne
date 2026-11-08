@@ -3350,6 +3350,336 @@ def test_encrypted_tool_codec_keeps_occurrence_metadata_checks(tmp_path, mutatio
     assert_encrypted_decline(prepared, active, conversation, wire)
 
 
+def oversized_reasoning_items(case):
+    from hermes_ariadne.prepared import _MAX_CANONICAL_CODEX_JSON_BYTES
+
+    bound = _MAX_CANONICAL_CODEX_JSON_BYTES
+    item = encrypted_reasoning_item()
+    if case == "ciphertext":
+        item["encrypted_content"] = "x" * (2 * bound)
+    elif case == "summary":
+        item["summary"][0]["text"] = "λ" * bound
+    elif case == "controls":
+        item["summary"][0]["text"] = "\0" * (bound // 2)
+    elif case == "cumulative":
+        item["summary"] = [{"type": "summary_text", "text": "x" * 1000} for _ in range(1100)]
+    elif case == "empty_parts":
+        item["summary"] = [{"type": "summary_text", "text": ""} for _ in range(40000)]
+    elif case == "model":
+        item["_issuer_model"] = "m" * (2 * bound)
+    elif case == "item_keys":
+        item.update({f"extra_{i}": None for i in range(80000)})
+    elif case == "part_keys":
+        item["summary"][0].update({f"extra_{i}": None for i in range(80000)})
+    return [item]
+
+
+RESOURCE_CASES = [
+    "ciphertext",
+    "summary",
+    "controls",
+    "cumulative",
+    "empty_parts",
+    "model",
+    "item_keys",
+    "part_keys",
+]
+
+
+@pytest.mark.parametrize("case", RESOURCE_CASES)
+def test_encrypted_resource_direct_rejects_before_full_serialization(monkeypatch, case):
+    import hermes_ariadne.prepared as module
+
+    items = oversized_reasoning_items(case)
+    policy = module.ReasoningReplayPolicy("codex_backend", items[0]["_issuer_model"])
+    before = copy.deepcopy(items)
+    monkeypatch.setattr(module, "canonical_json", lambda _: pytest.fail("full carrier encode"))
+    original_dumps = module.json.dumps
+    original_set = set
+    encoded_lengths = []
+
+    def bounded_dumps(value, **kwargs):
+        assert type(value) is str and len(value) <= 4096
+        encoded = original_dumps(value, **kwargs)
+        encoded_lengths.append(len(encoded.encode("utf-8")))
+        return encoded
+
+    def bounded_set(value):
+        assert len(value) <= 6, "key set allocated before builtin length check"
+        return original_set(value)
+
+    monkeypatch.setattr(module.json, "dumps", bounded_dumps)
+    monkeypatch.setattr(module, "set", bounded_set, raising=False)
+    with pytest.raises(ValueError):
+        module._encrypted_codex_reasoning(
+            {"role": "assistant", "codex_reasoning_items": items}, policy
+        )
+    assert items == before
+    assert max(encoded_lengths, default=0) <= 24578
+    if case != "controls":
+        assert encoded_lengths == []  # Necessary raw/count bounds need no JSON encoding.
+
+
+@pytest.mark.parametrize("view", ["request", "restored", "active_list", "active_text"])
+@pytest.mark.parametrize("case", RESOURCE_CASES)
+def test_encrypted_resource_public_precedes_safety_serialization(tmp_path, monkeypatch, view, case):
+    import hermes_ariadne.prepared as module
+
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    items = oversized_reasoning_items(case)
+    rows, index = {
+        "request": (wire, 5),
+        "restored": (conversation, 3),
+        "active_list": (active, 3),
+        "active_text": (active, 3),
+    }[view]
+    carrier = canonical_json(items).decode("utf-8") if view == "active_text" else items
+    rows[index]["codex_reasoning_items"] = carrier
+    before = copy.deepcopy((active, conversation, wire))
+    archive = prepared.projection._archive.path.read_bytes()
+    checkpoint = prepared.kernel.path.read_bytes()
+    original = module.ascii_json_units
+
+    def guarded(value):
+        if value is rows:
+            pytest.fail("oversized carrier reached generic safety serializer")
+        return original(value)
+
+    monkeypatch.setattr(module, "ascii_json_units", guarded)
+    result = choose(prepared, active, conversation, wire, reasoning_policy=replay_policy())
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment"
+    assert (active, conversation, wire) == before
+    assert prepared.projection._archive.path.read_bytes() == archive
+    assert prepared.kernel.path.read_bytes() == checkpoint
+
+
+REASONING_BYTE_PATTERNS = [
+    ("ciphertext", "x"),
+    ("summary", "λ😀"),
+    ("summary", '"\\\0\n'),
+    ("model", "λ😀"),
+    ("model", '"\\\0\n'),
+]
+
+
+def reasoning_items_at_byte_limit(field, pattern, extra):
+    from hermes_ariadne.prepared import _MAX_CANONICAL_CODEX_JSON_BYTES
+
+    items = [encrypted_reasoning_item()]
+    target, key = {
+        "ciphertext": (items[0], "encrypted_content"),
+        "summary": (items[0]["summary"][0], "text"),
+        "model": (items[0], "_issuer_model"),
+    }[field]
+    target[key] = "mm"  # Keep model boundaries non-whitespace, including control patterns.
+    room = _MAX_CANONICAL_CODEX_JSON_BYTES + extra - len(canonical_json(items))
+    unit_bytes = len(canonical_json(pattern)) - 2
+    count, remainder = divmod(room, unit_bytes)
+    target[key] = "m" + pattern * count + "x" * remainder + "m"
+    assert len(canonical_json(items)) == _MAX_CANONICAL_CODEX_JSON_BYTES + extra
+    return items
+
+
+@pytest.mark.parametrize("field,pattern", REASONING_BYTE_PATTERNS)
+@pytest.mark.parametrize("extra", [0, 1])
+@pytest.mark.parametrize("canonical_text", [False, True])
+def test_encrypted_exact_byte_boundaries_preserve_values(field, pattern, extra, canonical_text):
+    import hermes_ariadne.prepared as module
+
+    items = reasoning_items_at_byte_limit(field, pattern, extra)
+    carrier = canonical_json(items).decode("utf-8") if canonical_text else items
+    before = copy.deepcopy(carrier)
+    policy = module.ReasoningReplayPolicy("codex_backend", items[0]["_issuer_model"])
+    message = {"role": "assistant", "codex_reasoning_items": carrier}
+    if extra:
+        with pytest.raises(ValueError, match="admission bound"):
+            module._encrypted_codex_reasoning(message, policy, durable=canonical_text)
+    else:
+        assert module._reasoning_list_bytes(items) == module._MAX_CANONICAL_CODEX_JSON_BYTES
+        result = module._encrypted_codex_reasoning(message, policy, durable=canonical_text)
+        assert result == items
+        if not canonical_text:
+            assert result is items
+    assert message["codex_reasoning_items"] == before
+
+
+@pytest.mark.parametrize("field,pattern", REASONING_BYTE_PATTERNS)
+@pytest.mark.parametrize("extra", [0, 1])
+@pytest.mark.parametrize("canonical_text", [False, True])
+def test_encrypted_public_exact_byte_boundaries(tmp_path, field, pattern, extra, canonical_text):
+    from dataclasses import replace
+
+    import hermes_ariadne.prepared as module
+
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    prepared = replace(prepared, request_bytes=16 * module._MAX_CANONICAL_CODEX_JSON_BYTES)
+    items = reasoning_items_at_byte_limit(field, pattern, extra)
+    set_encrypted_envelope(active, conversation, wire, items)
+    # Source TEXT has its own inclusive bound, including whitespace/escaping.
+    active[3]["codex_reasoning_items"] = (
+        canonical_json(items).decode("utf-8") if canonical_text else copy.deepcopy(items)
+    )
+    policy = module.ReasoningReplayPolicy("codex_backend", items[0]["_issuer_model"])
+    before = copy.deepcopy((active, conversation, wire))
+    hashes = [digest(row) for row in active]
+    archive = prepared.projection._archive.path.read_bytes()
+    checkpoint = prepared.kernel.path.read_bytes()
+    measured = []
+    result = choose(
+        prepared,
+        active,
+        conversation,
+        wire,
+        reasoning_policy=policy,
+        measure_tokens=lambda m: measured.append(copy.deepcopy(m)) or 100,
+    )
+    if extra:
+        assert result.status == "declined" and result.messages is None
+        assert result.diagnostics["reason"] == "unsupported_alignment" and measured == []
+    else:
+        assert result.status == "selected" and result.messages is not None
+        assert result.messages[3:] == wire[4:]
+        assert measured == [result.messages]
+        # Final policy stays in ASCII-JSON units, not the codec's UTF-8 units.
+        from hermes_ariadne.simulation import ascii_json_units
+
+        assert result.diagnostics["request_bytes"] == ascii_json_units(result.messages)
+    assert (active, conversation, wire) == before
+    assert [digest(row) for row in active] == hashes
+    assert prepared.projection._archive.path.read_bytes() == archive
+    assert prepared.kernel.path.read_bytes() == checkpoint
+
+
+@pytest.mark.parametrize("seed", [14, 4504058384])
+def test_encrypted_size_randomized_differential(seed, monkeypatch):
+    import random
+
+    import hermes_ariadne.prepared as module
+
+    rng = random.Random(seed)
+    alphabet = 'abc λ😀漢"\\\0\n\t\b\r\f\x1f\u2028'
+    for index in range(300):
+        item = encrypted_reasoning_item(ident="rs_" + "x" * rng.randint(1, 61))
+        item["encrypted_content"] = "x" + "".join(rng.choices('a"\\\0\n', k=rng.randrange(50)))
+        item["_issuer_model"] = "m" + "".join(rng.choices(alphabet, k=rng.randrange(40))) + "m"
+        item["summary"] = [
+            {"type": "summary_text", "text": "".join(rng.choices(alphabet, k=rng.randrange(80)))}
+            for _ in range(rng.randrange(10))
+        ]
+        if index % 10 == 0:
+            # Exercise additivity across encoder slices, not just tiny strings.
+            item["summary"].append(
+                {
+                    "type": "summary_text",
+                    "text": "".join(rng.choices(alphabet, k=rng.choice([4095, 4096, 4097, 8193]))),
+                }
+            )
+        items = [item]
+        before = copy.deepcopy(items)
+        expected = len(canonical_json(items))
+        policy = module.ReasoningReplayPolicy("codex_backend", item["_issuer_model"])
+        assert module._reasoning_list_bytes(items) == expected
+        assert (
+            module._encrypted_codex_reasoning(
+                {"role": "assistant", "codex_reasoning_items": items}, policy
+            )
+            is items
+        )
+        # Differential acceptance as well as exact size, with inclusive limits.
+        with monkeypatch.context() as patcher:
+            patcher.setattr(module, "_MAX_CANONICAL_CODEX_JSON_BYTES", expected - 1)
+            with pytest.raises(ValueError, match="admission bound"):
+                module._reasoning_list_bytes(items)
+            patcher.setattr(module, "_MAX_CANONICAL_CODEX_JSON_BYTES", expected)
+            assert module._reasoning_list_bytes(items) == expected
+        assert items == before
+
+
+@pytest.mark.parametrize("public", [False, True])
+def test_encrypted_giant_matching_policy_uses_bounded_utf8_validation(tmp_path, public):
+    import sys
+
+    import hermes_ariadne.prepared as module
+
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    items = oversized_reasoning_items("model")
+    policy = module.ReasoningReplayPolicy("codex_backend", items[0]["_issuer_model"])
+    wire[5]["codex_reasoning_items"] = items
+    encode_lengths = []
+
+    def observe(frame, event, function):
+        if event == "c_call" and getattr(function, "__name__", None) == "encode":
+            value = getattr(function, "__self__", None)
+            if type(value) is str:
+                encode_lengths.append(len(value))
+
+    previous = sys.getprofile()
+    sys.setprofile(observe)
+    try:
+        if public:
+            result = choose(prepared, active, conversation, wire, reasoning_policy=policy)
+            assert result.status == "declined" and result.messages is None
+        else:
+            with pytest.raises(ValueError, match="admission bound"):
+                module._encrypted_codex_reasoning(
+                    {"role": "assistant", "codex_reasoning_items": items}, policy
+                )
+    finally:
+        sys.setprofile(previous)
+    assert max(encode_lengths, default=0) <= 4096
+    # No independent tag cap: huge trusted labels remain valid without reasoning.
+    module._require_reasoning_policy(policy)
+    for rows, index in ((active, 3), (conversation, 3), (wire, 5)):
+        rows[index].pop("codex_reasoning_items")
+    assert (
+        choose(prepared, active, conversation, wire, reasoning_policy=policy).status == "selected"
+    )
+
+
+def test_encrypted_summary_count_bound_is_derived_not_an_extra_cap():
+    import hermes_ariadne.prepared as module
+
+    skeleton = encrypted_reasoning_item()
+    skeleton.update(encrypted_content="", id="", summary=[], _issuer_model="")
+    assert len(canonical_json([skeleton])) == 116
+    assert len(canonical_json({"type": "summary_text", "text": ""})) == 33
+    item = encrypted_reasoning_item()
+    item["summary"] = []
+    room = module._MAX_CANONICAL_CODEX_JSON_BYTES - len(canonical_json([item]))
+    count = (room + 1) // 34
+    item["summary"] = [{"type": "summary_text", "text": ""} for _ in range(count)]
+    item["encrypted_content"] += "x" * (
+        module._MAX_CANONICAL_CODEX_JSON_BYTES - len(canonical_json([item]))
+    )
+    assert module._reasoning_list_bytes([item]) == module._MAX_CANONICAL_CODEX_JSON_BYTES
+    assert module._encrypted_codex_reasoning(
+        {"role": "assistant", "codex_reasoning_items": [item]}, replay_policy()
+    ) == [item]
+    item["summary"].append({"type": "summary_text", "text": ""})
+    with pytest.raises(ValueError, match="admission bound"):
+        module._reasoning_list_bytes([item])
+
+
+@pytest.mark.parametrize("field", ["summary", "model"])
+@pytest.mark.parametrize("offset", [4095, 4096, 4097])
+def test_encrypted_strict_utf8_across_string_slices(field, offset):
+    import hermes_ariadne.prepared as module
+
+    item = encrypted_reasoning_item()
+    bad = "m" * offset + "\ud800" + "m"
+    if field == "summary":
+        item["summary"][0]["text"] = bad
+        policy = replay_policy()
+    else:
+        item["_issuer_model"] = bad
+        policy = module.ReasoningReplayPolicy("codex_backend", bad)
+    with pytest.raises(UnicodeError):
+        module._encrypted_codex_reasoning(
+            {"role": "assistant", "codex_reasoning_items": [item]}, policy
+        )
+
+
 @pytest.mark.parametrize("mode", ["derived", "legacy", "cross_row_native", "duplicate_native"])
 def test_encrypted_tool_codec_preserves_existing_function_id_scope(tmp_path, mode):
     prepared, active, conversation, wire = encrypted_tool_fixture(tmp_path)

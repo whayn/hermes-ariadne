@@ -52,10 +52,14 @@ def _require_reasoning_policy(policy):
         or policy.issuer_kind != "codex_backend"
         or type(policy.issuer_model) is not str
         or not policy.issuer_model
-        or policy.issuer_model != policy.issuer_model.strip()
+        or policy.issuer_model[0].isspace()
+        or policy.issuer_model[-1].isspace()
     ):
         raise ValueError("unsupported reasoning replay policy")
-    policy.issuer_model.encode("utf-8")
+    # Policy labels have no independent length limit (including reasoning-free
+    # selections), but validating one must not allocate its entire UTF-8 copy.
+    for start in range(0, len(policy.issuer_model), 4096):
+        policy.issuer_model[start : start + 4096].encode("utf-8")
 
 
 def _positive(value):
@@ -344,55 +348,119 @@ def _ordinary_codex_message(message, *, wire=False, durable=False):
     return items
 
 
-def _encrypted_codex_reasoning(message, policy, *, durable=False):
-    """Validate an opaque replay envelope, without interpreting its ciphertext."""
-    _require_reasoning_policy(policy)
-    items = message["codex_reasoning_items"]
-    if durable and type(items) is str:
-        if len(items) > _MAX_CANONICAL_CODEX_JSON_BYTES:
-            raise ValueError("canonical Codex JSON exceeds its admission bound")
-        encoded = items.encode("utf-8")
-        if len(encoded) > _MAX_CANONICAL_CODEX_JSON_BYTES:
-            raise ValueError("canonical Codex JSON exceeds its admission bound")
-        items = _json(encoded)
-    if type(items) is not list or len(items) != 1 or message["role"] != "assistant":
+def _reasoning_list_bytes(items):
+    """Exact compact UTF-8 JSON size for the finite encrypted carrier shape.
+
+    Resource admission only: this grants no route, role, source or occurrence
+    permission. Check builtin lengths before key sets or string serialization;
+    a cumulative lower bound caps traversal even for many empty summaries.
+    """
+    if type(items) is not list or len(items) != 1:
         raise ValueError("unsupported encrypted reasoning envelope")
     item = items[0]
-    if type(item) is not dict or set(item) != {
-        "type",
-        "encrypted_content",
-        "id",
-        "summary",
-        "_issuer_kind",
-        "_issuer_model",
-    }:
+    if (
+        type(item) is not dict
+        or len(item) != 6
+        or set(item)
+        != {
+            "type",
+            "encrypted_content",
+            "id",
+            "summary",
+            "_issuer_kind",
+            "_issuer_model",
+        }
+    ):
         raise ValueError("unsupported encrypted reasoning fields")
     if (
         item["type"] != "reasoning"
         or type(item["encrypted_content"]) is not str
         or not item["encrypted_content"]
-        or not item["encrypted_content"].isascii()
         or type(item["id"]) is not str
+        or len(item["id"]) > 64
         or re.fullmatch(r"rs_[A-Za-z0-9_-]{1,61}", item["id"]) is None
         or item["id"].startswith("rs_tmp_")
         or type(item["_issuer_kind"]) is not str
-        or item["_issuer_kind"] != policy.issuer_kind
+        or item["_issuer_kind"] != "codex_backend"
         or type(item["_issuer_model"]) is not str
-        or item["_issuer_model"] != policy.issuer_model
         or type(item["summary"]) is not list
     ):
         raise ValueError("unsupported encrypted reasoning item")
-    for part in item["summary"]:
+
+    def bounded(size):
+        if size > _MAX_CANONICAL_CODEX_JSON_BYTES:
+            raise ValueError("Codex reasoning list exceeds its admission bound")
+        return size
+
+    # Empty encrypted_content/id/model and [] summary cost 116 bytes. Each
+    # {"text":"","type":"summary_text"} costs 33, plus inter-part commas.
+    parts = item["summary"]
+    count = len(parts)
+    size = bounded(116 + 33 * count + max(count - 1, 0))
+    for key in ("encrypted_content", "id", "_issuer_model"):
+        size = bounded(size + len(item[key]))
+    for part in parts:
         if (
             type(part) is not dict
+            or len(part) != 2
             or set(part) != {"type", "text"}
             or part["type"] != "summary_text"
             or type(part["text"]) is not str
         ):
             raise ValueError("unsupported reasoning summary")
-        part["text"].encode("utf-8")
-    if len(canonical_json(items)) > _MAX_CANONICAL_CODEX_JSON_BYTES:
-        raise ValueError("Codex reasoning list exceeds its admission bound")
+        size = bounded(size + len(part["text"]))
+    if not item["encrypted_content"].isascii():
+        raise ValueError("unsupported encrypted reasoning item")
+
+    def payload(value):
+        nonlocal size
+        # iterencode alone may produce a whole giant escaped string. Encode
+        # <=4096 characters instead (<=24578 UTF-8 JSON bytes with quotes).
+        # Escaping and UTF-8 sizes are additive across scalar Unicode slices;
+        # strict UTF-8 also rejects surrogate summary/model text.
+        for start in range(0, len(value), 4096):
+            chunk = value[start : start + 4096]
+            encoded = json.dumps(chunk, ensure_ascii=False).encode("utf-8")
+            size = bounded(size + len(encoded) - 2 - len(chunk))
+
+    for key in ("encrypted_content", "id", "_issuer_model"):
+        payload(item[key])
+    for part in parts:
+        payload(part["text"])
+    return size
+
+
+def _reasoning_resource_preflight(message):
+    """Bound only this carrier before generic public-path safety serialization."""
+    items = message.get("codex_reasoning_items")
+    if items in (None, "", False, [], {}):
+        return  # Preserve legacy falsey markers, not serialized JSON absence.
+    if type(items) is str:
+        if len(items) > _MAX_CANONICAL_CODEX_JSON_BYTES:
+            raise ValueError("canonical Codex JSON exceeds its admission bound")
+        size = 0
+        for start in range(0, len(items), 4096):
+            size += len(items[start : start + 4096].encode("utf-8"))
+            if size > _MAX_CANONICAL_CODEX_JSON_BYTES:
+                raise ValueError("canonical Codex JSON exceeds its admission bound")
+        # Only canonical active rows may decode later. Generic re-escaping of
+        # this bounded text is now bounded too; do not normalize or cache it.
+    else:
+        _reasoning_list_bytes(items)
+
+
+def _encrypted_codex_reasoning(message, policy, *, durable=False):
+    """Validate an opaque replay envelope, without interpreting its ciphertext."""
+    _require_reasoning_policy(policy)
+    items = message["codex_reasoning_items"]
+    if durable and type(items) is str:
+        _reasoning_resource_preflight(message)
+        items = _json(items.encode("utf-8"))
+    _reasoning_list_bytes(items)
+    if message["role"] != "assistant":
+        raise ValueError("unsupported encrypted reasoning envelope")
+    if items[0]["_issuer_model"] != policy.issuer_model:
+        raise ValueError("unsupported encrypted reasoning item")
     return items
 
 
@@ -699,8 +767,14 @@ def _alignment(prepared, request, conversation, incoming, active, reasoning_poli
             raise ValueError("nonempty message lists required")
         for message in messages:
             _require_supported_data_use(message)
+            _reasoning_resource_preflight(message)
+    # Do not let generic ASCII-JSON safety checks fully encode an oversized
+    # reasoning carrier before its codec runs. Other metadata is out of scope.
+    for messages in (request, conversation, active):
         _safe_json(messages)
     _require_supported_data_use(incoming)
+    if type(incoming) is dict:
+        _reasoning_resource_preflight(incoming)
     _safe_json(incoming)
     split = _leading(request)
     if not split:

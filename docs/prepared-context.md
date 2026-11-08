@@ -218,6 +218,14 @@ A stale classification cannot overwrite a newer binding. Model updates do not
 refresh the frozen prefix. Clones start without reasoning permission; same-agent
 reset/rebind may retain the latest explicit route binding.
 
+Native provider/profile classification runs synchronously in the callback's
+Hermes context, outside the engine lock. Exceptions disable reasoning permission,
+but there is no overall lookup deadline: filesystem operations and operator-installed
+provider-plugin discovery/imports must return. The route revision prevents stale
+permission publication; it does not cancel blocked native work. Moving lookup to
+an unbounded background worker would not supply cancellation and could lose the
+callback's profile context.
+
 **Issuer/model stamps are labels, not authentication.** This contract establishes
 source correspondence plus the latest bound-route label match—not endpoint or
 account authenticity, decryptability, provider acceptance, final physical-wire
@@ -236,6 +244,15 @@ without rewriting history. This is not the candidate `request_bytes` allowance,
 a whole-source/process-memory bound, or a dispatch veto: Hermes can still send
 the original request after a decline. Original strings and source hashes remain
 unchanged, and no decoded-carrier cache survives a selection.
+
+For the supported encrypted reasoning list, the same inclusive limit measures
+compact UTF-8 JSON bytes. A resource-only preflight runs before generic selection
+serialization. It checks the finite shape and cumulative lower bounds, then
+measures escaped string payloads in bounded slices rather than allocating a
+complete oversized carrier encoding. Canonical reasoning JSON text is byte-checked
+before generic re-escaping or decoding. This bounds temporary carrier-admission
+work, not already-materialized inputs, aggregate requests, unrelated metadata,
+archive ingestion, or process memory; it grants no source or route permission.
 
 Legacy empty-as-absent markers (`None`, `""`, `False`, `[]`, `{}`, `0`, `0.0`)
 keep their previous comparison semantics. Hermes normally persists these as SQL
