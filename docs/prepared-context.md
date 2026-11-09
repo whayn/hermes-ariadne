@@ -161,12 +161,13 @@ Some ordinary answers and archive lookups also carry provider-issued sealed
 continuation state in `codex_reasoning_items`. This is not a user memory store.
 Ariadne does not decrypt, summarize, regenerate or strip it. The experimental
 [issue #14](https://github.com/whayn/hermes-ariadne/issues/14) implementation admits
-one finite envelope on an otherwise supported **retained assistant answer or
-tool-call message**, while returning the actual assembled recent messages
-unchanged. Native continuation/restart and installed-artifact verification are
-separate gates; the pure checks alone do not establish those results.
+a nonempty ordered list of finite envelopes on an otherwise supported **retained
+assistant answer or tool-call message**, while returning the actual assembled
+recent messages unchanged. Native continuation/restart and installed-artifact
+verification are separate gates; the pure checks alone do not establish those
+results.
 
-The item must have exactly six keys: `type`, `encrypted_content`, `id`, `summary`,
+Each item must have exactly six keys: `type`, `encrypted_content`, `id`, `summary`,
 `_issuer_kind` and `_issuer_model`. Its type is `reasoning`; ciphertext is nonempty
 ASCII, preserved without decoding or interpreting it. The ID must be a clean
 ASCII `rs_` value within 64 characters, excluding `rs_tmp_` IDs. Summary parts are
@@ -177,10 +178,12 @@ Both stored JSON text and decoded list envelopes have a separate 1 MiB admission
 bound; strict canonical decoding rejects duplicate keys and nonfinite values.
 
 Every admitted reasoning-bearing row must have canonical active-source coverage
-and exact UID/session/order correspondence. Its complete encrypted item must agree
-across canonical JSON text, restored conversation lists and assembled request
-lists. Repeated reasoning IDs across different retained rows in one candidate
-request decline because the native formatter can suppress repeated item IDs.
+and exact UID/session/order correspondence. Its complete ordered encrypted-item
+list must agree across canonical JSON text,
+restored conversation lists and assembled request lists. Every item's model must
+match the trusted bound model. Repeated reasoning IDs within one list or across
+different retained rows in one candidate request decline because the native
+formatter can suppress repeated item IDs.
 This is a request-local reasoning rule, not a global/session ID namespace or a
 change to existing function-call occurrence semantics.
 
@@ -245,11 +248,14 @@ a whole-source/process-memory bound, or a dispatch veto: Hermes can still send
 the original request after a decline. Original strings and source hashes remain
 unchanged, and no decoded-carrier cache survives a selection.
 
-For the supported encrypted reasoning list, the same inclusive limit measures
-compact UTF-8 JSON bytes. A resource-only preflight runs before generic selection
-serialization. It checks the finite shape and cumulative lower bounds, then
-measures escaped string payloads in bounded slices rather than allocating a
-complete oversized carrier encoding. Canonical reasoning JSON text is byte-checked
+For the supported nonempty encrypted reasoning list, the same inclusive limit
+measures the **whole list's** compact UTF-8 JSON bytes, not a separate allowance
+per item. A resource-only preflight runs before generic selection serialization.
+It rejects impossible item counts using the structural minimum before traversal,
+checks each finite shape and cumulative lower bounds, then measures escaped string
+payloads in bounded slices rather than allocating a complete oversized carrier
+encoding. There is no additional arbitrary item-count cap. Canonical reasoning
+JSON text is byte-checked
 before generic re-escaping or decoding. This bounds temporary carrier-admission
 work, not already-materialized inputs, aggregate requests, unrelated metadata,
 archive ingestion, or process memory; it grants no source or route permission.

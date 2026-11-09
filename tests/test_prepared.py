@@ -3010,6 +3010,239 @@ def test_encrypted_answer_requires_explicit_policy_and_preserves_exact_sources(t
     assert prepared.kernel.path.read_bytes() == checkpoint
 
 
+def ordered_reasoning_items(*, prefix="rs_ordered"):
+    items = [encrypted_reasoning_item(ident=f"{prefix}_{index}") for index in range(3)]
+    for index, item in enumerate(items):
+        item["encrypted_content"] += f' {index} "\\\n'
+        item["summary"] = [
+            {"type": "summary_text", "text": f" {index} λ😀\n"},
+            {"type": "summary_text", "text": ""},
+            {"type": "summary_text", "text": "second\t"},
+        ]
+    return items
+
+
+@pytest.mark.parametrize("envelope", ["answer", "tool"])
+def test_encrypted_ordered_multi_item_selects_exact_isolated_tail(tmp_path, envelope):
+    fixture = encrypted_answer_fixture if envelope == "answer" else encrypted_tool_fixture
+    prepared, active, conversation, wire = fixture(tmp_path)
+    indices = (3,) if envelope == "answer" else (5, 8)
+    for index in indices:
+        items = ordered_reasoning_items(prefix=f"rs_row_{index}")
+        active[index]["codex_reasoning_items"] = json.dumps(items)
+        conversation[index]["codex_reasoning_items"] = copy.deepcopy(items)
+        wire[index + 2]["codex_reasoning_items"] = copy.deepcopy(items)
+    before = copy.deepcopy((active, conversation, wire))
+    hashes = [digest(row) for row in active]
+    archive = prepared.projection._archive.path.read_bytes()
+    checkpoint = prepared.kernel.path.read_bytes()
+    measured = []
+    result = choose(
+        prepared,
+        active,
+        conversation,
+        wire,
+        reasoning_policy=replay_policy(),
+        measure_tokens=lambda m: measured.append(copy.deepcopy(m)) or 100,
+    )
+    assert result.status == "selected" and result.messages is not None
+    assert result.messages[:2] == wire[:2] and result.messages[3:] == wire[4:]
+    assert measured == [result.messages]
+    result.messages[indices[0] + 1]["codex_reasoning_items"][2]["summary"][0]["text"] = "isolated"
+    assert (active, conversation, wire) == before
+    assert [digest(row) for row in active] == hashes
+    assert prepared.projection._archive.path.read_bytes() == archive
+    assert prepared.kernel.path.read_bytes() == checkpoint
+
+
+@pytest.mark.parametrize("index", [1, 2])
+def test_encrypted_ordered_multi_item_requires_each_model_to_match_policy(tmp_path, index):
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    items = ordered_reasoning_items()
+    set_encrypted_envelope(active, conversation, wire, items)
+    assert (
+        choose(prepared, active, conversation, wire, reasoning_policy=replay_policy()).status
+        == "selected"
+    )
+    items[index]["_issuer_model"] = "sibling-model"
+    set_encrypted_envelope(active, conversation, wire, items)
+    assert_encrypted_decline(prepared, active, conversation, wire)
+
+
+@pytest.mark.parametrize("scope", ["within", "across"])
+@pytest.mark.parametrize("equal_payload", [False, True])
+def test_encrypted_ordered_multi_item_ids_are_all_request_local_unique(
+    tmp_path, scope, equal_payload
+):
+    prepared, active, conversation, wire = encrypted_tool_fixture(tmp_path)
+    bundles = {index: ordered_reasoning_items(prefix=f"rs_row_{index}") for index in (5, 8)}
+    for index, items in bundles.items():
+        active[index]["codex_reasoning_items"] = json.dumps(items)
+        conversation[index]["codex_reasoning_items"] = copy.deepcopy(items)
+        wire[index + 2]["codex_reasoning_items"] = copy.deepcopy(items)
+    # A fresh selection owns a fresh set; IDs are not session-global state.
+    for _ in range(2):
+        assert (
+            choose(prepared, active, conversation, wire, reasoning_policy=replay_policy()).status
+            == "selected"
+        )
+    source = bundles[5][1]
+    index = 5 if scope == "within" else 8
+    bundles[index][2] = copy.deepcopy(source)
+    if not equal_payload:
+        bundles[index][2]["encrypted_content"] += " different"
+    active[index]["codex_reasoning_items"] = json.dumps(bundles[index])
+    conversation[index]["codex_reasoning_items"] = copy.deepcopy(bundles[index])
+    wire[index + 2]["codex_reasoning_items"] = copy.deepcopy(bundles[index])
+    assert_encrypted_decline(prepared, active, conversation, wire)
+
+
+@pytest.mark.parametrize("view", ["active", "restored", "request"])
+@pytest.mark.parametrize("mutation", ["insert", "remove", "reorder", "substitute"])
+def test_encrypted_ordered_multi_item_binds_full_list_in_each_view(tmp_path, view, mutation):
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    items = ordered_reasoning_items()
+    set_encrypted_envelope(active, conversation, wire, items)
+    assert (
+        choose(prepared, active, conversation, wire, reasoning_policy=replay_policy()).status
+        == "selected"
+    )
+    changed = copy.deepcopy(items)
+    if mutation == "insert":
+        changed.insert(1, encrypted_reasoning_item(ident="rs_inserted"))
+    elif mutation == "remove":
+        changed.pop(1)
+    elif mutation == "reorder":
+        changed[1:] = reversed(changed[1:])
+    else:
+        changed[2]["encrypted_content"] += " replacement"
+    rows, index = {"active": (active, 3), "restored": (conversation, 3), "request": (wire, 5)}[view]
+    rows[index]["codex_reasoning_items"] = json.dumps(changed) if view == "active" else changed
+    assert_encrypted_decline(prepared, active, conversation, wire)
+
+
+@pytest.mark.parametrize(
+    "field,pattern", [("ciphertext", "x"), ("summary", "λ😀"), ("summary", '"\\\0\n')]
+)
+@pytest.mark.parametrize("extra", [0, 1])
+@pytest.mark.parametrize("canonical_text", [False, True])
+def test_encrypted_ordered_multi_item_exact_byte_boundary(
+    tmp_path, field, pattern, extra, canonical_text
+):
+    from dataclasses import replace
+
+    import hermes_ariadne.prepared as module
+
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    prepared = replace(prepared, request_bytes=16 * module._MAX_CANONICAL_CODEX_JSON_BYTES)
+    items = ordered_reasoning_items()
+    target, key = (
+        (items[2], "encrypted_content")
+        if field == "ciphertext"
+        else (items[2]["summary"][1], "text")
+    )
+    target[key] = ""
+    room = module._MAX_CANONICAL_CODEX_JSON_BYTES + extra - len(canonical_json(items))
+    count, remainder = divmod(room, len(canonical_json(pattern)) - 2)
+    target[key] = pattern * count + "x" * remainder
+    assert len(canonical_json(items)) == module._MAX_CANONICAL_CODEX_JSON_BYTES + extra
+    set_encrypted_envelope(active, conversation, wire, items)
+    active[3]["codex_reasoning_items"] = (
+        canonical_json(items).decode("utf-8") if canonical_text else copy.deepcopy(items)
+    )
+    if extra:
+        with pytest.raises(ValueError, match="admission bound"):
+            module._encrypted_codex_reasoning(active[3], replay_policy(), durable=True)
+        assert_encrypted_decline(prepared, active, conversation, wire)
+    else:
+        assert module._reasoning_list_bytes(items) == module._MAX_CANONICAL_CODEX_JSON_BYTES
+        assert module._encrypted_codex_reasoning(active[3], replay_policy(), durable=True) == items
+        before = copy.deepcopy((active, conversation, wire))
+        result = choose(prepared, active, conversation, wire, reasoning_policy=replay_policy())
+        assert result.status == "selected" and result.messages is not None
+        assert result.messages[3:] == wire[4:]
+        assert (active, conversation, wire) == before
+        # Source TEXT has an independent bound: whitespace costs bytes even
+        # though decoding it would preserve this already admitted compact list.
+        if canonical_text:
+            active[3]["codex_reasoning_items"] += " "
+            assert_encrypted_decline(prepared, active, conversation, wire)
+
+
+def test_encrypted_ordered_multi_item_count_bound_precedes_item_traversal(tmp_path, monkeypatch):
+    import hermes_ariadne.prepared as module
+
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    count = (module._MAX_CANONICAL_CODEX_JSON_BYTES - 1) // 115 + 1
+    # Invalid entries would raise a schema error if traversed before the bound.
+    items = [None] * count
+    with monkeypatch.context() as patcher:
+        patcher.setattr(module, "set", lambda _: pytest.fail("item key traversal"), raising=False)
+        patcher.setattr(module.json, "dumps", lambda *a, **k: pytest.fail("string serialization"))
+        with pytest.raises(ValueError, match="admission bound"):
+            module._reasoning_list_bytes(items)
+    wire[5]["codex_reasoning_items"] = items
+    monkeypatch.setattr(module, "_safe_json", lambda _: pytest.fail("generic safety serialization"))
+    result = choose(prepared, active, conversation, wire, reasoning_policy=replay_policy())
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "later_payload",
+        "cumulative_payload",
+        "later_summary",
+        "cumulative_summary",
+        "later_text",
+        "cumulative_text",
+    ],
+)
+@pytest.mark.parametrize("view", ["request", "restored", "active_list"])
+def test_encrypted_ordered_multi_item_lower_bounds_precede_all_serializers(
+    tmp_path, monkeypatch, case, view
+):
+    import hermes_ariadne.prepared as module
+
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    items = ordered_reasoning_items()
+    bound = module._MAX_CANONICAL_CODEX_JSON_BYTES
+    indices = (2,) if case.startswith("later") else (1, 2)
+    amount = bound if len(indices) == 1 else bound // 2
+    for index in indices:
+        if case.endswith("payload"):
+            items[index]["encrypted_content"] = "x" * amount
+        elif case.endswith("summary"):
+            # Repeated references keep the adversarial count fixture small.
+            items[index]["summary"] = [{"type": "summary_text", "text": ""}] * (amount // 34 + 1)
+        else:
+            items[index]["summary"][0]["text"] = "x" * amount
+    rows, index = {"request": (wire, 5), "restored": (conversation, 3), "active_list": (active, 3)}[
+        view
+    ]
+    rows[index]["codex_reasoning_items"] = items
+    before = copy.deepcopy((active, conversation, wire))
+    encoded_lengths = []
+    original_dumps = module.json.dumps
+
+    def bounded_dumps(value, **kwargs):
+        assert type(value) is str and len(value) <= 4096
+        encoded_lengths.append(len(value))
+        return original_dumps(value, **kwargs)
+
+    monkeypatch.setattr(module.json, "dumps", bounded_dumps)
+    monkeypatch.setattr(module, "canonical_json", lambda _: pytest.fail("generic serialization"))
+    monkeypatch.setattr(module, "_safe_json", lambda _: pytest.fail("generic safety serialization"))
+    with pytest.raises(ValueError, match="admission bound"):
+        module._reasoning_list_bytes(items)
+    assert encoded_lengths == []
+    result = choose(prepared, active, conversation, wire, reasoning_policy=replay_policy())
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment"
+    assert (active, conversation, wire) == before
+
+
 def encrypted_tool_fixture(tmp_path):
     prepared, active, conversation, wire = native_codex_tool_fixture(tmp_path)
     for index in (5, 8):
@@ -3054,14 +3287,15 @@ def test_encrypted_tool_groups_preserve_native_ids_occurrence_uids_and_sql_nulls
     assert (active, conversation, wire) == before
 
 
+@pytest.mark.parametrize("item_index", [0, 2])
 @pytest.mark.parametrize(
     "field", ["type", "encrypted_content", "id", "summary", "_issuer_kind", "_issuer_model"]
 )
-def test_encrypted_envelope_requires_every_stamp_and_payload_field(tmp_path, field):
+def test_encrypted_envelope_requires_every_stamp_and_payload_field(tmp_path, field, item_index):
     prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
-    item = encrypted_reasoning_item()
-    item.pop(field)
-    set_encrypted_envelope(active, conversation, wire, [item])
+    items = ordered_reasoning_items()[: item_index + 1]
+    items[item_index].pop(field)
+    set_encrypted_envelope(active, conversation, wire, items)
     assert_encrypted_decline(prepared, active, conversation, wire)
 
 
@@ -3100,11 +3334,14 @@ def test_encrypted_envelope_requires_every_stamp_and_payload_field(tmp_path, fie
         {"unknown": None},
     ],
 )
-def test_encrypted_envelope_rejects_unsupported_values_even_when_all_views_agree(tmp_path, patch):
+@pytest.mark.parametrize("item_index", [0, 2])
+def test_encrypted_envelope_rejects_unsupported_values_even_when_all_views_agree(
+    tmp_path, patch, item_index
+):
     prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
-    item = encrypted_reasoning_item()
-    item.update(patch)
-    set_encrypted_envelope(active, conversation, wire, [item])
+    items = ordered_reasoning_items()[: item_index + 1]
+    items[item_index].update(patch)
+    set_encrypted_envelope(active, conversation, wire, items)
     assert_encrypted_decline(prepared, active, conversation, wire)
 
 
@@ -3112,10 +3349,17 @@ def test_encrypted_envelope_rejects_unsupported_values_even_when_all_views_agree
     "envelope",
     [None, False, 1, {}, [], [None], [encrypted_reasoning_item(), encrypted_reasoning_item()]],
 )
-def test_encrypted_envelope_requires_one_object(tmp_path, envelope):
+def test_encrypted_envelope_requires_nonempty_objects_with_unique_ids(tmp_path, envelope):
     prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
     # Nonempty serialized null/empty JSON is not legacy absence.
     set_encrypted_envelope(active, conversation, wire, envelope)
+    if type(envelope) is list and len(envelope) == 2:
+        import hermes_ariadne.prepared as module
+
+        # Cardinality is admitted; the per-view identity check rejects twins.
+        assert module._reasoning_list_bytes(envelope) == len(canonical_json(envelope))
+        with pytest.raises(ValueError, match="duplicate retained reasoning identity"):
+            module._comparison_payloads([conversation[3]], [replay_policy()])
     assert_encrypted_decline(prepared, active, conversation, wire)
 
 

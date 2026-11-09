@@ -355,62 +355,65 @@ def _reasoning_list_bytes(items):
     permission. Check builtin lengths before key sets or string serialization;
     a cumulative lower bound caps traversal even for many empty summaries.
     """
-    if type(items) is not list or len(items) != 1:
+    if type(items) is not list or not items:
         raise ValueError("unsupported encrypted reasoning envelope")
-    item = items[0]
-    if (
-        type(item) is not dict
-        or len(item) != 6
-        or set(item)
-        != {
-            "type",
-            "encrypted_content",
-            "id",
-            "summary",
-            "_issuer_kind",
-            "_issuer_model",
-        }
-    ):
-        raise ValueError("unsupported encrypted reasoning fields")
-    if (
-        item["type"] != "reasoning"
-        or type(item["encrypted_content"]) is not str
-        or not item["encrypted_content"]
-        or type(item["id"]) is not str
-        or len(item["id"]) > 64
-        or re.fullmatch(r"rs_[A-Za-z0-9_-]{1,61}", item["id"]) is None
-        or item["id"].startswith("rs_tmp_")
-        or type(item["_issuer_kind"]) is not str
-        or item["_issuer_kind"] != "codex_backend"
-        or type(item["_issuer_model"]) is not str
-        or type(item["summary"]) is not list
-    ):
-        raise ValueError("unsupported encrypted reasoning item")
 
     def bounded(size):
         if size > _MAX_CANONICAL_CODEX_JSON_BYTES:
             raise ValueError("Codex reasoning list exceeds its admission bound")
         return size
 
-    # Empty encrypted_content/id/model and [] summary cost 116 bytes. Each
-    # {"text":"","type":"summary_text"} costs 33, plus inter-part commas.
-    parts = item["summary"]
-    count = len(parts)
-    size = bounded(116 + 33 * count + max(count - 1, 0))
-    for key in ("encrypted_content", "id", "_issuer_model"):
-        size = bounded(size + len(item[key]))
-    for part in parts:
+    # Each empty six-field item costs 114 bytes, plus commas and list brackets.
+    # Admit the structural minimum BEFORE traversing items or allocating key sets.
+    size = bounded(1 + 115 * len(items))
+    for item in items:
         if (
-            type(part) is not dict
-            or len(part) != 2
-            or set(part) != {"type", "text"}
-            or part["type"] != "summary_text"
-            or type(part["text"]) is not str
+            type(item) is not dict
+            or len(item) != 6
+            or set(item)
+            != {
+                "type",
+                "encrypted_content",
+                "id",
+                "summary",
+                "_issuer_kind",
+                "_issuer_model",
+            }
         ):
-            raise ValueError("unsupported reasoning summary")
-        size = bounded(size + len(part["text"]))
-    if not item["encrypted_content"].isascii():
-        raise ValueError("unsupported encrypted reasoning item")
+            raise ValueError("unsupported encrypted reasoning fields")
+        if (
+            item["type"] != "reasoning"
+            or type(item["encrypted_content"]) is not str
+            or not item["encrypted_content"]
+            or type(item["id"]) is not str
+            or len(item["id"]) > 64
+            or re.fullmatch(r"rs_[A-Za-z0-9_-]{1,61}", item["id"]) is None
+            or item["id"].startswith("rs_tmp_")
+            or type(item["_issuer_kind"]) is not str
+            or item["_issuer_kind"] != "codex_backend"
+            or type(item["_issuer_model"]) is not str
+            or type(item["summary"]) is not list
+        ):
+            raise ValueError("unsupported encrypted reasoning item")
+        # Bound every item's raw payload and summary structure before encoding
+        # ANY strings, including when only a later item exceeds the shared budget.
+        parts = item["summary"]
+        count = len(parts)
+        size = bounded(size + 33 * count + max(count - 1, 0))
+        for key in ("encrypted_content", "id", "_issuer_model"):
+            size = bounded(size + len(item[key]))
+        for part in parts:
+            if (
+                type(part) is not dict
+                or len(part) != 2
+                or set(part) != {"type", "text"}
+                or part["type"] != "summary_text"
+                or type(part["text"]) is not str
+            ):
+                raise ValueError("unsupported reasoning summary")
+            size = bounded(size + len(part["text"]))
+        if not item["encrypted_content"].isascii():
+            raise ValueError("unsupported encrypted reasoning item")
 
     def payload(value):
         nonlocal size
@@ -423,10 +426,11 @@ def _reasoning_list_bytes(items):
             encoded = json.dumps(chunk, ensure_ascii=False).encode("utf-8")
             size = bounded(size + len(encoded) - 2 - len(chunk))
 
-    for key in ("encrypted_content", "id", "_issuer_model"):
-        payload(item[key])
-    for part in parts:
-        payload(part["text"])
+    for item in items:
+        for key in ("encrypted_content", "id", "_issuer_model"):
+            payload(item[key])
+        for part in item["summary"]:
+            payload(part["text"])
     return size
 
 
@@ -459,7 +463,7 @@ def _encrypted_codex_reasoning(message, policy, *, durable=False):
     _reasoning_list_bytes(items)
     if message["role"] != "assistant":
         raise ValueError("unsupported encrypted reasoning envelope")
-    if items[0]["_issuer_model"] != policy.issuer_model:
+    if any(item["_issuer_model"] != policy.issuer_model for item in items):
         raise ValueError("unsupported encrypted reasoning item")
     return items
 
@@ -751,10 +755,11 @@ def _comparison_payloads(messages, policies, *, wire=False, durable=False):
         payload = _comparison(message, wire=wire, durable=durable, reasoning_policy=policies[index])
         items = payload.get("codex_reasoning_items")
         if items:
-            ident = items[0]["id"]
-            if ident in reasoning_ids:
-                raise ValueError("duplicate retained reasoning identity")
-            reasoning_ids.add(ident)
+            for item in items:
+                ident = item["id"]
+                if ident in reasoning_ids:
+                    raise ValueError("duplicate retained reasoning identity")
+                reasoning_ids.add(ident)
         payloads.append(payload)
     return payloads
 
