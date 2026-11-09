@@ -47,6 +47,27 @@ def scripted_reasoning(turn, index=0):
     }
 
 
+def scripted_reasoning_items(turn, index=0, *, reasoning_count=1):
+    """Synthetic ordered server constants; NOT provider state or encryption."""
+    assert reasoning_count in (1, 4)
+    if reasoning_count == 1:
+        return [scripted_reasoning(turn, index)]  # Original singleton fixture unchanged.
+    items = [scripted_reasoning(turn, 4 * index + position) for position in range(4)]
+    items[0]["summary"] = []
+    items[1]["summary"] = [
+        {"type": "summary_text", "text": f"  SYNTHETIC {turn}/{index}/1 first"},
+        {"type": "summary_text", "text": ""},
+        {"type": "summary_text", "text": f"SYNTHETIC {turn}/{index}/1 last  "},
+    ]
+    items[2]["summary"] = [{"type": "summary_text", "text": ""}]
+    items[3]["summary"] = [
+        {"type": "summary_text", "text": ""},
+        {"type": "summary_text", "text": f"  SYNTHETIC {turn}/{index}/3 last  "},
+        {"type": "summary_text", "text": ""},
+    ]
+    return items
+
+
 def codex_transport_summary(mode, report, sent, trace):
     return {
         "mode": mode,
@@ -189,8 +210,9 @@ def codex_worker(tmp_path):
                 item = respond(body, turn)
                 output = [item]
                 if trace["native"] and turn != "baseline":
-                    reasoning = scripted_reasoning(turn, len(trace["responses"]))
-                    output.insert(0, reasoning)
+                    output[:0] = scripted_reasoning_items(
+                        turn, len(trace["responses"]), reasoning_count=trace["reasoning_count"]
+                    )
                 trace["responses"].append({"turn": turn, "output": copy.deepcopy(output)})
                 terminal = {
                     "id": "resp_synthetic_" + turn,
@@ -228,7 +250,8 @@ def codex_worker(tmp_path):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    def run(mode):
+    def run(mode, *, reasoning_count=1):
+        assert reasoning_count in (1, 4)
         trace.clear()
         trace.update(
             calls=[],
@@ -237,7 +260,14 @@ def codex_worker(tmp_path):
             pages=0,
             complete=False,
             native=mode.startswith("native-"),
+            reasoning_count=reasoning_count,
         )
+        # Inspect the operator publication directly, outside the worker/hook.
+        directory = (
+            home / "ariadne" / "prepared" / hashlib.sha256(b"synthetic-codex-prepared").hexdigest()
+        )
+        manifest_path = directory / "manifest.json"
+        before_manifest = manifest_path.read_bytes() if manifest_path.exists() else None
         before = len(requests)
         process = subprocess.run(
             [
@@ -256,6 +286,18 @@ def codex_worker(tmp_path):
         assert not errors, errors
         assert process.returncode == 0, process.stdout + process.stderr
         report = json.loads(process.stdout.splitlines()[-1])
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes)
+        checkpoint = directory / (manifest["checkpoint_sha256"] + ".json")
+        assert hashlib.sha256(checkpoint.read_bytes()).hexdigest() == manifest["checkpoint_sha256"]
+        if before_manifest is not None:
+            assert manifest_bytes == before_manifest, "native worker changed frozen publication"
+        report["prepared_generation"] = {
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "checkpoint_sha256": manifest["checkpoint_sha256"],
+            "projection_id": manifest["projection_id"],
+            "event_ids": manifest["event_ids"],
+        }
         import httpx
         import openai
 
@@ -811,33 +853,51 @@ def assert_durable_carrier(report, turn):
         assert carrier == expected
 
 
-def test_native_reasoning_final_answer_continuation(codex_worker):
+@pytest.mark.parametrize("reasoning_count", [1, 4], ids=["one-item", "four-items"])
+def test_native_reasoning_final_answer_continuation(codex_worker, reasoning_count):
     baseline, original, baseline_trace = codex_worker("native-baseline")
-    live, sent, trace = codex_worker("native-text")
+    live, sent, trace = codex_worker("native-text", reasoning_count=reasoning_count)
     assert len(sent) == 2
     assert_native_reasoning_state(baseline, baseline_trace)
     assert_native_reasoning_state(live, trace)
     assert_native_reasoning_replay(baseline, original, original[0]["body"], selected=False)
     assert_native_reasoning_replay(live, sent, original[0]["body"])
     assert_selected(live)
-    restarted, resumed, restart_trace = codex_worker("native-restart")
+    restarted, resumed, restart_trace = codex_worker(
+        "native-restart", reasoning_count=reasoning_count
+    )
     assert len({baseline["pid"], live["pid"], restarted["pid"]}) == 3
     assert_native_reasoning_state(restarted, restart_trace)
     assert_native_reasoning_replay(restarted, resumed, original[0]["body"])
     assert_selected(restarted)
     assert_reasoning_restart(live, restarted)
+    assert (
+        baseline["prepared_generation"]
+        == live["prepared_generation"]
+        == restarted["prepared_generation"]
+    )
+    assert live["prepared_memory"] == restarted["prepared_memory"]
 
 
-def test_native_reasoning_tools_and_restart(codex_worker):
+@pytest.mark.parametrize("reasoning_count", [1, 4], ids=["one-item", "four-items"])
+def test_native_reasoning_tools_and_restart(codex_worker, reasoning_count):
     baseline, original, _ = codex_worker("native-baseline")
-    live, sent, trace = codex_worker("native-tools")
-    restarted, resumed, resumed_trace = codex_worker("native-restarttools")
+    live, sent, trace = codex_worker("native-tools", reasoning_count=reasoning_count)
+    restarted, resumed, resumed_trace = codex_worker(
+        "native-restarttools", reasoning_count=reasoning_count
+    )
     assert len({baseline["pid"], live["pid"], restarted["pid"]}) == 3
     for report, requests, script in ((live, sent, trace), (restarted, resumed, resumed_trace)):
         assert_native_reasoning_state(report, script)
         assert_native_reasoning_replay(report, requests, original[0]["body"])
         assert_selected(report)
     assert_reasoning_restart(live, restarted)
+    assert (
+        baseline["prepared_generation"]
+        == live["prepared_generation"]
+        == restarted["prepared_generation"]
+    )
+    assert live["prepared_memory"] == restarted["prepared_memory"]
     assert assert_native_tool_history(live, trace["calls"]) == assert_native_tool_history(
         restarted, trace["calls"]
     )
@@ -956,8 +1016,8 @@ def native_transcript(rows, *, durable=False, loaded=False, hook=False):
 
 def scripted_assistant(output):
     """Expectation from server constants, NEVER seeded into DB or host exports."""
-    reasoning, item = output
-    assert reasoning["type"] == "reasoning"
+    *reasoning_items, item = output
+    assert reasoning_items and all(part["type"] == "reasoning" for part in reasoning_items)
     owner = {"role": "assistant", "content": ""}
     if item["type"] == "message":
         owner.update(content=item["content"][0]["text"], codex_message_items=[item])
@@ -978,11 +1038,15 @@ def scripted_assistant(output):
             "_issuer_kind": "codex_backend",
             "_issuer_model": "ariadne/test",
         }
+        for reasoning in reasoning_items
     ]
-    # _extract_responses_reasoning_text joins nonempty summary texts with LF.
-    owner["reasoning"] = (
-        "\n".join(p["text"] for p in reasoning["summary"] if p["text"]).strip() or None
-    )
+    # Native scan extracts/strips EACH item's nonempty summary texts with LF,
+    # then _normalize_codex_response joins the nonempty items with double LF.
+    parts = [
+        "\n".join(p["text"] for p in reasoning["summary"] if p["text"]).strip()
+        for reasoning in reasoning_items
+    ]
+    owner["reasoning"] = "\n\n".join(part for part in parts if part) or None
     # build_assistant_message 1666-1682 promotes captured nonempty reasoning text.
     owner["reasoning_content"] = owner["reasoning"]
     return owner
@@ -1013,16 +1077,17 @@ def native_expected_input(rows, *, replay=True, model="ariadne/test", issuer="co
         if isinstance(reasoning, str):
             reasoning = json.loads(reasoning)
         if reasoning:
-            assert role == "assistant" and len(reasoning) == 1
-            item = reasoning[0]
-            if replay and item["_issuer_kind"] == issuer and item["_issuer_model"] == model:
-                wire.append(
-                    {
-                        "type": item["type"],
-                        "encrypted_content": item["encrypted_content"],
-                        "summary": copy.deepcopy(item["summary"]),
-                    }
-                )
+            assert role == "assistant"
+            for item in reasoning:
+                if replay and item["_issuer_kind"] == issuer and item["_issuer_model"] == model:
+                    # The audited native helper omits ONLY these three fields.
+                    wire.append(
+                        {
+                            k: copy.deepcopy(v)
+                            for k, v in item.items()
+                            if k not in {"id", "_issuer_kind", "_issuer_model"}
+                        }
+                    )
         carrier = row.get("codex_message_items")
         if isinstance(carrier, str):
             carrier = json.loads(carrier)
@@ -1069,6 +1134,12 @@ def assert_native_reasoning_state(report, trace):
     assert report["openai_origin"].endswith("/openai/__init__.py")
     assert "plugins/ariadne-prepared" in report["engine_origin"]
     expected = native_transcript(report["checkpoints"][0]["durable"], durable=True)
+    if "reasoning_count" in trace:
+        for index, response in enumerate(trace["responses"]):
+            if response["turn"] != "baseline":
+                assert response["output"][:-1] == scripted_reasoning_items(
+                    response["turn"], index, reasoning_count=trace["reasoning_count"]
+                ), "scripted full ordered response changed"
     outputs = iter(trace["responses"])
     returns = iter(report["tool_results"])
     for checkpoint in report["checkpoints"]:
@@ -1709,7 +1780,7 @@ def assert_native_tool_history(report, calls):
     return snapshots["durable"]
 
 
-def pure_native_reasoning_evidence():
+def pure_native_reasoning_evidence(*, reasoning_count=1):
     """Host-free samples for killing the oracles; NEVER native positive evidence."""
     base, sent, baseline = pure_selected_evidence()
     seed = copy.deepcopy(base["durable"])
@@ -1720,7 +1791,9 @@ def pure_native_reasoning_evidence():
     checkpoints = []
     for index, turn in enumerate(("first", "second")):
         checkpoints.append({"turn": turn, "durable": copy.deepcopy(durable)})
-        output = [scripted_reasoning(turn, index), completed_message(turn)]
+        output = scripted_reasoning_items(turn, index, reasoning_count=reasoning_count) + [
+            completed_message(turn)
+        ]
         trace["responses"].append({"turn": turn, "output": copy.deepcopy(output)})
         user = {
             "role": "user",
@@ -1782,11 +1855,14 @@ def pure_native_reasoning_evidence():
                         {"type": "input_text", "text": "SYNTHETIC-CODEX-TURN-" + turn},
                     ],
                 },
-                {
-                    "type": "reasoning",
-                    "encrypted_content": f"SYNTHETIC-NOT-CRYPTO-{turn}-{index}-opaque!",
-                    "summary": copy.deepcopy(trace["responses"][index]["output"][0]["summary"]),
-                },
+                *[
+                    {
+                        "type": "reasoning",
+                        "encrypted_content": item["encrypted_content"],
+                        "summary": copy.deepcopy(item["summary"]),
+                    }
+                    for item in trace["responses"][index]["output"][:-1]
+                ],
                 {
                     "type": "message",
                     "role": "assistant",
@@ -1826,11 +1902,219 @@ def pure_native_reasoning_evidence():
     return report, sent, baseline, trace
 
 
-def test_pure_native_reasoning_oracles_accept_finite_samples():
-    report, sent, baseline, trace = pure_native_reasoning_evidence()
+@pytest.fixture
+def native_replay_reasoning_items():
+    """Execute the installed PURE replay definitions, never import/start the host.
+
+    These exact Codex stamps take the helpers' direct identity branches, so no
+    registry, URL resolver, model module or SDK is imported by this projection.
+    """
+    source = os.environ.get("HERMES_SOURCE")
+    if not source:
+        pytest.skip("HERMES_SOURCE required for actual pure native replay projection")
+    path = Path(source) / "agent" / "codex_responses_adapter.py"
+    names = {
+        "_as_list",
+        "_canonical_issuer_kind",
+        "_model_can_read_blob",
+        "_replay_reasoning_items",
+    }
+    definitions = [
+        node
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    assert {node.name for node in definitions} == names
+    module = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
+        + definitions,
+        type_ignores=[],
+    )
+    namespace = {"_CROSS_ISSUER_WARN_EMITTED": True}
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return namespace["_replay_reasoning_items"]
+
+
+@pytest.mark.parametrize("follower_kind", ["message", "function_call"])
+def test_pure_native_reasoning_four_item_expected_projection(
+    follower_kind, native_replay_reasoning_items
+):
+    items = [
+        {
+            **scripted_reasoning("second", index),
+            "_issuer_kind": "codex_backend",
+            "_issuer_model": "ariadne/test",
+        }
+        for index in range(4)
+    ]
+    # Native strips exactly these three keys, not arbitrary underscore fields.
+    items[-1]["_synthetic_unknown"] = {"preserved": ["SYNTHETIC"]}
+    row = {"role": "assistant", "content": "", "codex_reasoning_items": items}
+    if follower_kind == "message":
+        row["codex_message_items"] = [completed_message("second")]
+        follower = copy.deepcopy(completed_message("second"))
+        follower.pop("id")
+    else:
+        row["tool_calls"] = [
+            {
+                "call_id": "call_synthetic_four",
+                "function": {"name": "ariadne_find", "arguments": "{}"},
+            }
+        ]
+        follower = {
+            "type": "function_call",
+            "call_id": "call_synthetic_four",
+            "name": "ariadne_find",
+            "arguments": "{}",
+        }
+    seen = set()
+    projected = native_replay_reasoning_items(
+        row,
+        seen_item_ids=seen,
+        current_issuer_kind="codex_backend",
+        current_issuer_model="ariadne/test",
+        native_compaction_eligible=False,
+    )
+    assert projected == [
+        {
+            k: copy.deepcopy(v)
+            for k, v in item.items()
+            if k not in {"id", "_issuer_kind", "_issuer_model"}
+        }
+        for item in items
+    ]
+    assert seen == {item["id"] for item in items}
+    assert native_expected_input([row]) == projected + [follower]
+    assert native_expected_input([row], replay=False) == [follower]
+
+
+@pytest.mark.parametrize("follower_kind", ["message", "function_call"])
+def test_pure_native_reasoning_four_item_scripted_assistant(follower_kind):
+    """Full ordered carrier and native per-item LF / between-item double-LF text."""
+    summaries = [
+        [],
+        [
+            {"type": "summary_text", "text": "  SYNTHETIC first"},
+            {"type": "summary_text", "text": ""},
+            {"type": "summary_text", "text": "SYNTHETIC last  "},
+        ],
+        [{"type": "summary_text", "text": ""}],
+        [{"type": "summary_text", "text": "  SYNTHETIC fourth  "}],
+    ]
+    items = [
+        {**scripted_reasoning("first", index), "summary": summary}
+        for index, summary in enumerate(summaries)
+    ]
+    follower = completed_message("first")
+    if follower_kind == "function_call":
+        follower = {
+            "type": "function_call",
+            "id": "fc_synthetic_DIFFERENT",
+            "call_id": "call_synthetic_four",
+            "name": "ariadne_find",
+            "arguments": '{"query":"SYNTHETIC"}',
+            "status": "completed",
+        }
+    before = copy.deepcopy(items + [follower])
+    owner = scripted_assistant(items + [follower])
+    expected = {
+        "role": "assistant",
+        "content": "synthetic Codex first" if follower_kind == "message" else "",
+        "codex_reasoning_items": [
+            {**item, "_issuer_kind": "codex_backend", "_issuer_model": "ariadne/test"}
+            for item in items
+        ],
+        "reasoning": "SYNTHETIC first\nSYNTHETIC last\n\nSYNTHETIC fourth",
+        "reasoning_content": "SYNTHETIC first\nSYNTHETIC last\n\nSYNTHETIC fourth",
+    }
+    if follower_kind == "message":
+        expected["codex_message_items"] = [follower]
+    else:
+        expected["tool_calls"] = [
+            {
+                "id": follower["call_id"],
+                "call_id": follower["call_id"],
+                "response_item_id": follower["id"],
+                "type": "function",
+                "function": {"name": follower["name"], "arguments": follower["arguments"]},
+            }
+        ]
+    assert owner == expected
+    assert items + [follower] == before
+    owner["codex_reasoning_items"][-1]["summary"][0]["text"] = "MUTATED COPY"
+    assert items + [follower] == before
+
+
+@pytest.mark.parametrize("reasoning_count", [1, 4], ids=["one-item", "four-items"])
+def test_pure_native_reasoning_oracles_accept_finite_samples(reasoning_count):
+    report, sent, baseline, trace = pure_native_reasoning_evidence(reasoning_count=reasoning_count)
+    assert all(len(response["output"]) == reasoning_count + 1 for response in trace["responses"])
     assert_native_reasoning_state(report, trace)
     assert_native_reasoning_replay(report, sent, baseline)
     assert_selected(report)
+
+
+@pytest.mark.parametrize("boundary", ["durable", "replay", "hook", "candidate", "http"])
+@pytest.mark.parametrize("damage", ["missing", "reordered", "substituted"])
+def test_pure_native_reasoning_four_item_oracles_reject_late_damage(
+    boundary, damage, native_replay_reasoning_items
+):
+    report, sent, baseline, trace = pure_native_reasoning_evidence(reasoning_count=4)
+    # Use the ACTUAL native projection as the synthetic wire observation. The
+    # expected oracle still uses preassembly/script constants, never this wire.
+    projected = []
+    seen = set()  # One whole request, not one set per assistant row.
+    for row in report["replay"]:
+        projected.extend(
+            native_replay_reasoning_items(
+                row,
+                seen_item_ids=seen,
+                current_issuer_kind="codex_backend",
+                current_issuer_model="ariadne/test",
+                native_compaction_eligible=False,
+            )
+        )
+    wire = sent[0]["body"]["input"]
+    positions = [index for index, item in enumerate(wire) if item.get("type") == "reasoning"]
+    assert len(projected) == len(positions) == 8
+    for index, item in zip(positions, projected, strict=True):
+        wire[index] = copy.deepcopy(item)
+    assert_native_reasoning_state(report, trace)
+    assert_native_reasoning_replay(report, sent, baseline)
+
+    if boundary == "http":
+        # Mutate the FOURTH item of the later assistant, never the singleton
+        # position covered by the older regressions. Keep the follower intact.
+        if damage == "missing":
+            wire.pop(positions[-1])
+        elif damage == "reordered":
+            a, b = positions[-2:]
+            wire[a], wire[b] = wire[b], wire[a]
+        else:
+            wire[positions[-1]]["encrypted_content"] += "SYNTHETIC-SUBSTITUTION"
+    else:
+        rows = (
+            report[boundary]
+            if boundary in {"durable", "replay"}
+            else report["selections"][0]["request" if boundary == "hook" else "candidate"]
+        )
+        owner = [row for row in rows if row.get("codex_reasoning_items")][-1]
+        raw = owner["codex_reasoning_items"]
+        items = json.loads(raw) if isinstance(raw, str) else raw
+        assert len(items) == 4
+        if damage == "missing":
+            items.pop(3)
+        elif damage == "reordered":
+            items[2], items[3] = items[3], items[2]
+        else:
+            items[3]["encrypted_content"] += "SYNTHETIC-SUBSTITUTION"
+        if boundary == "durable":
+            owner["codex_reasoning_items"] = json.dumps(items)
+    with pytest.raises(AssertionError):
+        if boundary in {"durable", "replay"}:
+            assert_native_reasoning_state(report, trace)
+        else:
+            assert_native_reasoning_replay(report, sent, baseline)
 
 
 @pytest.mark.parametrize("boundary", ["durable", "replay", "hook", "candidate", "http"])
