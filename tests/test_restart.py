@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -126,6 +127,7 @@ def test_exact_search_after_process_restart_and_missed_hook(tmp_path):
     }
     env.update(
         HERMES_HOME=str(home),
+        HERMES_MANAGED_DIR=tempfile.mkdtemp(prefix="managed-", dir=tmp_path),
         HOME=str(tmp_path),
         TZ="UTC",
         PYTHONPATH=os.environ["HERMES_SOURCE"] + os.pathsep + env.get("PYTHONPATH", ""),

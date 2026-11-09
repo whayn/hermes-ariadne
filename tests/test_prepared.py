@@ -12,6 +12,21 @@ from hermes_ariadne.kernel import MemoryKernel
 from hermes_ariadne.sources import Projection
 from hermes_ariadne.store import EventStore, canonical_json
 
+REASONING_FIELDS = ("reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items")
+NONEMPTY_REASONING = [
+    "synthetic reasoning",
+    [{"type": "reasoning", "encrypted_content": "synthetic"}],
+    {"summary": "synthetic reasoning"},
+    True,
+    1,
+    "[]",
+    "null",
+    "{}",
+    '""',
+    "false",
+    "0",
+]
+
 
 def digest(value):
     return hashlib.sha256(canonical_json(value)).hexdigest()
@@ -71,6 +86,79 @@ def test_publication_loads_exact_frozen_checkpoint(tmp_path):
     assert PreparedView.load(store, "absent", tmp_path) is None
 
 
+def prefix_carrier_fixture(tmp_path, metadata):
+    store, rows, _, path, old = fixture(tmp_path)
+    rows[1].update(copy.deepcopy(metadata))
+    store.ingest("chosen", rows, origin="fixture")
+    projection = Projection(store, "chosen", [digest(row) for row in rows])
+    kernel = MemoryKernel(projection, tmp_path / "carrier-prefix.json", node_bytes=128)
+    kernel.build(lambda _: "synthetic navigation")
+    return store, rows, kernel, path, old
+
+
+@pytest.mark.parametrize("field", REASONING_FIELDS)
+@pytest.mark.parametrize("value", NONEMPTY_REASONING)
+@pytest.mark.parametrize("published", [False, True])
+def test_publication_refuses_reasoning_prefix_without_replacing_prior_artifacts(
+    tmp_path, field, value, published
+):
+    from hermes_ariadne.prepared import PreparedView, publish_prepared
+
+    store, rows, kernel, path, old = prefix_carrier_fixture(tmp_path, {field: value})
+    if not published:
+        path.unlink()
+    projection = kernel.projection
+    artifacts = {p: p.read_bytes() for p in path.parent.iterdir()}
+    archive = store.path.read_bytes()
+    checkpoint = kernel.path.read_bytes()
+    sources = [canonical_json(projection.message(i)) for i in range(len(rows))]
+
+    with pytest.raises(ValueError, match="^unsupported_prepared_prefix_reasoning$"):
+        publish_prepared(kernel, home=tmp_path)
+
+    assert {p: p.read_bytes() for p in path.parent.iterdir()} == artifacts
+    assert store.path.read_bytes() == archive
+    assert kernel.path.read_bytes() == checkpoint
+    assert [canonical_json(projection.message(i)) for i in range(len(rows))] == sources
+    loaded = PreparedView.load(store, "chosen", tmp_path)
+    if published:
+        assert loaded is not None and loaded.checkpoint_id == old.checkpoint_id
+    else:
+        assert loaded is None and not path.exists()
+
+
+@pytest.mark.parametrize("field", REASONING_FIELDS)
+@pytest.mark.parametrize("value", NONEMPTY_REASONING)
+def test_load_refuses_legacy_ready_reasoning_prefix_without_changes(tmp_path, field, value):
+    from hermes_ariadne.prepared import PreparedView
+
+    store, rows, kernel, path, _ = prefix_carrier_fixture(tmp_path, {field: value})
+    # Reproduce an artifact published before prefix reasoning was excluded:
+    # all identities, settings, permissions and checkpoint bytes remain valid.
+    manifest = json.loads(path.read_bytes())
+    data = kernel.path.read_bytes()
+    sha = hashlib.sha256(data).hexdigest()
+    target = path.parent / f"{sha}.json"
+    target.write_bytes(data)
+    target.chmod(0o600)
+    manifest.update(
+        projection_id=kernel.projection.projection_id,
+        event_ids=list(kernel.projection.event_ids),
+        checkpoint_sha256=sha,
+    )
+    path.write_bytes(canonical_json(manifest))
+    artifacts = {p: p.read_bytes() for p in path.parent.iterdir()}
+    archive = store.path.read_bytes()
+    assert kernel.view()["usable"]
+    assert kernel.prefix_view(len(rows))
+
+    assert PreparedView.load(store, "chosen", tmp_path) is None
+
+    assert {p: p.read_bytes() for p in path.parent.iterdir()} == artifacts
+    assert store.path.read_bytes() == archive and kernel.path.read_bytes() == data
+    assert [kernel.projection.message(i) for i in range(len(rows))] == rows
+
+
 def selection_fixture(tmp_path, **limits):
     store, rows, kernel, path, prepared = fixture(tmp_path, **limits)
     conversation = copy.deepcopy(rows) + [
@@ -95,6 +183,154 @@ def choose(prepared, active, conversation, wire, **kwargs):
         measure_tokens=kwargs.pop("measure_tokens", lambda _: 100),
         **kwargs,
     )
+
+
+@pytest.mark.parametrize("field", REASONING_FIELDS)
+@pytest.mark.parametrize("value", NONEMPTY_REASONING)
+@pytest.mark.parametrize("omit_from_views", [False, True])
+def test_direct_reasoning_prefix_declines_before_comparison_or_measurement(
+    tmp_path, monkeypatch, field, value, omit_from_views
+):
+    import hermes_ariadne.prepared as module
+
+    store, rows, kernel, path, _ = prefix_carrier_fixture(tmp_path, {field: value})
+    direct = module.PreparedView(
+        kernel=kernel,
+        checkpoint_id=hashlib.sha256(kernel.path.read_bytes()).hexdigest(),
+        history_bytes=8192,
+        request_bytes=65536,
+        reserve_tokens=4096,
+        _memory="synthetic frozen navigation",
+    )
+    active = copy.deepcopy(rows)
+    if omit_from_views:
+        active[1].pop(field)
+    conversation = copy.deepcopy(active) + [
+        {"message_uid": "previous", "role": "user", "content": "previous"},
+        {"message_uid": "answer", "role": "assistant", "content": "answer"},
+        {"message_uid": "current", "role": "user", "content": "current"},
+    ]
+    wire = as_wire(conversation)
+    before = copy.deepcopy((active, conversation, wire))
+    archive = store.path.read_bytes()
+    checkpoint = kernel.path.read_bytes()
+    manifest = path.read_bytes()
+    compared, measured, decoded = [], [], []
+    real_comparison = module._comparison
+    real_json = module._json
+
+    def compare(message, **kwargs):
+        compared.append(True)
+        return real_comparison(message, **kwargs)
+
+    def decode(value):
+        decoded.append(True)
+        return real_json(value)
+
+    monkeypatch.setattr(module, "_comparison", compare)
+    monkeypatch.setattr(module, "_json", decode)
+    result = choose(
+        direct, active, conversation, wire, measure_tokens=lambda m: measured.append(m) or 100
+    )
+
+    # The old codec already declines reasoning; the new guarantee is an
+    # independent frozen-source check BEFORE any provider comparison.
+    assert compared == []
+    assert measured == [] and decoded == []
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment"
+    assert result.diagnostics["host_fallback"] == "original_request_on_decline"
+    assert (active, conversation, wire) == before
+    assert store.path.read_bytes() == archive
+    assert kernel.path.read_bytes() == checkpoint and path.read_bytes() == manifest
+    assert [canonical_json(kernel.projection.message(i)) for i in range(len(rows))] == [
+        canonical_json(row) for row in rows
+    ]
+
+
+@pytest.mark.parametrize("field", REASONING_FIELDS)
+@pytest.mark.parametrize("marker", [None, "", False, [], {}, 0, 0.0, -0.0])
+def test_legacy_empty_reasoning_prefix_can_publish_load_and_select(tmp_path, field, marker):
+    from hermes_ariadne.prepared import PreparedView, publish_prepared
+
+    store, rows, kernel, path, _ = prefix_carrier_fixture(tmp_path, {field: marker})
+    archive = store.path.read_bytes()
+    checkpoint = kernel.path.read_bytes()
+    source_bytes = [canonical_json(row) for row in rows]
+    assert publish_prepared(kernel, home=tmp_path) == path
+    prepared = PreparedView.load(store, "chosen", tmp_path)
+    assert prepared is not None
+    conversation = copy.deepcopy(rows) + [
+        {"message_uid": "previous", "role": "user", "content": "previous"},
+        {"message_uid": "answer", "role": "assistant", "content": "answer"},
+        {"message_uid": "current", "role": "user", "content": "current"},
+    ]
+    # Native assembled replay omits the empty reasoning marker.
+    wire = as_wire(conversation)
+    before = copy.deepcopy((rows, conversation, wire))
+    measured = []
+
+    result = choose(
+        prepared, rows, conversation, wire, measure_tokens=lambda m: measured.append(m) or 100
+    )
+
+    assert result.status == "selected" and result.messages is not None
+    assert measured == [result.messages]
+    assert result.messages[3:] == wire[4:]
+    assert (rows, conversation, wire) == before
+    assert [canonical_json(kernel.projection.message(i)) for i in range(len(rows))] == source_bytes
+    assert store.path.read_bytes() == archive and kernel.path.read_bytes() == checkpoint
+
+
+@pytest.mark.parametrize("field", REASONING_FIELDS)
+def test_reasoning_still_admitted_by_general_projection_and_kernel(tmp_path, field):
+    from hermes_ariadne.retrieval import _require_supported_projection
+
+    store, rows, kernel, _, _ = prefix_carrier_fixture(tmp_path, {field: "synthetic reasoning"})
+    archive = store.path.read_bytes()
+    assert _require_supported_projection(kernel.projection) is None
+    assert kernel.view()["usable"] and kernel.prefix_view(len(rows))
+    assert [kernel.projection.message(i) for i in range(len(rows))] == rows
+    assert store.path.read_bytes() == archive
+
+
+@pytest.mark.parametrize("field", REASONING_FIELDS)
+def test_reasoning_outside_frozen_prefix_reaches_existing_tail_codec(tmp_path, monkeypatch, field):
+    import hermes_ariadne.prepared as module
+
+    prepared, rows, conversation, _ = selection_fixture(tmp_path)
+    conversation[3][field] = "synthetic retained reasoning"
+    active = copy.deepcopy(conversation)
+    wire = as_wire(conversation)
+    store = prepared.projection._archive
+    store.ingest("chosen", active[2:], origin="fixture")
+    archive = store.path.read_bytes()
+    before = copy.deepcopy((active, conversation, wire))
+    checkpoint = prepared.kernel.path.read_bytes()
+    # Later archived rows are not part of the operator-frozen projection.
+    module.publish_prepared(prepared.kernel, home=tmp_path)
+    loaded = module.PreparedView.load(store, "chosen", tmp_path)
+    assert loaded is not None and loaded.projection.event_ids == tuple(digest(row) for row in rows)
+    compared, measured = [], []
+    real_comparison = module._comparison
+
+    def compare(message, **kwargs):
+        compared.append(message)
+        return real_comparison(message, **kwargs)
+
+    monkeypatch.setattr(module, "_comparison", compare)
+    result = choose(
+        loaded, active, conversation, wire, measure_tokens=lambda m: measured.append(m) or 100
+    )
+
+    # Slice A does not authorize tail replay: the unchanged codec still
+    # declines, but the frozen-prefix guard must not reject these later rows.
+    assert any(message is conversation[3] for message in compared)
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment"
+    assert measured == []
+    assert (active, conversation, wire) == before
+    assert store.path.read_bytes() == archive and prepared.kernel.path.read_bytes() == checkpoint
 
 
 def test_select_exact_prefix_preserves_actual_request_and_sources(tmp_path):
@@ -2539,3 +2775,1174 @@ def test_selected_navigation_handles_are_accepted_by_ariadne_zoom(tmp_path):
         recovered.append(response["page"]["event_ref"])
     assert handles and all(ref in {"event:" + digest(row) for row in active} for ref in recovered)
     assert (store.path.read_bytes(), prepared.kernel.path.read_bytes()) == before
+
+
+@pytest.mark.parametrize("mixture", ["tool_tool", "answer_tool"])
+@pytest.mark.parametrize("equal_payload", [False, True])
+def test_encrypted_reasoning_ids_are_request_local_unique(tmp_path, mixture, equal_payload):
+    prepared, active, conversation, wire = encrypted_tool_fixture(tmp_path)
+    if mixture == "answer_tool":
+        items = [encrypted_reasoning_item(ident="rs_answer")]
+        answer = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "answer"}],
+            }
+        ]
+        active[3].update(
+            codex_message_items=copy.deepcopy(answer),
+            codex_reasoning_items=json.dumps(items),
+            reasoning=None,
+            reasoning_content=None,
+        )
+        conversation[3].update(
+            codex_message_items=copy.deepcopy(answer), codex_reasoning_items=items
+        )
+        wire[5].update(
+            codex_message_items=copy.deepcopy(answer), codex_reasoning_items=copy.deepcopy(items)
+        )
+        first, second = 3, 5
+    else:
+        first, second = 5, 8
+    policy = replay_policy()
+    # Independent selections may reuse exactly the same retained reasoning IDs.
+    for _ in range(2):
+        assert (
+            choose(prepared, active, conversation, wire, reasoning_policy=policy).status
+            == "selected"
+        )
+    replacement = copy.deepcopy(conversation[first]["codex_reasoning_items"])
+    if not equal_payload:
+        replacement[0]["encrypted_content"] += " different payload"
+    active[second]["codex_reasoning_items"] = json.dumps(replacement)
+    conversation[second]["codex_reasoning_items"] = copy.deepcopy(replacement)
+    wire[second + 2]["codex_reasoning_items"] = copy.deepcopy(replacement)
+    before = copy.deepcopy((active, conversation, wire))
+    measured = []
+    result = choose(
+        prepared,
+        active,
+        conversation,
+        wire,
+        reasoning_policy=policy,
+        measure_tokens=lambda m: measured.append(m) or 100,
+    )
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment" and measured == []
+    assert (active, conversation, wire) == before
+
+
+@pytest.mark.parametrize(
+    "field,source,restored,persisted,selected",
+    [
+        ("reasoning", None, "absent", False, True),
+        ("reasoning", None, None, True, True),
+        ("reasoning_content", None, "absent", True, True),
+        ("reasoning_content", None, None, False, True),
+        ("reasoning", None, "", True, False),
+        ("reasoning_content", None, "", False, False),
+        ("reasoning", "", "", False, True),
+        ("reasoning", "", "absent", True, True),
+        ("reasoning", "", "absent", False, False),
+        ("reasoning_content", "", "", True, True),
+        ("reasoning_content", "", "absent", True, False),
+        ("reasoning_content", "", "absent", False, False),
+        ("reasoning", "", None, True, False),
+        ("reasoning_content", "", None, False, False),
+        ("reasoning", " \nλ first\t ", " \nλ first\t ", False, True),
+        ("reasoning_content", "second 😀\n", "second 😀\n", True, True),
+        ("reasoning", " exact ", "exact", True, False),
+        ("reasoning_content", "exact", "absent", False, False),
+        ("reasoning", "exact", "absent", True, False),
+        ("reasoning_content", " exact ", "exact", True, False),
+        ("reasoning", None, False, False, False),
+        ("reasoning_content", "", False, True, False),
+        ("reasoning", "\ud800", "\ud800", False, False),
+        ("reasoning_content", "\udfff", "\udfff", True, False),
+    ],
+)
+def test_encrypted_readable_companions_follow_independent_column_mapping(
+    tmp_path, field, source, restored, persisted, selected
+):
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    # A second, unequal readable column must not be merged or derived from summary.
+    other = "reasoning_content" if field == "reasoning" else "reasoning"
+    active[3][other] = conversation[3][other] = "independent other column λ"
+    active[3][field] = source
+    conversation[3][field] = restored
+    if restored == "absent":
+        conversation[3].pop(field)
+    if persisted:
+        conversation[3]["_db_persisted"] = True
+    before = copy.deepcopy((active, conversation, wire))
+    measured = []
+    result = choose(
+        prepared,
+        active,
+        conversation,
+        wire,
+        reasoning_policy=replay_policy(),
+        measure_tokens=lambda m: measured.append(m) or 100,
+    )
+    assert result.status == ("selected" if selected else "declined")
+    if selected:
+        assert measured == [result.messages] and result.messages[3:] == wire[4:]
+    else:
+        assert measured == [] and result.messages is None
+    assert (active, conversation, wire) == before
+
+
+@pytest.mark.parametrize("field", ["reasoning", "reasoning_content"])
+@pytest.mark.parametrize("value", ["missing", False, 0, [], {}, 1])
+def test_encrypted_canonical_companions_require_explicit_sql_columns(tmp_path, field, value):
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    active[3][field] = value
+    if value == "missing":
+        active[3].pop(field)
+    assert_encrypted_decline(prepared, active, conversation, wire)
+
+
+@pytest.mark.parametrize("field", ["reasoning", "reasoning_content"])
+@pytest.mark.parametrize("value", [None, "", "readable"])
+def test_encrypted_request_must_omit_both_readable_keys(tmp_path, field, value):
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    wire[5][field] = value
+    assert_encrypted_decline(prepared, active, conversation, wire)
+
+
+def assert_encrypted_decline(prepared, active, conversation, wire, **kwargs):
+    before = copy.deepcopy((active, conversation, wire))
+    hashes = [digest(row) for row in active]
+    archive = prepared.projection._archive.path.read_bytes()
+    checkpoint = prepared.kernel.path.read_bytes()
+    measured = []
+    result = choose(
+        prepared,
+        active,
+        conversation,
+        wire,
+        reasoning_policy=kwargs.pop("reasoning_policy", replay_policy()),
+        measure_tokens=lambda m: measured.append(m) or 100,
+        **kwargs,
+    )
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment" and measured == []
+    assert (active, conversation, wire) == before
+    assert [digest(row) for row in active] == hashes
+    assert prepared.projection._archive.path.read_bytes() == archive
+    assert prepared.kernel.path.read_bytes() == checkpoint
+
+
+def encrypted_reasoning_item(*, ident="rs_retained_14"):
+    # Opaque synthetic ASCII, deliberately not an encoded/provider ciphertext.
+    return {
+        "type": "reasoning",
+        "encrypted_content": "synthetic opaque : ! retained bytes",
+        "id": ident,
+        "summary": [{"type": "summary_text", "text": "summary λ"}],
+        "_issuer_kind": "codex_backend",
+        "_issuer_model": "synthetic-model-14",
+    }
+
+
+def encrypted_answer_fixture(tmp_path):
+    prepared, active, conversation, wire = ordinary_codex_fixture(tmp_path)
+    items = [encrypted_reasoning_item()]
+    active[3].update(
+        codex_reasoning_items=json.dumps(items), reasoning=None, reasoning_content=None
+    )
+    conversation[3].update(codex_reasoning_items=copy.deepcopy(items), reasoning=None)
+    wire[5]["codex_reasoning_items"] = copy.deepcopy(items)
+    return prepared, active, conversation, wire
+
+
+@pytest.mark.parametrize("model", ["", " ", "\t\n", " model", "model "])
+def test_encrypted_policy_rejects_unnormalized_model_tags(tmp_path, model):
+    from hermes_ariadne.prepared import ReasoningReplayPolicy
+
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    for rows, index in ((active, 3), (conversation, 3), (wire, 5)):
+        items = [encrypted_reasoning_item()]
+        items[0]["_issuer_model"] = model
+        rows[index]["codex_reasoning_items"] = json.dumps(items) if rows is active else items
+    assert_encrypted_decline(
+        prepared,
+        active,
+        conversation,
+        wire,
+        reasoning_policy=ReasoningReplayPolicy("codex_backend", model),
+    )
+
+
+def replay_policy():
+    from hermes_ariadne.prepared import ReasoningReplayPolicy
+
+    return ReasoningReplayPolicy("codex_backend", "synthetic-model-14")
+
+
+def test_encrypted_answer_requires_explicit_policy_and_preserves_exact_sources(tmp_path):
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    before = copy.deepcopy((active, conversation, wire))
+    hashes = [digest(row) for row in active]
+    archive = prepared.projection._archive.path.read_bytes()
+    checkpoint = prepared.kernel.path.read_bytes()
+    measured = []
+    assert choose(prepared, active, conversation, wire).status == "declined"
+
+    result = choose(
+        prepared,
+        active,
+        conversation,
+        wire,
+        reasoning_policy=replay_policy(),
+        measure_tokens=lambda m: measured.append(copy.deepcopy(m)) or 100,
+    )
+
+    assert result.status == "selected" and result.messages is not None
+    assert measured == [result.messages]
+    assert result.messages[:2] == wire[:2] and result.messages[3:] == wire[4:]
+    result.messages[4]["codex_reasoning_items"][0]["summary"][0]["text"] = "isolated"
+    assert (active, conversation, wire) == before
+    assert [digest(row) for row in active] == hashes
+    assert prepared.projection._archive.path.read_bytes() == archive
+    assert prepared.kernel.path.read_bytes() == checkpoint
+
+
+def ordered_reasoning_items(*, prefix="rs_ordered"):
+    items = [encrypted_reasoning_item(ident=f"{prefix}_{index}") for index in range(3)]
+    for index, item in enumerate(items):
+        item["encrypted_content"] += f' {index} "\\\n'
+        item["summary"] = [
+            {"type": "summary_text", "text": f" {index} λ😀\n"},
+            {"type": "summary_text", "text": ""},
+            {"type": "summary_text", "text": "second\t"},
+        ]
+    return items
+
+
+@pytest.mark.parametrize("envelope", ["answer", "tool"])
+def test_encrypted_ordered_multi_item_selects_exact_isolated_tail(tmp_path, envelope):
+    fixture = encrypted_answer_fixture if envelope == "answer" else encrypted_tool_fixture
+    prepared, active, conversation, wire = fixture(tmp_path)
+    indices = (3,) if envelope == "answer" else (5, 8)
+    for index in indices:
+        items = ordered_reasoning_items(prefix=f"rs_row_{index}")
+        active[index]["codex_reasoning_items"] = json.dumps(items)
+        conversation[index]["codex_reasoning_items"] = copy.deepcopy(items)
+        wire[index + 2]["codex_reasoning_items"] = copy.deepcopy(items)
+    before = copy.deepcopy((active, conversation, wire))
+    hashes = [digest(row) for row in active]
+    archive = prepared.projection._archive.path.read_bytes()
+    checkpoint = prepared.kernel.path.read_bytes()
+    measured = []
+    result = choose(
+        prepared,
+        active,
+        conversation,
+        wire,
+        reasoning_policy=replay_policy(),
+        measure_tokens=lambda m: measured.append(copy.deepcopy(m)) or 100,
+    )
+    assert result.status == "selected" and result.messages is not None
+    assert result.messages[:2] == wire[:2] and result.messages[3:] == wire[4:]
+    assert measured == [result.messages]
+    result.messages[indices[0] + 1]["codex_reasoning_items"][2]["summary"][0]["text"] = "isolated"
+    assert (active, conversation, wire) == before
+    assert [digest(row) for row in active] == hashes
+    assert prepared.projection._archive.path.read_bytes() == archive
+    assert prepared.kernel.path.read_bytes() == checkpoint
+
+
+@pytest.mark.parametrize("index", [1, 2])
+def test_encrypted_ordered_multi_item_requires_each_model_to_match_policy(tmp_path, index):
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    items = ordered_reasoning_items()
+    set_encrypted_envelope(active, conversation, wire, items)
+    assert (
+        choose(prepared, active, conversation, wire, reasoning_policy=replay_policy()).status
+        == "selected"
+    )
+    items[index]["_issuer_model"] = "sibling-model"
+    set_encrypted_envelope(active, conversation, wire, items)
+    assert_encrypted_decline(prepared, active, conversation, wire)
+
+
+@pytest.mark.parametrize("scope", ["within", "across"])
+@pytest.mark.parametrize("equal_payload", [False, True])
+def test_encrypted_ordered_multi_item_ids_are_all_request_local_unique(
+    tmp_path, scope, equal_payload
+):
+    prepared, active, conversation, wire = encrypted_tool_fixture(tmp_path)
+    bundles = {index: ordered_reasoning_items(prefix=f"rs_row_{index}") for index in (5, 8)}
+    for index, items in bundles.items():
+        active[index]["codex_reasoning_items"] = json.dumps(items)
+        conversation[index]["codex_reasoning_items"] = copy.deepcopy(items)
+        wire[index + 2]["codex_reasoning_items"] = copy.deepcopy(items)
+    # A fresh selection owns a fresh set; IDs are not session-global state.
+    for _ in range(2):
+        assert (
+            choose(prepared, active, conversation, wire, reasoning_policy=replay_policy()).status
+            == "selected"
+        )
+    source = bundles[5][1]
+    index = 5 if scope == "within" else 8
+    bundles[index][2] = copy.deepcopy(source)
+    if not equal_payload:
+        bundles[index][2]["encrypted_content"] += " different"
+    active[index]["codex_reasoning_items"] = json.dumps(bundles[index])
+    conversation[index]["codex_reasoning_items"] = copy.deepcopy(bundles[index])
+    wire[index + 2]["codex_reasoning_items"] = copy.deepcopy(bundles[index])
+    assert_encrypted_decline(prepared, active, conversation, wire)
+
+
+@pytest.mark.parametrize("view", ["active", "restored", "request"])
+@pytest.mark.parametrize("mutation", ["insert", "remove", "reorder", "substitute"])
+def test_encrypted_ordered_multi_item_binds_full_list_in_each_view(tmp_path, view, mutation):
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    items = ordered_reasoning_items()
+    set_encrypted_envelope(active, conversation, wire, items)
+    assert (
+        choose(prepared, active, conversation, wire, reasoning_policy=replay_policy()).status
+        == "selected"
+    )
+    changed = copy.deepcopy(items)
+    if mutation == "insert":
+        changed.insert(1, encrypted_reasoning_item(ident="rs_inserted"))
+    elif mutation == "remove":
+        changed.pop(1)
+    elif mutation == "reorder":
+        changed[1:] = reversed(changed[1:])
+    else:
+        changed[2]["encrypted_content"] += " replacement"
+    rows, index = {"active": (active, 3), "restored": (conversation, 3), "request": (wire, 5)}[view]
+    rows[index]["codex_reasoning_items"] = json.dumps(changed) if view == "active" else changed
+    assert_encrypted_decline(prepared, active, conversation, wire)
+
+
+@pytest.mark.parametrize(
+    "field,pattern", [("ciphertext", "x"), ("summary", "λ😀"), ("summary", '"\\\0\n')]
+)
+@pytest.mark.parametrize("extra", [0, 1])
+@pytest.mark.parametrize("canonical_text", [False, True])
+def test_encrypted_ordered_multi_item_exact_byte_boundary(
+    tmp_path, field, pattern, extra, canonical_text
+):
+    from dataclasses import replace
+
+    import hermes_ariadne.prepared as module
+
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    prepared = replace(prepared, request_bytes=16 * module._MAX_CANONICAL_CODEX_JSON_BYTES)
+    items = ordered_reasoning_items()
+    target, key = (
+        (items[2], "encrypted_content")
+        if field == "ciphertext"
+        else (items[2]["summary"][1], "text")
+    )
+    target[key] = ""
+    room = module._MAX_CANONICAL_CODEX_JSON_BYTES + extra - len(canonical_json(items))
+    count, remainder = divmod(room, len(canonical_json(pattern)) - 2)
+    target[key] = pattern * count + "x" * remainder
+    assert len(canonical_json(items)) == module._MAX_CANONICAL_CODEX_JSON_BYTES + extra
+    set_encrypted_envelope(active, conversation, wire, items)
+    active[3]["codex_reasoning_items"] = (
+        canonical_json(items).decode("utf-8") if canonical_text else copy.deepcopy(items)
+    )
+    if extra:
+        with pytest.raises(ValueError, match="admission bound"):
+            module._encrypted_codex_reasoning(active[3], replay_policy(), durable=True)
+        assert_encrypted_decline(prepared, active, conversation, wire)
+    else:
+        assert module._reasoning_list_bytes(items) == module._MAX_CANONICAL_CODEX_JSON_BYTES
+        assert module._encrypted_codex_reasoning(active[3], replay_policy(), durable=True) == items
+        before = copy.deepcopy((active, conversation, wire))
+        result = choose(prepared, active, conversation, wire, reasoning_policy=replay_policy())
+        assert result.status == "selected" and result.messages is not None
+        assert result.messages[3:] == wire[4:]
+        assert (active, conversation, wire) == before
+        # Source TEXT has an independent bound: whitespace costs bytes even
+        # though decoding it would preserve this already admitted compact list.
+        if canonical_text:
+            active[3]["codex_reasoning_items"] += " "
+            assert_encrypted_decline(prepared, active, conversation, wire)
+
+
+def test_encrypted_ordered_multi_item_count_bound_precedes_item_traversal(tmp_path, monkeypatch):
+    import hermes_ariadne.prepared as module
+
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    count = (module._MAX_CANONICAL_CODEX_JSON_BYTES - 1) // 115 + 1
+    # Invalid entries would raise a schema error if traversed before the bound.
+    items = [None] * count
+    with monkeypatch.context() as patcher:
+        patcher.setattr(module, "set", lambda _: pytest.fail("item key traversal"), raising=False)
+        patcher.setattr(module.json, "dumps", lambda *a, **k: pytest.fail("string serialization"))
+        with pytest.raises(ValueError, match="admission bound"):
+            module._reasoning_list_bytes(items)
+    wire[5]["codex_reasoning_items"] = items
+    monkeypatch.setattr(module, "_safe_json", lambda _: pytest.fail("generic safety serialization"))
+    result = choose(prepared, active, conversation, wire, reasoning_policy=replay_policy())
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "later_payload",
+        "cumulative_payload",
+        "later_summary",
+        "cumulative_summary",
+        "later_text",
+        "cumulative_text",
+    ],
+)
+@pytest.mark.parametrize("view", ["request", "restored", "active_list"])
+def test_encrypted_ordered_multi_item_lower_bounds_precede_all_serializers(
+    tmp_path, monkeypatch, case, view
+):
+    import hermes_ariadne.prepared as module
+
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    items = ordered_reasoning_items()
+    bound = module._MAX_CANONICAL_CODEX_JSON_BYTES
+    indices = (2,) if case.startswith("later") else (1, 2)
+    amount = bound if len(indices) == 1 else bound // 2
+    for index in indices:
+        if case.endswith("payload"):
+            items[index]["encrypted_content"] = "x" * amount
+        elif case.endswith("summary"):
+            # Repeated references keep the adversarial count fixture small.
+            items[index]["summary"] = [{"type": "summary_text", "text": ""}] * (amount // 34 + 1)
+        else:
+            items[index]["summary"][0]["text"] = "x" * amount
+    rows, index = {"request": (wire, 5), "restored": (conversation, 3), "active_list": (active, 3)}[
+        view
+    ]
+    rows[index]["codex_reasoning_items"] = items
+    before = copy.deepcopy((active, conversation, wire))
+    encoded_lengths = []
+    original_dumps = module.json.dumps
+
+    def bounded_dumps(value, **kwargs):
+        assert type(value) is str and len(value) <= 4096
+        encoded_lengths.append(len(value))
+        return original_dumps(value, **kwargs)
+
+    monkeypatch.setattr(module.json, "dumps", bounded_dumps)
+    monkeypatch.setattr(module, "canonical_json", lambda _: pytest.fail("generic serialization"))
+    monkeypatch.setattr(module, "_safe_json", lambda _: pytest.fail("generic safety serialization"))
+    with pytest.raises(ValueError, match="admission bound"):
+        module._reasoning_list_bytes(items)
+    assert encoded_lengths == []
+    result = choose(prepared, active, conversation, wire, reasoning_policy=replay_policy())
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment"
+    assert (active, conversation, wire) == before
+
+
+def encrypted_tool_fixture(tmp_path):
+    prepared, active, conversation, wire = native_codex_tool_fixture(tmp_path)
+    for index in (5, 8):
+        items = [encrypted_reasoning_item(ident=f"rs_tool_{index}")]
+        active[index].update(
+            content="",
+            codex_reasoning_items=json.dumps(items),
+            reasoning="",
+            reasoning_content="",
+            codex_message_items=None,
+            tool_call_id=None,
+            tool_name=None,
+            effect_disposition=None,
+        )
+        active[index]["tool_call_uids"] = json.dumps(active[index].pop("_tool_call_uids"))
+        conversation[index].update(
+            content="",
+            codex_reasoning_items=copy.deepcopy(items),
+            reasoning_content="",
+            _db_persisted=True,
+        )
+        wire[index + 2].update(content="", codex_reasoning_items=copy.deepcopy(items))
+    for index in (6, 7, 9):
+        active[index]["tool_call_uid"] = active[index].pop("_tool_call_uid")
+    return prepared, active, conversation, wire
+
+
+def test_encrypted_tool_groups_preserve_native_ids_occurrence_uids_and_sql_nulls(tmp_path):
+    prepared, active, conversation, wire = encrypted_tool_fixture(tmp_path)
+    before = copy.deepcopy((active, conversation, wire))
+    measured = []
+    result = choose(
+        prepared,
+        active,
+        conversation,
+        wire,
+        reasoning_policy=replay_policy(),
+        measure_tokens=lambda m: measured.append(copy.deepcopy(m)) or 100,
+    )
+    assert result.status == "selected" and result.messages is not None
+    assert result.messages[3:] == wire[4:] and measured == [result.messages]
+    assert (active, conversation, wire) == before
+
+
+@pytest.mark.parametrize("item_index", [0, 2])
+@pytest.mark.parametrize(
+    "field", ["type", "encrypted_content", "id", "summary", "_issuer_kind", "_issuer_model"]
+)
+def test_encrypted_envelope_requires_every_stamp_and_payload_field(tmp_path, field, item_index):
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    items = ordered_reasoning_items()[: item_index + 1]
+    items[item_index].pop(field)
+    set_encrypted_envelope(active, conversation, wire, items)
+    assert_encrypted_decline(prepared, active, conversation, wire)
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"type": "message"},
+        {"type": None},
+        {"encrypted_content": ""},
+        {"encrypted_content": None},
+        {"encrypted_content": "non-ASCII λ"},
+        {"encrypted_content": False},
+        {"id": "rs_"},
+        {"id": "rs_tmp_transient"},
+        {"id": "rs_has space"},
+        {"id": " rs_clean"},
+        {"id": "rs_" + "x" * 62},
+        {"id": None},
+        {"_issuer_kind": "openai"},
+        {"_issuer_kind": None},
+        {"_issuer_model": "sibling-model"},
+        {"_issuer_model": None},
+        {"summary": None},
+        {"summary": {}},
+        {"summary": [{"type": "output_text", "text": "x"}]},
+        {"summary": [{"type": "summary_text"}]},
+        {"summary": [{"type": "summary_text", "text": False}]},
+        {"summary": [{"type": "summary_text", "text": "\ud800"}]},
+        {"summary": [{"type": "summary_text", "text": "\udfff"}]},
+        {"summary": [{"type": "summary_text", "text": "x", "extra": None}]},
+        {"summary": ["x"]},
+        {"summary": [float("inf")]},
+        {"signature": "x"},
+        {"status": "completed"},
+        {"content": []},
+        {"unknown": None},
+    ],
+)
+@pytest.mark.parametrize("item_index", [0, 2])
+def test_encrypted_envelope_rejects_unsupported_values_even_when_all_views_agree(
+    tmp_path, patch, item_index
+):
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    items = ordered_reasoning_items()[: item_index + 1]
+    items[item_index].update(patch)
+    set_encrypted_envelope(active, conversation, wire, items)
+    assert_encrypted_decline(prepared, active, conversation, wire)
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [None, False, 1, {}, [], [None], [encrypted_reasoning_item(), encrypted_reasoning_item()]],
+)
+def test_encrypted_envelope_requires_nonempty_objects_with_unique_ids(tmp_path, envelope):
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    # Nonempty serialized null/empty JSON is not legacy absence.
+    set_encrypted_envelope(active, conversation, wire, envelope)
+    if type(envelope) is list and len(envelope) == 2:
+        import hermes_ariadne.prepared as module
+
+        # Cardinality is admitted; the per-view identity check rejects twins.
+        assert module._reasoning_list_bytes(envelope) == len(canonical_json(envelope))
+        with pytest.raises(ValueError, match="duplicate retained reasoning identity"):
+            module._comparison_payloads([conversation[3]], [replay_policy()])
+    assert_encrypted_decline(prepared, active, conversation, wire)
+
+
+def set_encrypted_envelope(active, conversation, wire, items):
+    active[3]["codex_reasoning_items"] = json.dumps(items)
+    conversation[3]["codex_reasoning_items"] = copy.deepcopy(items)
+    wire[5]["codex_reasoning_items"] = copy.deepcopy(items)
+
+
+@pytest.mark.parametrize("view", ["active", "restored", "request"])
+@pytest.mark.parametrize("mutation", ["ciphertext", "id", "summary", "order", "missing"])
+def test_encrypted_identity_binds_each_view_without_erasing_fields(tmp_path, view, mutation):
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    items = [encrypted_reasoning_item()]
+    items[0]["summary"].append({"type": "summary_text", "text": "second"})
+    set_encrypted_envelope(active, conversation, wire, items)
+    assert (
+        choose(prepared, active, conversation, wire, reasoning_policy=replay_policy()).status
+        == "selected"
+    )
+    rows, index = {"active": (active, 3), "restored": (conversation, 3), "request": (wire, 5)}[view]
+    changed = copy.deepcopy(items)
+    if mutation == "ciphertext":
+        changed[0]["encrypted_content"] += " changed"
+    elif mutation == "id":
+        changed[0]["id"] = "rs_other"
+    elif mutation == "summary":
+        changed[0]["summary"][0]["text"] += " "
+    elif mutation == "order":
+        changed[0]["summary"].reverse()
+    if mutation == "missing":
+        rows[index].pop("codex_reasoning_items")
+    else:
+        rows[index]["codex_reasoning_items"] = json.dumps(changed) if view == "active" else changed
+    assert_encrypted_decline(prepared, active, conversation, wire)
+
+
+@pytest.mark.parametrize("view", ["restored", "request"])
+def test_encrypted_noncanonical_carriers_must_already_be_lists(tmp_path, view):
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    rows, index = (conversation, 3) if view == "restored" else (wire, 5)
+    rows[index]["codex_reasoning_items"] = json.dumps(rows[index]["codex_reasoning_items"])
+    assert_encrypted_decline(prepared, active, conversation, wire)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "[]",
+        "null",
+        "{}",
+        "false",
+        "0",
+        "[",
+        "duplicate-key",
+        "[NaN]",
+        "[1e999]",
+        "\ud800",
+    ],
+)
+def test_encrypted_canonical_json_is_strict_not_falsey_absence(tmp_path, text):
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    if text == "duplicate-key":
+        # Otherwise fully valid/equal: permissive last-key-wins parsing would admit it.
+        text = active[3]["codex_reasoning_items"].replace(
+            '"type": "reasoning"', '"type": "reasoning", "type": "reasoning"'
+        )
+    active[3]["codex_reasoning_items"] = text
+    assert_encrypted_decline(prepared, active, conversation, wire)
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [[], [{"type": "summary_text", "text": ""}], [{"type": "summary_text", "text": " \nλ😀\t "}]],
+)
+@pytest.mark.parametrize("canonical_text", [False, True])
+def test_encrypted_preserves_empty_unicode_summary_and_bounded_ids(
+    tmp_path, summary, canonical_text
+):
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    items = [encrypted_reasoning_item(ident="rs_" + "x" * 61)]
+    items[0]["summary"] = summary
+    set_encrypted_envelope(active, conversation, wire, items)
+    if not canonical_text:
+        active[3]["codex_reasoning_items"] = copy.deepcopy(items)
+    else:
+        active[3]["codex_message_items"] = json.dumps(active[3]["codex_message_items"])
+    result = choose(prepared, active, conversation, wire, reasoning_policy=replay_policy())
+    assert result.status == "selected" and result.messages[3:] == wire[4:]
+
+
+@pytest.mark.parametrize("canonical_text", [False, True])
+@pytest.mark.parametrize("extra", [0, 1])
+def test_encrypted_envelope_utf8_byte_limit_is_inclusive(canonical_text, extra):
+    from hermes_ariadne.prepared import _MAX_CANONICAL_CODEX_JSON_BYTES, _encrypted_codex_reasoning
+
+    items = [encrypted_reasoning_item()]
+    items[0]["encrypted_content"] = ""
+    room = _MAX_CANONICAL_CODEX_JSON_BYTES - len(canonical_json(items))
+    items[0]["encrypted_content"] = "x" * (room + extra)
+    message = {
+        "role": "assistant",
+        "codex_reasoning_items": json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+        if canonical_text
+        else items,
+    }
+    if extra:
+        with pytest.raises(ValueError, match="admission bound"):
+            _encrypted_codex_reasoning(message, replay_policy(), durable=canonical_text)
+    else:
+        assert _encrypted_codex_reasoning(message, replay_policy(), durable=canonical_text) == items
+
+
+@pytest.mark.parametrize("unit", ["x", "λ"])
+def test_encrypted_canonical_json_bounds_precede_decode(monkeypatch, unit):
+    import hermes_ariadne.prepared as module
+
+    monkeypatch.setattr(module, "_MAX_CANONICAL_CODEX_JSON_BYTES", 32)
+    monkeypatch.setattr(module, "_json", lambda _: pytest.fail("oversized JSON reached decode"))
+    message = {
+        "role": "assistant",
+        "codex_reasoning_items": unit * 33 if unit == "x" else unit * 17,
+    }
+    with pytest.raises(ValueError, match="admission bound"):
+        module._encrypted_codex_reasoning(message, replay_policy(), durable=True)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["coverage", "uid", "duplicate_uid", "session", "order", "standalone", "role", "details"],
+)
+def test_encrypted_admission_requires_retained_canonical_identity_and_supported_carrier(
+    tmp_path, failure
+):
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    if failure == "coverage":
+        del active[3:]
+    elif failure == "uid":
+        active[3]["message_uid"] = "unrelated"
+    elif failure == "duplicate_uid":
+        active[3]["message_uid"] = conversation[3]["message_uid"] = active[2]["message_uid"]
+    elif failure == "session":
+        active[3]["session_id"] = "other"
+    elif failure == "order":
+        active[2], active[3] = active[3], active[2]
+    else:
+        for rows, index in ((active, 3), (conversation, 3), (wire, 5)):
+            if failure == "standalone":
+                rows[index].pop("codex_message_items")
+            elif failure == "role":
+                rows[index]["role"] = "user"
+            else:
+                rows[index]["reasoning_details"] = [{"type": "unrelated"}]
+    assert_encrypted_decline(prepared, active, conversation, wire)
+
+
+@pytest.mark.parametrize("view", ["active", "restored", "request"])
+@pytest.mark.parametrize("restriction", ["data_use", "withheld"])
+def test_encrypted_replay_does_not_bypass_machine_restrictions(tmp_path, view, restriction):
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    rows, index = {"active": (active, 3), "restored": (conversation, 3), "request": (wire, 5)}[view]
+    if restriction == "data_use":
+        rows[index]["data_use"] = ["no_model"]
+    else:
+        rows[index]["withheld_prompt"] = "hidden synthetic source"
+    result = choose(prepared, active, conversation, wire, reasoning_policy=replay_policy())
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_data_use"
+
+
+@pytest.mark.parametrize("policy", [True, {}, "codex_backend", object()])
+def test_encrypted_policy_is_not_an_arbitrary_truthy_permission(tmp_path, policy):
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    assert_encrypted_decline(prepared, active, conversation, wire, reasoning_policy=policy)
+
+
+@pytest.mark.parametrize("field", REASONING_FIELDS)
+@pytest.mark.parametrize("marker", [None, "", False, [], {}, 0, 0.0, -0.0])
+def test_encrypted_policy_preserves_legacy_falsey_reasoning_free_tail(tmp_path, field, marker):
+    prepared, _, conversation, wire = selection_fixture(tmp_path)
+    conversation[3][field] = marker
+    active = copy.deepcopy(conversation)
+    for policy in (None, replay_policy()):
+        result = choose(prepared, active, conversation, wire, reasoning_policy=policy)
+        assert result.status == "selected" and result.messages[3:] == wire[4:]
+
+
+def test_encrypted_policy_never_authorizes_a_frozen_reasoning_source(tmp_path, monkeypatch):
+    import hermes_ariadne.prepared as module
+
+    _, rows, kernel, _, _ = prefix_carrier_fixture(
+        tmp_path, {"codex_reasoning_items": [encrypted_reasoning_item()]}
+    )
+    direct = module.PreparedView(
+        kernel, "synthetic", 8192, 65536, 4096, "synthetic frozen navigation"
+    )
+    conversation = copy.deepcopy(rows) + [
+        {"message_uid": "previous", "role": "user", "content": "previous"},
+        {"message_uid": "answer", "role": "assistant", "content": "answer"},
+        {"message_uid": "current", "role": "user", "content": "current"},
+    ]
+    monkeypatch.setattr(module, "_comparison", lambda *a, **k: pytest.fail("prefix reached codec"))
+    assert_encrypted_decline(direct, rows, conversation, as_wire(conversation))
+
+
+@pytest.mark.parametrize(
+    "mutation", ["wrong_result", "reused_uid", "missing_parallel", "contradictory_alias"]
+)
+def test_encrypted_tool_codec_keeps_occurrence_metadata_checks(tmp_path, mutation):
+    prepared, active, conversation, wire = encrypted_tool_fixture(tmp_path)
+    for rows in (active, conversation):
+        if mutation == "wrong_result":
+            key = "tool_call_uid" if rows is active else "_tool_call_uid"
+            rows[6][key] = "other"
+        elif mutation == "reused_uid":
+            if rows is active:
+                rows[8]["tool_call_uids"] = json.dumps({"repeat": "occ1"})
+                rows[9]["tool_call_uid"] = "occ1"
+            else:
+                rows[8]["_tool_call_uids"]["repeat"] = "occ1"
+                rows[9]["_tool_call_uid"] = "occ1"
+        elif mutation == "missing_parallel":
+            if rows is active:
+                rows[5]["tool_call_uids"] = json.dumps({"repeat": "occ1"})
+            else:
+                rows[5]["_tool_call_uids"].pop("parallel")
+        else:
+            rows[5]["_tool_call_uids" if rows is active else "tool_call_uids"] = {
+                "repeat": "other",
+                "parallel": "occ2",
+            }
+    assert_encrypted_decline(prepared, active, conversation, wire)
+
+
+def oversized_reasoning_items(case):
+    from hermes_ariadne.prepared import _MAX_CANONICAL_CODEX_JSON_BYTES
+
+    bound = _MAX_CANONICAL_CODEX_JSON_BYTES
+    item = encrypted_reasoning_item()
+    if case == "ciphertext":
+        item["encrypted_content"] = "x" * (2 * bound)
+    elif case == "summary":
+        item["summary"][0]["text"] = "λ" * bound
+    elif case == "controls":
+        item["summary"][0]["text"] = "\0" * (bound // 2)
+    elif case == "cumulative":
+        item["summary"] = [{"type": "summary_text", "text": "x" * 1000} for _ in range(1100)]
+    elif case == "empty_parts":
+        item["summary"] = [{"type": "summary_text", "text": ""} for _ in range(40000)]
+    elif case == "model":
+        item["_issuer_model"] = "m" * (2 * bound)
+    elif case == "item_keys":
+        item.update({f"extra_{i}": None for i in range(80000)})
+    elif case == "part_keys":
+        item["summary"][0].update({f"extra_{i}": None for i in range(80000)})
+    return [item]
+
+
+RESOURCE_CASES = [
+    "ciphertext",
+    "summary",
+    "controls",
+    "cumulative",
+    "empty_parts",
+    "model",
+    "item_keys",
+    "part_keys",
+]
+
+
+@pytest.mark.parametrize("case", RESOURCE_CASES)
+def test_encrypted_resource_direct_rejects_before_full_serialization(monkeypatch, case):
+    import hermes_ariadne.prepared as module
+
+    items = oversized_reasoning_items(case)
+    policy = module.ReasoningReplayPolicy("codex_backend", items[0]["_issuer_model"])
+    before = copy.deepcopy(items)
+    monkeypatch.setattr(module, "canonical_json", lambda _: pytest.fail("full carrier encode"))
+    original_dumps = module.json.dumps
+    original_set = set
+    encoded_lengths = []
+
+    def bounded_dumps(value, **kwargs):
+        assert type(value) is str and len(value) <= 4096
+        encoded = original_dumps(value, **kwargs)
+        encoded_lengths.append(len(encoded.encode("utf-8")))
+        return encoded
+
+    def bounded_set(value):
+        assert len(value) <= 6, "key set allocated before builtin length check"
+        return original_set(value)
+
+    monkeypatch.setattr(module.json, "dumps", bounded_dumps)
+    monkeypatch.setattr(module, "set", bounded_set, raising=False)
+    with pytest.raises(ValueError):
+        module._encrypted_codex_reasoning(
+            {"role": "assistant", "codex_reasoning_items": items}, policy
+        )
+    assert items == before
+    assert max(encoded_lengths, default=0) <= 24578
+    if case != "controls":
+        assert encoded_lengths == []  # Necessary raw/count bounds need no JSON encoding.
+
+
+@pytest.mark.parametrize("view", ["request", "restored", "active_list", "active_text"])
+@pytest.mark.parametrize("case", RESOURCE_CASES)
+def test_encrypted_resource_public_precedes_safety_serialization(tmp_path, monkeypatch, view, case):
+    import hermes_ariadne.prepared as module
+
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    items = oversized_reasoning_items(case)
+    rows, index = {
+        "request": (wire, 5),
+        "restored": (conversation, 3),
+        "active_list": (active, 3),
+        "active_text": (active, 3),
+    }[view]
+    carrier = canonical_json(items).decode("utf-8") if view == "active_text" else items
+    rows[index]["codex_reasoning_items"] = carrier
+    before = copy.deepcopy((active, conversation, wire))
+    archive = prepared.projection._archive.path.read_bytes()
+    checkpoint = prepared.kernel.path.read_bytes()
+    original = module.ascii_json_units
+
+    def guarded(value):
+        if value is rows:
+            pytest.fail("oversized carrier reached generic safety serializer")
+        return original(value)
+
+    monkeypatch.setattr(module, "ascii_json_units", guarded)
+    result = choose(prepared, active, conversation, wire, reasoning_policy=replay_policy())
+    assert result.status == "declined" and result.messages is None
+    assert result.diagnostics["reason"] == "unsupported_alignment"
+    assert (active, conversation, wire) == before
+    assert prepared.projection._archive.path.read_bytes() == archive
+    assert prepared.kernel.path.read_bytes() == checkpoint
+
+
+REASONING_BYTE_PATTERNS = [
+    ("ciphertext", "x"),
+    ("summary", "λ😀"),
+    ("summary", '"\\\0\n'),
+    ("model", "λ😀"),
+    ("model", '"\\\0\n'),
+]
+
+
+def reasoning_items_at_byte_limit(field, pattern, extra):
+    from hermes_ariadne.prepared import _MAX_CANONICAL_CODEX_JSON_BYTES
+
+    items = [encrypted_reasoning_item()]
+    target, key = {
+        "ciphertext": (items[0], "encrypted_content"),
+        "summary": (items[0]["summary"][0], "text"),
+        "model": (items[0], "_issuer_model"),
+    }[field]
+    target[key] = "mm"  # Keep model boundaries non-whitespace, including control patterns.
+    room = _MAX_CANONICAL_CODEX_JSON_BYTES + extra - len(canonical_json(items))
+    unit_bytes = len(canonical_json(pattern)) - 2
+    count, remainder = divmod(room, unit_bytes)
+    target[key] = "m" + pattern * count + "x" * remainder + "m"
+    assert len(canonical_json(items)) == _MAX_CANONICAL_CODEX_JSON_BYTES + extra
+    return items
+
+
+@pytest.mark.parametrize("field,pattern", REASONING_BYTE_PATTERNS)
+@pytest.mark.parametrize("extra", [0, 1])
+@pytest.mark.parametrize("canonical_text", [False, True])
+def test_encrypted_exact_byte_boundaries_preserve_values(field, pattern, extra, canonical_text):
+    import hermes_ariadne.prepared as module
+
+    items = reasoning_items_at_byte_limit(field, pattern, extra)
+    carrier = canonical_json(items).decode("utf-8") if canonical_text else items
+    before = copy.deepcopy(carrier)
+    policy = module.ReasoningReplayPolicy("codex_backend", items[0]["_issuer_model"])
+    message = {"role": "assistant", "codex_reasoning_items": carrier}
+    if extra:
+        with pytest.raises(ValueError, match="admission bound"):
+            module._encrypted_codex_reasoning(message, policy, durable=canonical_text)
+    else:
+        assert module._reasoning_list_bytes(items) == module._MAX_CANONICAL_CODEX_JSON_BYTES
+        result = module._encrypted_codex_reasoning(message, policy, durable=canonical_text)
+        assert result == items
+        if not canonical_text:
+            assert result is items
+    assert message["codex_reasoning_items"] == before
+
+
+@pytest.mark.parametrize("field,pattern", REASONING_BYTE_PATTERNS)
+@pytest.mark.parametrize("extra", [0, 1])
+@pytest.mark.parametrize("canonical_text", [False, True])
+def test_encrypted_public_exact_byte_boundaries(tmp_path, field, pattern, extra, canonical_text):
+    from dataclasses import replace
+
+    import hermes_ariadne.prepared as module
+
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    prepared = replace(prepared, request_bytes=16 * module._MAX_CANONICAL_CODEX_JSON_BYTES)
+    items = reasoning_items_at_byte_limit(field, pattern, extra)
+    set_encrypted_envelope(active, conversation, wire, items)
+    # Source TEXT has its own inclusive bound, including whitespace/escaping.
+    active[3]["codex_reasoning_items"] = (
+        canonical_json(items).decode("utf-8") if canonical_text else copy.deepcopy(items)
+    )
+    policy = module.ReasoningReplayPolicy("codex_backend", items[0]["_issuer_model"])
+    before = copy.deepcopy((active, conversation, wire))
+    hashes = [digest(row) for row in active]
+    archive = prepared.projection._archive.path.read_bytes()
+    checkpoint = prepared.kernel.path.read_bytes()
+    measured = []
+    result = choose(
+        prepared,
+        active,
+        conversation,
+        wire,
+        reasoning_policy=policy,
+        measure_tokens=lambda m: measured.append(copy.deepcopy(m)) or 100,
+    )
+    if extra:
+        assert result.status == "declined" and result.messages is None
+        assert result.diagnostics["reason"] == "unsupported_alignment" and measured == []
+    else:
+        assert result.status == "selected" and result.messages is not None
+        assert result.messages[3:] == wire[4:]
+        assert measured == [result.messages]
+        # Final policy stays in ASCII-JSON units, not the codec's UTF-8 units.
+        from hermes_ariadne.simulation import ascii_json_units
+
+        assert result.diagnostics["request_bytes"] == ascii_json_units(result.messages)
+    assert (active, conversation, wire) == before
+    assert [digest(row) for row in active] == hashes
+    assert prepared.projection._archive.path.read_bytes() == archive
+    assert prepared.kernel.path.read_bytes() == checkpoint
+
+
+@pytest.mark.parametrize("seed", [14, 4504058384])
+def test_encrypted_size_randomized_differential(seed, monkeypatch):
+    import random
+
+    import hermes_ariadne.prepared as module
+
+    rng = random.Random(seed)
+    alphabet = 'abc λ😀漢"\\\0\n\t\b\r\f\x1f\u2028'
+    for index in range(300):
+        item = encrypted_reasoning_item(ident="rs_" + "x" * rng.randint(1, 61))
+        item["encrypted_content"] = "x" + "".join(rng.choices('a"\\\0\n', k=rng.randrange(50)))
+        item["_issuer_model"] = "m" + "".join(rng.choices(alphabet, k=rng.randrange(40))) + "m"
+        item["summary"] = [
+            {"type": "summary_text", "text": "".join(rng.choices(alphabet, k=rng.randrange(80)))}
+            for _ in range(rng.randrange(10))
+        ]
+        if index % 10 == 0:
+            # Exercise additivity across encoder slices, not just tiny strings.
+            item["summary"].append(
+                {
+                    "type": "summary_text",
+                    "text": "".join(rng.choices(alphabet, k=rng.choice([4095, 4096, 4097, 8193]))),
+                }
+            )
+        items = [item]
+        before = copy.deepcopy(items)
+        expected = len(canonical_json(items))
+        policy = module.ReasoningReplayPolicy("codex_backend", item["_issuer_model"])
+        assert module._reasoning_list_bytes(items) == expected
+        assert (
+            module._encrypted_codex_reasoning(
+                {"role": "assistant", "codex_reasoning_items": items}, policy
+            )
+            is items
+        )
+        # Differential acceptance as well as exact size, with inclusive limits.
+        with monkeypatch.context() as patcher:
+            patcher.setattr(module, "_MAX_CANONICAL_CODEX_JSON_BYTES", expected - 1)
+            with pytest.raises(ValueError, match="admission bound"):
+                module._reasoning_list_bytes(items)
+            patcher.setattr(module, "_MAX_CANONICAL_CODEX_JSON_BYTES", expected)
+            assert module._reasoning_list_bytes(items) == expected
+        assert items == before
+
+
+@pytest.mark.parametrize("public", [False, True])
+def test_encrypted_giant_matching_policy_uses_bounded_utf8_validation(tmp_path, public):
+    import sys
+
+    import hermes_ariadne.prepared as module
+
+    prepared, active, conversation, wire = encrypted_answer_fixture(tmp_path)
+    items = oversized_reasoning_items("model")
+    policy = module.ReasoningReplayPolicy("codex_backend", items[0]["_issuer_model"])
+    wire[5]["codex_reasoning_items"] = items
+    encode_lengths = []
+
+    def observe(frame, event, function):
+        if event == "c_call" and getattr(function, "__name__", None) == "encode":
+            value = getattr(function, "__self__", None)
+            if type(value) is str:
+                encode_lengths.append(len(value))
+
+    previous = sys.getprofile()
+    sys.setprofile(observe)
+    try:
+        if public:
+            result = choose(prepared, active, conversation, wire, reasoning_policy=policy)
+            assert result.status == "declined" and result.messages is None
+        else:
+            with pytest.raises(ValueError, match="admission bound"):
+                module._encrypted_codex_reasoning(
+                    {"role": "assistant", "codex_reasoning_items": items}, policy
+                )
+    finally:
+        sys.setprofile(previous)
+    assert max(encode_lengths, default=0) <= 4096
+    # No independent tag cap: huge trusted labels remain valid without reasoning.
+    module._require_reasoning_policy(policy)
+    for rows, index in ((active, 3), (conversation, 3), (wire, 5)):
+        rows[index].pop("codex_reasoning_items")
+    assert (
+        choose(prepared, active, conversation, wire, reasoning_policy=policy).status == "selected"
+    )
+
+
+def test_encrypted_summary_count_bound_is_derived_not_an_extra_cap():
+    import hermes_ariadne.prepared as module
+
+    skeleton = encrypted_reasoning_item()
+    skeleton.update(encrypted_content="", id="", summary=[], _issuer_model="")
+    assert len(canonical_json([skeleton])) == 116
+    assert len(canonical_json({"type": "summary_text", "text": ""})) == 33
+    item = encrypted_reasoning_item()
+    item["summary"] = []
+    room = module._MAX_CANONICAL_CODEX_JSON_BYTES - len(canonical_json([item]))
+    count = (room + 1) // 34
+    item["summary"] = [{"type": "summary_text", "text": ""} for _ in range(count)]
+    item["encrypted_content"] += "x" * (
+        module._MAX_CANONICAL_CODEX_JSON_BYTES - len(canonical_json([item]))
+    )
+    assert module._reasoning_list_bytes([item]) == module._MAX_CANONICAL_CODEX_JSON_BYTES
+    assert module._encrypted_codex_reasoning(
+        {"role": "assistant", "codex_reasoning_items": [item]}, replay_policy()
+    ) == [item]
+    item["summary"].append({"type": "summary_text", "text": ""})
+    with pytest.raises(ValueError, match="admission bound"):
+        module._reasoning_list_bytes([item])
+
+
+@pytest.mark.parametrize("field", ["summary", "model"])
+@pytest.mark.parametrize("offset", [4095, 4096, 4097])
+def test_encrypted_strict_utf8_across_string_slices(field, offset):
+    import hermes_ariadne.prepared as module
+
+    item = encrypted_reasoning_item()
+    bad = "m" * offset + "\ud800" + "m"
+    if field == "summary":
+        item["summary"][0]["text"] = bad
+        policy = replay_policy()
+    else:
+        item["_issuer_model"] = bad
+        policy = module.ReasoningReplayPolicy("codex_backend", bad)
+    with pytest.raises(UnicodeError):
+        module._encrypted_codex_reasoning(
+            {"role": "assistant", "codex_reasoning_items": [item]}, policy
+        )
+
+
+@pytest.mark.parametrize("mode", ["derived", "legacy", "cross_row_native", "duplicate_native"])
+def test_encrypted_tool_codec_preserves_existing_function_id_scope(tmp_path, mode):
+    prepared, active, conversation, wire = encrypted_tool_fixture(tmp_path)
+    for rows in (active, conversation, wire[2:]):
+        if mode == "derived":
+            rows[5]["tool_calls"][0]["response_item_id"] = "fc_repeat"
+        elif mode == "legacy":
+            for key in ("call_id", "response_item_id"):
+                rows[5]["tool_calls"][0].pop(key, None)
+        elif mode == "cross_row_native":
+            rows[8]["tool_calls"][0]["response_item_id"] = rows[5]["tool_calls"][0][
+                "response_item_id"
+            ]
+        else:
+            rows[5]["tool_calls"][1]["response_item_id"] = rows[5]["tool_calls"][0][
+                "response_item_id"
+            ]
+    if mode == "duplicate_native":
+        assert_encrypted_decline(prepared, active, conversation, wire)
+    else:
+        result = choose(prepared, active, conversation, wire, reasoning_policy=replay_policy())
+        assert result.status == "selected" and result.messages[3:] == wire[4:]

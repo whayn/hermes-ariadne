@@ -7,6 +7,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -171,6 +172,7 @@ def native_worker(tmp_path):
         env.update(
             HOME=str(tmp_path),
             HERMES_HOME=str(home),
+            HERMES_MANAGED_DIR=tempfile.mkdtemp(prefix="managed-", dir=tmp_path),
             TZ="UTC",
             PYTHONPATH=os.pathsep.join(
                 (

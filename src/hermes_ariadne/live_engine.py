@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
+from types import SimpleNamespace
 from typing import Any
 
 from .engine import AriadneEngine, logger
@@ -17,6 +18,10 @@ class _Scope:
     session_id: str | None
     home: Path | None
     prepared: Any
+    # Only selection snapshots include route state; evidence/archive-only hooks
+    # remain attachment-scoped and model updates do not change _capture().
+    route_revision: int | None = None
+    reasoning_policy: Any = None
 
 
 class PreparedAriadneEngine(AriadneEngine):
@@ -37,8 +42,10 @@ class PreparedAriadneEngine(AriadneEngine):
         super().__init__()
         self._lock = RLock()
         self._generation = 0
+        self._route_revision = 0
         self._profile_home = None
         self._prepared = None
+        self._reasoning_policy = None
         self._home = None
         self._selection = {
             "status": "not_initialized",
@@ -70,10 +77,10 @@ class PreparedAriadneEngine(AriadneEngine):
             else:
                 origin = "hook"
             with self._lock:
-                if scope.generation != self._generation:
+                if not self._current(scope):
                     return
                 outcome = scope.store.ingest(scope.session_id, messages, origin=origin)
-                if scope.generation != self._generation:
+                if not self._current(scope):
                     return
                 self._skipped = outcome["skipped"]
                 self._archive_error = None
@@ -83,7 +90,7 @@ class PreparedAriadneEngine(AriadneEngine):
     def _record_scoped_error(self, scope, exc):
         error = type(exc).__name__
         with self._lock:
-            if scope.generation != self._generation:
+            if not self._current(scope):
                 return
             self._archive_error = error
         # Logging handlers can re-enter lifecycle hooks, including host reads.
@@ -183,9 +190,15 @@ class PreparedAriadneEngine(AriadneEngine):
                 "host_fallback": "original_request_on_decline",
             }
 
+    def _current(self, scope):
+        # Caller holds the lock. Epochs fence away/back AND same-value updates.
+        return scope.generation == self._generation and (
+            scope.route_revision is None or scope.route_revision == self._route_revision
+        )
+
     def _decline(self, reason, scope):
         with self._lock:
-            if scope.generation == self._generation:
+            if self._current(scope):
                 self._selection = {
                     "status": "declined",
                     "reason": reason,
@@ -198,7 +211,9 @@ class PreparedAriadneEngine(AriadneEngine):
         self, model, context_length, base_url="", api_key="", provider="", api_mode=""
     ):
         with self._lock:
-            super().update_model(model, context_length, base_url, api_key, provider, api_mode)
+            self._route_revision += 1
+            revision = self._route_revision
+            self._reasoning_policy = None
             # Source identity is model-independent, but the preceding measurement isn't.
             if self._prepared is not None:
                 self._selection = {
@@ -206,6 +221,48 @@ class PreparedAriadneEngine(AriadneEngine):
                     "provider_fit_verified": False,
                     "host_fallback": "original_request_on_decline",
                 }
+            super().update_model(model, context_length, base_url, api_key, provider, api_mode)
+        # Native registry/profile lookup may call back or block. A newer update
+        # wins even when this older computation fails or finishes last.
+        policy = self._bound_reasoning_policy(model, base_url, provider, api_mode)
+        with self._lock:
+            if revision == self._route_revision:
+                self._reasoning_policy = policy
+
+    @staticmethod
+    def _bound_reasoning_policy(model, base_url, provider, api_mode):
+        # These are the agent's bound labels, NOT effective per-request wire data.
+        # Invoke native profile lookup in this callback's Hermes home/context;
+        # never borrow a probe registry, cache a URL, or inspect credentials.
+        if any(
+            type(value) is not str or not value.strip()
+            for value in (model, base_url, provider, api_mode)
+        ):
+            return None
+        if provider != "openai-codex" or api_mode != "codex_responses":
+            return None
+        try:
+            from agent.codex_responses_adapter import (
+                _classify_responses_issuer,
+                _wire_model_identity,
+                classify_responses_route,
+            )
+            from agent.safe_worker_policy import safe_worker_enabled
+
+            from .prepared import ReasoningReplayPolicy, _require_reasoning_policy
+
+            if safe_worker_enabled():  # Native lookup deliberately bypasses profiles here.
+                return None
+            flags = classify_responses_route(SimpleNamespace(provider=provider, base_url=base_url))
+            issuer = _classify_responses_issuer(base_url=base_url, **flags._asdict())
+            normalized = _wire_model_identity(model)
+            if type(normalized) is not str:
+                return None
+            policy = ReasoningReplayPolicy(issuer, normalized)
+            _require_reasoning_policy(policy)
+            return policy
+        except Exception:
+            return None
 
     def select_context(
         self,
@@ -215,7 +272,12 @@ class PreparedAriadneEngine(AriadneEngine):
         incoming_message=None,
         budget_tokens=0,
     ):
-        scope = self._capture()
+        with self._lock:
+            scope = replace(
+                self._capture(),
+                route_revision=self._route_revision,
+                reasoning_policy=self._reasoning_policy,
+            )
         if scope.home is None:
             return None  # Construction/reset/end have no attached lifetime.
         if scope.prepared is None:
@@ -226,7 +288,7 @@ class PreparedAriadneEngine(AriadneEngine):
             return self._decline("scope_mismatch", scope)
         self._observe([], scope=scope)
         with self._lock:
-            if scope.generation != self._generation:
+            if not self._current(scope):
                 return None
             if self._archive_error:
                 return self._decline("archive_unavailable", scope)
@@ -235,7 +297,7 @@ class PreparedAriadneEngine(AriadneEngine):
 
             active = scope.db.get_messages(scope.session_id, include_inactive=False)
             with self._lock:
-                if scope.generation != self._generation:
+                if not self._current(scope):
                     return None
             decision = scope.prepared.select(
                 request_messages,
@@ -244,11 +306,12 @@ class PreparedAriadneEngine(AriadneEngine):
                 active_messages=active,
                 budget_tokens=budget_tokens,
                 measure_tokens=estimate_request_tokens_rough,
+                reasoning_policy=scope.reasoning_policy,
             )
         except Exception:
             return self._decline("selection_unavailable", scope)
         with self._lock:
-            if scope.generation != self._generation:
+            if not self._current(scope):
                 return None
             self._selection = {"status": decision.status, **decision.diagnostics}
             return decision.messages
