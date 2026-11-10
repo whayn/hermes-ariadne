@@ -474,8 +474,8 @@ class RollingAriadneEngine(AriadneEngine):
                         messages=decode_json(
                             target.request_bytes, self._settings.max_request_bytes
                         ),
-                        max_tokens=2048,
-                        timeout=60,
+                        max_tokens=self._settings.max_tokens,
+                        timeout=self._settings.timeout,
                         purpose="ariadne-rolling-preparation",
                     )
                 except Exception:
