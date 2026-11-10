@@ -185,3 +185,163 @@ def test_installer_cli_requires_explicit_prepared_flag(tmp_path, monkeypatch, ca
     module.main()
     assert calls == [(tmp_path.resolve(), True)]
     assert "context.engine=ariadne-prepared" in capsys.readouterr().out
+
+
+ROLLING_FILES = {
+    "__init__.py": "rolling_entry.py",
+    "plugin.yaml": "rolling_plugin.yaml",
+    **{
+        name: name
+        for name in (
+            "engine.py",
+            "store.py",
+            "live_engine.py",
+            "prepared.py",
+            "retrieval.py",
+            "kernel.py",
+            "tree.py",
+            "sources.py",
+            "simulation.py",
+            "receipts.py",
+            "rolling.py",
+            "rolling_engine.py",
+            "rolling_state.py",
+            "rolling_selection.py",
+            "rolling_retrieval.py",
+        )
+    },
+}
+
+
+def test_rolling_installer_copies_exact_runtime_without_activation(tmp_path):
+    import ast
+
+    import hermes_ariadne.install as module
+
+    home = tmp_path / "home"
+    home.mkdir()
+    config = home / "config.yaml"
+    config.write_bytes(b"context:\n  engine: compressor\n")
+    passive = install(home)
+    prepared = install(home, prepared=True)
+    old = {p: p.read_bytes() for folder in (passive, prepared) for p in folder.iterdir()}
+    target = install(home, rolling=True)
+    assert target == home / "plugins" / "ariadne-rolling-plugin"
+    assert not (home / "plugins" / "ariadne-rolling").exists()
+    assert {p.name for p in target.iterdir()} == set(ROLLING_FILES)
+    source = Path(module.__file__).parent
+    for name, original in ROLLING_FILES.items():
+        assert (target / name).read_bytes() == (source / original).read_bytes()
+        if name.endswith(".py"):
+            for node in ast.walk(ast.parse((target / name).read_text())):
+                if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module:
+                    assert node.module.split(".")[0] + ".py" in ROLLING_FILES
+    assert config.read_bytes() == b"context:\n  engine: compressor\n"
+    assert all(p.read_bytes() == value for p, value in old.items())
+    assert not (home / "ariadne").exists()
+    assert target.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.parametrize("value", [1, "yes", None, [], {}])
+def test_rolling_mode_requires_explicit_boolean_before_writes(tmp_path, value):
+    with pytest.raises(ValueError, match="explicit boolean"):
+        install(tmp_path / "absent", rolling=value)
+    assert not (tmp_path / "absent").exists()
+
+
+def test_rolling_and_prepared_are_mutually_exclusive_before_writes(tmp_path):
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        install(tmp_path / "absent", rolling=True, prepared=True)
+    assert not (tmp_path / "absent").exists()
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "symlink", "dangling", "plugins-symlink"])
+def test_rolling_install_refuses_existing_targets_and_symlink_parents(tmp_path, kind):
+    home = tmp_path / "home"
+    plugins = home / "plugins"
+    plugins.mkdir(parents=True)
+    target = plugins / "ariadne-rolling-plugin"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_bytes(b"untouched")
+    if kind == "plugins-symlink":
+        plugins.rmdir()
+        plugins.symlink_to(outside, target_is_directory=True)
+    elif kind == "file":
+        target.write_bytes(b"untouched")
+    elif kind == "directory":
+        target.mkdir()
+        (target / "sentinel").write_bytes(b"untouched")
+    else:
+        target.symlink_to(sentinel if kind == "symlink" else outside / "absent")
+    protected = plugins if kind == "plugins-symlink" else target
+    before = protected.lstat()
+    with pytest.raises(FileExistsError):
+        install(home, rolling=True)
+    assert protected.lstat() == before
+    assert list(outside.iterdir()) == [sentinel]
+    assert sentinel.read_bytes() == b"untouched"
+
+
+@pytest.mark.parametrize("mode", [{}, {"prepared": True}, {"rolling": True}])
+def test_install_cleans_partial_copy_on_failure(tmp_path, monkeypatch, mode):
+    import hermes_ariadne.install as module
+
+    original = module.shutil.copyfile
+    calls = []
+
+    def broken(source, destination):
+        calls.append(destination)
+        if len(calls) == 2:
+            raise OSError("synthetic copy failure")
+        return original(source, destination)
+
+    monkeypatch.setattr(module.shutil, "copyfile", broken)
+    with pytest.raises(OSError, match="synthetic"):
+        install(tmp_path / "home", **mode)
+    assert list((tmp_path / "home" / "plugins").iterdir()) == []
+
+
+def test_rolling_cli_is_explicit_and_prints_separate_enablement(tmp_path, monkeypatch, capsys):
+    import sys
+
+    import hermes_ariadne.install as module
+
+    monkeypatch.setattr(sys, "argv", ["ariadne-install", "--home", str(tmp_path), "--rolling"])
+    module.main()
+    output = capsys.readouterr().out
+    assert "context.engine=ariadne-rolling" in output
+    assert "plugins enable ariadne-rolling-plugin" in output
+    assert "plugins.isolation=in_process" in output
+    assert "configuration unchanged" in output
+    assert (tmp_path / "plugins" / "ariadne-rolling-plugin" / "plugin.yaml").exists()
+    assert not (tmp_path / "config.yaml").exists()
+
+
+def test_cli_refuses_both_modes_before_writes(tmp_path, monkeypatch):
+    import sys
+
+    import hermes_ariadne.install as module
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["ariadne-install", "--home", str(tmp_path / "absent"), "--prepared", "--rolling"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        module.main()
+    assert exc.value.code == 2
+    assert not (tmp_path / "absent").exists()
+
+
+def test_package_data_includes_all_opt_in_manifests():
+    import tomllib
+
+    project = Path(__file__).resolve().parents[1]
+    metadata = tomllib.loads((project / "pyproject.toml").read_text())
+    assert metadata["tool"]["setuptools"]["package-data"]["hermes_ariadne"] == [
+        "plugin.yaml",
+        "prepared_plugin.yaml",
+        "rolling_plugin.yaml",
+    ]

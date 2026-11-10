@@ -26,7 +26,33 @@ _PREPARED_FILES = {
 }
 
 
-def install(home, *, prepared=False):
+_ROLLING_FILES = {
+    "__init__.py": "rolling_entry.py",
+    "plugin.yaml": "rolling_plugin.yaml",
+    **{
+        name: name
+        for name in (
+            "engine.py",
+            "store.py",
+            "live_engine.py",
+            "prepared.py",
+            "retrieval.py",
+            "kernel.py",
+            "tree.py",
+            "sources.py",
+            "simulation.py",
+            "receipts.py",
+            "rolling.py",
+            "rolling_engine.py",
+            "rolling_state.py",
+            "rolling_selection.py",
+            "rolling_retrieval.py",
+        )
+    },
+}
+
+
+def install(home, *, prepared=False, rolling=False):
     """Copy beneath canonical home; reject pre-existing destination symlinks.
 
     The explicit home itself may be a symlink. Existing final files, directories,
@@ -35,14 +61,25 @@ def install(home, *, prepared=False):
     """
     if type(prepared) is not bool:
         raise ValueError("prepared must be an explicit boolean")
+    if type(rolling) is not bool:
+        raise ValueError("rolling must be an explicit boolean")
+    if prepared and rolling:
+        raise ValueError("prepared and rolling are mutually exclusive")
     home = Path(home).expanduser().resolve()
-    target = home / "plugins" / ("ariadne-prepared" if prepared else "ariadne")
+    name = "ariadne-rolling-plugin" if rolling else "ariadne-prepared" if prepared else "ariadne"
+    target = home / "plugins" / name
     if target.parent.is_symlink():
         raise FileExistsError(f"Refusing symlink destination component: {target.parent}")
     target.parent.mkdir(parents=True, exist_ok=True)
     target.mkdir(mode=0o700)  # Refuse ANY pre-existing directory or symlink.
     try:
-        files = _PREPARED_FILES if prepared else {name: name for name in _RUNTIME_FILES}
+        files = (
+            _ROLLING_FILES
+            if rolling
+            else _PREPARED_FILES
+            if prepared
+            else {name: name for name in _RUNTIME_FILES}
+        )
         for target_name, source_name in files.items():
             shutil.copyfile(Path(__file__).parent / source_name, target / target_name)
     except BaseException:
@@ -59,12 +96,27 @@ def main():
         type=Path,
         help="Explicit destination HERMES_HOME (use a disposable development home)",
     )
-    parser.add_argument(
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
         "--prepared",
         action="store_true",
         help="Install the separate opt-in ariadne-prepared development engine",
     )
+    modes.add_argument(
+        "--rolling",
+        action="store_true",
+        help="Install the separate opt-in general plugin for ariadne-rolling (in_process only)",
+    )
     args = parser.parse_args()
+    if args.rolling:
+        target = install(args.home.expanduser().resolve(), rolling=True)
+        print(
+            f"Installed {target}; configuration unchanged. "
+            "Explicitly run hermes plugins enable ariadne-rolling-plugin and select "
+            "context.engine=ariadne-rolling in the same development home; "
+            "requires plugins.isolation=in_process."
+        )
+        return
     target = install(args.home.expanduser().resolve(), prepared=args.prepared)
     print(
         f"Installed {target}; configuration unchanged. "

@@ -7,9 +7,12 @@ new harness, frontend, or Hermes fork. No Hermes core patches are required.
 **Do not enable this milestone on an important/live profile.** Ordinary `ariadne`
 is passive. The separate opt-in [`ariadne-prepared`](docs/prepared-context.md)
 engine can select an operator-prepared frozen prefix and expose bounded find/zoom
-tools. Neither automatically compacts growing chats. Both displace the built-in
-compressor; long chats or selection fallback can hit provider limits. This is not
-yet a production long-horizon memory engine.
+tools. Neither of those modes automatically compacts growing chats. A third,
+separate opt-in [`ariadne-rolling`](docs/rolling-context.md) development mode adds
+automatic rolling preparation through Hermes's LLM facade. Its packaging and pure
+contracts are tested; installed-host rolling proof follows separately. All three
+displace the built-in compressor; long chats or selection fallback can hit
+provider limits. This is not yet a production long-horizon memory engine.
 
 ## Passive engine (`ariadne`)
 
@@ -48,7 +51,8 @@ Repository conventions draw on Hermes Agent, T3 Code and hermes-lcm; the pinned
 references and deliberate differences are recorded in
 [repository-conventions.md](docs/repository-conventions.md). UniiChat remains the
 memory-algorithm reference; the offline pure tree/view port is attributed in
-[NOTICE](NOTICE). Only the opt-in prepared runtime uses it.
+[NOTICE](NOTICE). The prepared runtime uses that tree; rolling uses a separate
+bounded flat navigation view and shared validation/archive primitives.
 
 ## Installation (isolated home first)
 
@@ -96,7 +100,8 @@ uv pip install --python /path/to/disposable/venv/bin/python dist/hermes_ariadne-
 ```
 
 Restart only the **development** Hermes process after installation/configuration.
-A general `plugins.enabled` entry is not needed. The tool must be allowed by the
+A general `plugins.enabled` entry is not needed for the passive directory mode
+described here (rolling has separate enablement; see its guide). The tool must be allowed by the
 platform's enabled toolsets: if you use an explicit list, retain all your desired
 existing toolsets and include `context_engine`. An empty list intentionally
 exposes no engine tools. `skip_memory` does not disable this ContextEngine.

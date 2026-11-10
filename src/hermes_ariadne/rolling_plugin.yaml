@@ -1,0 +1,34 @@
+{
+  "manifest_version": 2,
+  "name": "ariadne-rolling-plugin",
+  "version": "0.1.0",
+  "description": "Experimental opt-in automatic rolling context preparation; in_process only",
+  "author": "Whayn",
+  "license": "Apache-2.0",
+  "kind": "standalone",
+  "requires_env": [],
+  "provides_tools": [],
+  "provides_hooks": [],
+  "config_schema": {
+    "rolling": {
+      "type": "dict",
+      "description": "RollingSettings limits; unknown keys or invalid integers refuse registration. Logical jobs/bytes are not HTTP or billing caps.",
+      "default": {
+        "max_logical_jobs": 64,
+        "max_request_bytes": 65536,
+        "max_total_request_bytes": 2097152,
+        "max_readable_delta_bytes": 32768,
+        "max_delta_exchanges": 4,
+        "trigger_bytes": 4096,
+        "max_summary_bytes": 4096,
+        "max_navigation_bytes": 8192,
+        "max_candidate_bytes": 65536,
+        "reserve_tokens": 4096,
+        "max_prefix_events": 100000,
+        "max_checkpoint_bytes": 16777216,
+        "max_tokens": 2048,
+        "timeout": 60
+      }
+    }
+  }
+}
