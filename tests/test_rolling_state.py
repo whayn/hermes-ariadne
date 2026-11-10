@@ -516,3 +516,170 @@ def test_restart_charges_uncertainty_even_when_sources_disappear(tmp_path, monke
     with sqlite3.connect(path) as conn:
         assert conn.execute("SELECT state FROM jobs").fetchone()[0] == "uncertain"
         assert conn.execute("SELECT logical_reservations FROM campaign").fetchone()[0] == 1
+
+
+def test_charging_callback_identity_and_counters_commit_or_rollback_together(tmp_path):
+    store, settings = setup(tmp_path)
+    with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
+        frozen = target(store, settings, 1)
+        journal.freeze_target(frozen)
+
+        def after_updates():
+            if journal._conn.execute("SELECT state FROM jobs").fetchone()[0] == "reserved":
+                raise ValueError("revoked before commit")
+
+        with pytest.raises(ValueError, match="revoked"):
+            journal.reserve(
+                frozen.job_id,
+                frozen.request_bytes,
+                after_updates,
+                after_updates,
+                charging_callback_id="actual-C",
+            )
+        assert journal.inspect(frozen.job_id)["state"] == "planned"
+        assert journal.inspect(frozen.job_id)["charging_callback_id"] is None
+        assert journal.charged_callback_ids() == set()
+        assert (
+            journal.report()["logical_reservations"]
+            == journal.report()["cumulative_request_bytes"]
+            == 0
+        )
+        assert journal.reserve(
+            frozen.job_id,
+            frozen.request_bytes,
+            lambda: None,
+            lambda: None,
+            charging_callback_id="actual-C",
+        )
+        assert journal.inspect(frozen.job_id)["charging_callback_id"] == "actual-C"
+    for _ in range(2):
+        with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
+            assert journal.charged_callback_ids() == {"actual-C"}
+            assert journal.inspect(frozen.job_id)["state"] == "uncertain"
+            assert journal.report()["logical_reservations"] == 1
+            assert journal.report()["cumulative_request_bytes"] == len(frozen.request_bytes)
+
+
+def test_callback_dedup_covers_all_charged_jobs_not_only_latest(tmp_path):
+    store, settings = setup(tmp_path)
+    with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
+        parent = None
+        for count, callback in [(1, "C"), (2, "D")]:
+            frozen = target(store, settings, count, parent)
+            journal.freeze_target(frozen)
+            assert journal.reserve(
+                frozen.job_id,
+                frozen.request_bytes,
+                lambda: None,
+                lambda: None,
+                charging_callback_id=callback,
+            )
+            journal.record_ready(
+                frozen.job_id, "summary", {"provider": "test", "model": "test"}, None
+            )
+            parent = journal.publish_ready(
+                frozen.job_id, rolling.generation_bytes(frozen, "summary", sequence=count)
+            )
+        third = target(store, settings, 3, parent)
+        journal.freeze_target(third)
+        before = journal.report()
+        for callback in ("C", "D"):
+            assert not journal.reserve(
+                third.job_id,
+                third.request_bytes,
+                lambda: None,
+                lambda: None,
+                charging_callback_id=callback,
+            )
+        assert journal.report() == before
+        assert journal.inspect(third.job_id)["state"] == "planned"
+    with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
+        assert journal.charged_callback_ids() == {"C", "D"}
+        assert not journal.reserve(
+            third.job_id, third.request_bytes, lambda: None, lambda: None, charging_callback_id="C"
+        )
+        assert journal.report()["logical_reservations"] == 2
+        assert journal.reserve(
+            third.job_id, third.request_bytes, lambda: None, lambda: None, charging_callback_id="E"
+        )
+        journal.record_failed_or_uncertain(third.job_id, "invalid_output")
+    with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
+        assert journal.charged_callback_ids() == {"C", "D", "E"}
+        assert journal.report()["logical_reservations"] == 3
+
+
+@pytest.mark.parametrize("callback", ["", False, 123, "x" * 4097, "é" * 2049])
+def test_callback_identity_must_be_bounded_before_reservation(tmp_path, callback):
+    store, settings = setup(tmp_path)
+    with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
+        frozen = target(store, settings, 1)
+        journal.freeze_target(frozen)
+        with pytest.raises(ValueError):
+            journal.reserve(
+                frozen.job_id,
+                frozen.request_bytes,
+                lambda: None,
+                lambda: None,
+                charging_callback_id=callback,
+            )
+        assert journal.report()["logical_reservations"] == 0
+        assert journal.charged_callback_ids() == set()
+
+
+def test_unidentified_legacy_style_charge_cannot_authorize_new_callback_spending(tmp_path):
+    store, settings = setup(tmp_path)
+    with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
+        frozen = target(store, settings, 1)
+        ready(journal, frozen)  # Original S1 signature remains valid; identity is honestly unknown.
+        parent = journal.publish_ready(
+            frozen.job_id, rolling.generation_bytes(frozen, "summary", sequence=1)
+        )
+        second = target(store, settings, 2, parent)
+        journal.freeze_target(second)
+        path = journal.path
+    with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
+        assert journal.charged_callback_ids() == set()
+        with pytest.raises(ValueError, match="unknown charging callback"):
+            journal.reserve(
+                second.job_id,
+                second.request_bytes,
+                lambda: None,
+                lambda: None,
+                charging_callback_id="C",
+            )
+        assert journal.inspect(frozen.job_id)["charging_callback_id"] is None
+        assert journal.inspect(second.job_id)["state"] == "planned"
+        assert journal.report()["logical_reservations"] == 1
+        assert journal.path == path
+
+
+def test_v1_journal_is_rejected_without_migration_reset_or_invented_callback(tmp_path):
+    import sqlite3
+
+    store, settings = setup(tmp_path)
+    with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
+        frozen = target(store, settings, 1)
+        journal.freeze_target(frozen)
+        journal.reserve(frozen.job_id, frozen.request_bytes, lambda: None, lambda: None)
+        path = journal.path
+    with sqlite3.connect(path) as conn:
+        # Downgrade the owned synthetic DB to the exact original S1 schema.
+        conn.execute("ALTER TABLE jobs RENAME TO newer_jobs")
+        conn.execute("""CREATE TABLE jobs (
+            job_id TEXT PRIMARY KEY, target_id TEXT NOT NULL UNIQUE REFERENCES targets(target_id),
+            state TEXT NOT NULL, reserved_request_bytes INTEGER NOT NULL,
+            validated_text TEXT, text_sha256 TEXT, attribution BLOB, usage_observed BLOB,
+            error_code TEXT, generation_id TEXT
+        )""")
+        columns = "job_id,target_id,state,reserved_request_bytes,validated_text,text_sha256,attribution,usage_observed,error_code,generation_id"
+        conn.execute(f"INSERT INTO jobs ({columns}) SELECT {columns} FROM newer_jobs")
+        conn.execute("DROP TABLE newer_jobs")
+        conn.execute("PRAGMA user_version=1")
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="unsupported rolling journal schema"):
+        rolling_state.RollingJournal(tmp_path, "s", settings, store=store)
+    assert path.read_bytes() == before
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT state FROM jobs").fetchone()[0] == "reserved"
+        assert conn.execute("SELECT logical_reservations FROM campaign").fetchone()[0] == 1
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1

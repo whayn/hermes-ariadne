@@ -33,6 +33,7 @@ from .rolling import (
 )
 
 APPLICATION_ID = 0x4152524C
+SCHEMA_VERSION = 2  # v1 has no actual charging-callback identity: reject, never infer it.
 SCHEMA = (
     """CREATE TABLE campaign (
         id INTEGER PRIMARY KEY CHECK(id=1), session_id TEXT NOT NULL,
@@ -48,7 +49,7 @@ SCHEMA = (
         job_id TEXT PRIMARY KEY, target_id TEXT NOT NULL UNIQUE REFERENCES targets(target_id),
         state TEXT NOT NULL, reserved_request_bytes INTEGER NOT NULL,
         validated_text TEXT, text_sha256 TEXT, attribution BLOB, usage_observed BLOB,
-        error_code TEXT, generation_id TEXT
+        error_code TEXT, generation_id TEXT, charging_callback_id TEXT UNIQUE
     )""",
 )
 
@@ -174,7 +175,7 @@ class RollingJournal:
                     for sql in SCHEMA:
                         self._conn.execute(sql)
                     self._conn.execute(f"PRAGMA application_id={APPLICATION_ID}")
-                    self._conn.execute("PRAGMA user_version=1")
+                    self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                     self._conn.execute(
                         "INSERT INTO campaign VALUES(1,?,?,1,0,0,NULL,NULL,NULL)",
                         (session_id, settings.digest),
@@ -243,7 +244,7 @@ class RollingJournal:
     def _validate_schema(self):
         if (
             self._conn.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID
-            or self._conn.execute("PRAGMA user_version").fetchone()[0] != 1
+            or self._conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
         ):
             raise ValueError("unsupported rolling journal schema")
         reference = sqlite3.connect(":memory:")
@@ -280,6 +281,27 @@ class RollingJournal:
         with self._operation():
             return self._campaign()
 
+    def charged_callback_ids(self):
+        """All known actual charging IDs; NULL legacy-style IDs remain unknown.
+
+        Explicit-ID reservations refuse unknown historical charges. The original
+        S1 reserve signature and ready-result recovery still work without guessing.
+        """
+        with self._operation():
+            count = self._conn.execute("SELECT count(*) FROM jobs").fetchone()[0]
+            if count > self.settings.max_logical_jobs:
+                raise ValueError("journal job count exceeds campaign bound")
+            result = set()
+            for row in self._conn.execute("SELECT job_id FROM jobs").fetchall():
+                job, _ = self._job(row[0])
+                callback = job["charging_callback_id"]
+                if callback is not None:
+                    bounded_text(callback, 4096)
+                    if job["state"] == "planned" or callback in result:
+                        raise ValueError("invalid charging callback identity")
+                    result.add(callback)
+            return result
+
     def _target(self, target_id):
         require_digest(target_id)
         row = self._conn.execute(
@@ -306,14 +328,15 @@ class RollingJournal:
         require_digest(job_id)
         lengths = self._conn.execute(
             "SELECT length(target_id),length(CAST(validated_text AS BLOB)),length(text_sha256),"
-            "length(attribution),length(usage_observed),length(error_code),length(generation_id),length(state) "
+            "length(attribution),length(usage_observed),length(error_code),length(generation_id),length(state),"
+            "length(CAST(charging_callback_id AS BLOB)) "
             "FROM jobs WHERE job_id=?",
             (job_id,),
         ).fetchone()
         if lengths is None:
             raise ValueError("job must be frozen first")
         for size, cap in zip(
-            lengths, (64, self.settings.max_summary_bytes, 64, 8192, 8192, 64, 64, 16)
+            lengths, (64, self.settings.max_summary_bytes, 64, 8192, 8192, 64, 64, 16, 4096)
         ):
             if size is not None and size > cap:
                 raise ValueError("job field exceeds read bound")
@@ -429,15 +452,19 @@ class RollingJournal:
                 (target.target_id, payload, sha256(payload)),
             )
             self._conn.execute(
-                "INSERT INTO jobs VALUES(?,?,'planned',0,NULL,NULL,NULL,NULL,NULL,NULL)",
+                "INSERT INTO jobs VALUES(?,?,'planned',0,NULL,NULL,NULL,NULL,NULL,NULL,NULL)",
                 (target.job_id, target.target_id),
             )
             self._check()
             return target
 
-    def reserve(self, job_id, request_bytes, attachment_guard, route_guard):
+    def reserve(
+        self, job_id, request_bytes, attachment_guard, route_guard, *, charging_callback_id=None
+    ):
         if not callable(attachment_guard) or not callable(route_guard):
             raise ValueError("live capture guards required")
+        if charging_callback_id is not None:
+            bounded_text(charging_callback_id, 4096)
         with self._operation(), self._transaction():
             self._check(attachment_guard, route_guard)
             job, target = self._job(job_id)
@@ -447,6 +474,15 @@ class RollingJournal:
                 return False  # duplicate callback never receives invocation permission
             if job["state"] != "planned":
                 raise ValueError("failed or uncertain target cannot retry")
+            if charging_callback_id is not None:
+                if self._conn.execute(
+                    "SELECT 1 FROM jobs WHERE state!='planned' AND charging_callback_id IS NULL"
+                ).fetchone():
+                    raise ValueError("unknown charging callback in historical reservation")
+                if self._conn.execute(
+                    "SELECT 1 FROM jobs WHERE charging_callback_id=?", (charging_callback_id,)
+                ).fetchone():
+                    return False
             self._validate_target(target)
             self._check(attachment_guard, route_guard)
             campaign = self._campaign()
@@ -460,8 +496,8 @@ class RollingJournal:
             ):
                 raise ValueError("rolling logical budget exhausted")
             self._conn.execute(
-                "UPDATE jobs SET state='reserved',reserved_request_bytes=? WHERE job_id=?",
-                (size, job_id),
+                "UPDATE jobs SET state='reserved',reserved_request_bytes=?,charging_callback_id=? WHERE job_id=?",
+                (size, charging_callback_id, job_id),
             )
             self._conn.execute(
                 "UPDATE targets SET status='reserved' WHERE target_id=?", (target.target_id,)
@@ -681,6 +717,11 @@ class RollingJournal:
                 raise ValueError("target/job state mismatch")
             pending += state != "published"
             charged = state != "planned"
+            callback = job["charging_callback_id"]
+            if callback is not None:
+                bounded_text(callback, 4096)
+                if not charged:
+                    raise ValueError("uncharged callback identity")
             expected = len(target.request_bytes) if charged else 0
             if (
                 type(job["reserved_request_bytes"]) is not int
