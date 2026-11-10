@@ -1,9 +1,9 @@
-"""Opt-in rolling representation: pure policy, not a scheduler or selector.
+"""Opt-in rolling representation, validated views and completed-turn coverage.
 
 Only derived compactor text omits supported replay state. Canonical source rows
-are never rewritten. Full canonical/restored/assembled correspondence remains a
-separate mandatory gate for the future engine (Slice 2); canonical admission here
-is not proof that a host callback was completely persisted.
+are never rewritten. Completion validates the real canonical/restored transcript,
+not assembled API messages; selection separately checks all three real views in
+rolling_selection. Neither module schedules work or changes the host runtime.
 """
 
 import hashlib
@@ -657,3 +657,94 @@ def validate_generation(
     if _validated is not None:
         _validated.append(view)
     return view
+
+
+def revalidate_view(
+    view, store, session_id, settings, *, policy=None, parent_loader=None, guard=None
+):
+    """Recheck exact immutable bytes, all source dependencies and parent lineage.
+
+    Never trust a dataclass's exposed fields instead of its validated snapshot.
+    Scope/settings are supplied by the caller, not by model-controlled arguments.
+    """
+    if type(view) is not RollingView:
+        raise ValueError("trusted rolling view required")
+    checked = validate_generation(
+        view.snapshot_bytes,
+        store,
+        session_id,
+        settings,
+        policy=policy,
+        parent_loader=parent_loader,
+        guard=guard,
+    )
+    if checked != view:
+        raise ValueError("rolling view differs from its exact snapshot")
+    return checked
+
+
+@dataclass(frozen=True)
+class Coverage:
+    """Full canonical/restored coverage only; no callback-success/dispatch proof."""
+
+    event_ids: tuple[str, ...]
+    message_uids: tuple[str, ...]
+    final_assistant_uid: str
+    completed_exchanges: int
+
+
+def completed_exchange_starts(payloads, *, allow_current=False):
+    """Require a final assistant before EVERY next user boundary.
+
+    Tool-result completeness alone is not completed-response coverage. Inputs
+    must already have passed the shared payload and tool occurrence validators.
+    """
+    starts = [i for i, message in enumerate(payloads) if message["role"] == "user"]
+    if not starts or starts[0] != 0:
+        raise ValueError("history must start with a user exchange")
+    ends = starts[1:] + ([] if allow_current else [len(payloads)])
+    for end in ends:
+        final = payloads[end - 1]
+        if final["role"] != "assistant" or final.get("tool_calls"):
+            raise ValueError("completed exchange requires a final assistant")
+    return tuple(starts)
+
+
+def validate_completed_turn(active_rows, observed_messages, *, reasoning_policy, settings=None):
+    """Compare the COMPLETE real callback transcript against ALL active rows.
+
+    The native completion caller clones raw conversation messages, not assembled
+    API messages (conversation_loop._notify_context_engine_turn_complete). There
+    is deliberately no synthetic assembled argument here. The engine must still
+    gate success metadata, session scope and archive resolution independently.
+    """
+    from .prepared import _exact_occurrences, _exact_payloads, _reasoning_permissions
+
+    settings = settings or RollingSettings()
+    if (
+        type(active_rows) is not list
+        or type(observed_messages) is not list
+        or not active_rows
+        or len(active_rows) != len(observed_messages)
+        or any(type(m) is not dict for m in observed_messages)
+    ):
+        raise ValueError("full completed canonical/observed coverage required")
+    events, uids, _ = _canonical_rows(active_rows, policy=reasoning_policy, settings=settings)
+    if tuple(_uids(observed_messages)) != uids:
+        raise ValueError("completed observation UID coverage mismatch")
+    for message in observed_messages:
+        _require_supported_data_use(message)
+        _reasoning_resource_preflight(message)
+        encode_json(message, settings.max_checkpoint_bytes)
+    policies = _reasoning_permissions(
+        observed_messages,
+        active_rows,
+        None,
+        0,
+        reasoning_policy,
+        retirement_policy=POLICY_ID,
+    )
+    payloads = _exact_payloads(observed_messages, active_rows, policies)
+    _exact_occurrences(observed_messages, active_rows, policies)
+    starts = completed_exchange_starts(payloads)
+    return Coverage(events, uids, uids[-1], len(starts))
