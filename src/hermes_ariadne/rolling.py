@@ -379,14 +379,18 @@ class Target:
             or len(self.request_bytes) > settings.max_request_bytes
         ):
             raise ValueError("target exceeds input bound")
+        for key in ("event_ids", "message_uids", "route_labels"):
+            if len(getattr(self, key)) > settings.max_prefix_events:
+                raise ValueError("target exceeds sequence bound")
+        return self._canonical_bytes(settings.max_checkpoint_bytes)
+
+    def _canonical_bytes(self, limit):
         data = {field.name: getattr(self, field.name) for field in fields(self)}
         for key in ("event_ids", "message_uids", "route_labels"):
-            if len(data[key]) > settings.max_prefix_events:
-                raise ValueError("target exceeds sequence bound")
             data[key] = list(data[key])
         for key in ("readable_input", "request_bytes"):
             data[key] = data[key].decode("utf-8")
-        return encode_json(data, settings.max_checkpoint_bytes)
+        return encode_json(data, limit)
 
     @classmethod
     def from_bytes(cls, data, settings):
@@ -420,7 +424,10 @@ class Target:
 
     @property
     def target_id(self):
-        return sha256(self.to_bytes(RollingSettings()))
+        # Identity is the canonical serialization only. Campaign bounds were
+        # enforced when the target was admitted (create/freeze/from_bytes);
+        # reapplying default bounds here rejected legitimately configured targets.
+        return sha256(self._canonical_bytes(2**31 - 1))
 
     @property
     def job_id(self):
