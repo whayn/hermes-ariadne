@@ -150,9 +150,15 @@ registration; values are not silently coerced/defaulted. Absent fields use:
 
 Every limit must be an explicit integer from 1 through 2147483647 (not a bool,
 string, float or null). These are development defaults, not recommended daily-use
-or billing settings. `max_logical_jobs` counts durable logical reservations and
-request byte limits count serialized facade work, including cumulative charged
-work across advances/restart. **They are not physical HTTP attempt/cost caps.**
+or billing settings. `trigger_bytes` is the serialized UTF-8 length of one virtual
+canonical JSON array containing the readable_delta descriptors for newly aged,
+contiguous completed exchanges after the published frontier (excluding parent summary,
+prompt wrappers, previously summarized events, opaque replay values, and the newest
+completed exchange). This prefix-accumulation threshold is distinct from the per-job
+bounds: once triggered, preparation selects the earliest contiguous delta admitted by
+`max_delta_exchanges` and byte limits. `max_logical_jobs` counts durable logical
+reservations and request byte limits count serialized facade work, including cumulative
+charged work across advances/restart. **They are not physical HTTP attempt/cost caps.**
 Hermes may retry or fall back internally within one facade call. Observed usage
 is bounded, allowlisted metadata, not verified billing; missing usage is unknown,
 not measured zero. Interrupted reservations stay charged/uncertain, not free retries.

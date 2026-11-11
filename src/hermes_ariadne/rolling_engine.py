@@ -347,10 +347,42 @@ class RollingAriadneEngine(AriadneEngine):
             if self._current(scope):
                 self._rolling = {**self._rolling, "status": "unavailable"}
 
+    def _count_trigger_bytes(self, scope, active, start, stops) -> int:
+        if not stops:
+            return 0
+        total = 2
+        first = True
+        for i, stop in enumerate(stops):
+            lo = start if i == 0 else stops[i - 1]
+            if stop > self._settings.max_prefix_events:
+                raise ValueError("exceeded max_prefix_events")
+            if scope is not None:
+                self._guard(scope)
+            delta = readable_delta(
+                active[lo:stop],
+                policy=scope.policy if scope else None,
+                settings=self._settings,
+            )
+            if len(delta) > 2:
+                if not first:
+                    total += 1
+                total += len(delta) - 2
+                first = False
+            if total >= self._settings.trigger_bytes:
+                break
+        return 0 if first else total
+
     def _new_target(self, scope, active, parent, *, turn_id=None):
         starts = completed_exchange_starts(active)
         start = parent.frontier_count if parent else 0
+        if start not in starts:
+            raise ValueError("parent frontier not on exchange boundary")
         stops = [n for n in starts[1:] if n > start]
+        if not stops:
+            return None
+        total = self._count_trigger_bytes(scope, active, start, stops)
+        if total < self._settings.trigger_bytes:
+            return None
         best = None
         for stop in stops[: self._settings.max_delta_exchanges]:
             try:
@@ -393,9 +425,7 @@ class RollingAriadneEngine(AriadneEngine):
                 best = target
             except ValueError:
                 break  # Earliest contiguous bounded delta, never skip an exchange.
-        if best and len(best.readable_input) >= self._settings.trigger_bytes:
-            return best
-        return None
+        return best
 
     def on_turn_complete(self, messages, usage=None, **kwargs):
         turn_id = kwargs.get("turn_id")
