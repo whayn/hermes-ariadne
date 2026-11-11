@@ -446,6 +446,16 @@ class RollingJournal:
             if target.parent_generation is None
             else self._view(self._parent_bytes(target.parent_generation))
         )
+        # The journal-cross-checked parent was fully validated in this operation, so
+        # only the delta needs reading and canonicalizing. The prefix state is
+        # trusted only when it is tied to that exact view object; else rebuild in full.
+        recorded = (
+            None
+            if parent is None or self._memo is None
+            else self._memo.prefix_states.get(parent.generation_id)
+        )
+        if recorded is not None and recorded[0] is parent:
+            return self._validate_extension(target, parent, recorded[1])
         source = []
         for event in target.event_ids:
             require_digest(event)
@@ -462,6 +472,39 @@ class RollingJournal:
             settings=self.settings,
             policy=self.policy,
             parent=parent,
+            request_bytes=target.request_bytes,
+            route_labels=target.route_labels,
+        )
+        if rebuilt != target:
+            raise ValueError("frozen target source or identity mismatch")
+        return target
+
+    def _validate_extension(self, target, parent, prefix):
+        """Same verdict as the full rebuild, reading only ``target``'s own delta rows."""
+        # The parent's session/settings digest were checked by _create_extension and
+        # the memo is always set on this path (_validate_target only gets here with a
+        # recorded prefix state). The explicit event/uid prefix checks stay: they reject
+        # a target that does not extend the parent before any archive row is read.
+        assert self._memo is not None
+        start = parent.frontier_count
+        if (
+            target.event_ids[:start] != parent.event_ids
+            or target.message_uids[:start] != parent.message_uids
+        ):
+            raise ValueError("target is not a parent prefix extension")
+        source = []
+        for event in target.event_ids[start:]:
+            require_digest(event)
+            self._check()
+            source.append(self._memo.get_event(event))
+            self._check()
+        rebuilt = Target._create_extension(
+            source,
+            session_id=self.session_id,
+            settings=self.settings,
+            policy=self.policy,
+            parent=parent,
+            prefix=prefix,
             request_bytes=target.request_bytes,
             route_labels=target.route_labels,
         )

@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass, fields
 from .prepared import (
     ReasoningReplayPolicy,
     _comparison_payloads,
+    _identity_value,
     _occurrences,
     _reasoning_resource_preflight,
     _require_reasoning_policy,
@@ -231,6 +232,76 @@ def _canonical_rows(rows, *, policy, settings):
     return tuple(event_ids), tuple(row["message_uid"] for row in rows), payloads
 
 
+@dataclass(frozen=True)
+class _PrefixState:
+    """Cross-row identity state of a validated completed-exchange prefix.
+
+    A valid prefix ends at a completed exchange (last row an assistant without
+    tool calls), so no tool call is pending and the next row must be a user row:
+    the ONLY cross-row facts a following delta can violate are uniqueness of
+    message uids, retained reasoning item ids and tool-call occurrence uids, and
+    the total length bound. Everything else ``_canonical_rows`` checks is per row
+    or per exchange. The values come from the audited functions' own outputs
+    (``_canonical_rows`` uids/payloads, ``_identity_value`` of validated rows).
+
+    Precondition: every link of the chain this state summarizes was canonicalized
+    with the SAME reasoning policy object and settings digest as the delta it is
+    extended with. ``_ValidationMemo`` is scoped to one policy object and callers
+    pass one ``RollingSettings`` (a generation's header must carry its digest), so
+    a state is never extended under a different policy or limit.
+
+    Memory: the id sets are O(G*N) in total when every generation of a chain keeps
+    its own state (G generations, N rows each), bounded by ``max_logical_jobs`` x
+    ``max_prefix_events`` and held only for one operation's memo.
+    """
+
+    length: int
+    message_uids: frozenset
+    reasoning_ids: frozenset
+    occurrence_uids: frozenset
+
+
+_EMPTY_PREFIX = _PrefixState(0, frozenset(), frozenset(), frozenset())
+
+
+def _extend_prefix(prefix, rows, uids, payloads, settings):
+    """State of ``prefix`` plus ``rows`` (already ``_canonical_rows``-valid).
+
+    ``prefix`` is the state of the validated parent prefix (``_EMPTY_PREFIX`` for
+    a root). Rejects a total length over the bound and any identity the delta
+    shares with the prefix, exactly where ``_canonical_rows`` of the whole prefix
+    would. The disjointness checks are defence in depth where another layer
+    already rejects: a repeated message uid is pre-empted by the generation
+    header's duplicate-source check, but a state must not rely on its caller.
+    """
+    if prefix.length + len(rows) > settings.max_prefix_events:
+        raise ValueError("nonempty bounded canonical rows required")
+    reasoning = []
+    for payload in payloads:
+        items = payload.get("codex_reasoning_items")
+        if items:
+            reasoning.extend(item["id"] for item in items)
+    occurrences = []
+    for row in rows:
+        mapping = _identity_value(row, "tool_call_uids")
+        if mapping is not None:
+            occurrences.extend(uid for uid in mapping.values() if uid is not None)
+    messages = frozenset(uids)
+    reasoning, occurrences = frozenset(reasoning), frozenset(occurrences)
+    if not prefix.message_uids.isdisjoint(messages):
+        raise ValueError("missing or duplicate logical identity")
+    if not prefix.reasoning_ids.isdisjoint(reasoning):
+        raise ValueError("duplicate retained reasoning identity")
+    if not prefix.occurrence_uids.isdisjoint(occurrences):
+        raise ValueError("occurrence identities must be unique")
+    return _PrefixState(
+        prefix.length + len(rows),
+        prefix.message_uids | messages,
+        prefix.reasoning_ids | reasoning,
+        prefix.occurrence_uids | occurrences,
+    )
+
+
 def readable_delta(
     canonical_rows: list[dict],
     *,
@@ -245,6 +316,11 @@ def readable_delta(
     """
     settings = settings or RollingSettings()
     events, _, payloads = _canonical_rows(canonical_rows, policy=policy, settings=settings)
+    return _render_delta(canonical_rows, events, payloads, settings)
+
+
+def _render_delta(canonical_rows, events, payloads, settings):
+    """Whitelist already-canonicalized delta rows (``events``/``payloads`` are theirs)."""
     if sum(row["role"] == "user" for row in canonical_rows) > settings.max_delta_exchanges:
         raise ValueError("too many delta exchanges")
     result = []
@@ -271,6 +347,31 @@ def _summary_input(parent_summary, delta, settings):
         },
         settings.max_request_bytes,
     )
+
+
+def _require_request_and_route(request_bytes, route_labels, *, settings, policy):
+    """Request/route admission shared by every Target constructor."""
+    request = decode_json(request_bytes, settings.max_request_bytes)
+    if (
+        type(request) is not list
+        or not request
+        or encode_json(request, settings.max_request_bytes) != request_bytes
+    ):
+        raise ValueError("request must be canonical facade-message JSON")
+    for message in request:
+        if (
+            type(message) is not dict
+            or set(message) != {"role", "content"}
+            or message["role"] not in {"system", "user", "assistant"}
+            or type(message["content"]) is not str
+        ):
+            raise ValueError("unsupported compactor request")
+    if type(route_labels) is not tuple or len(route_labels) != 2:
+        raise ValueError("bound route labels required")
+    for label in route_labels:
+        bounded_text(label, 1024)
+    if policy is not None and route_labels != (policy.issuer_kind, policy.issuer_model):
+        raise ValueError("frozen route differs from trusted reasoning binding")
 
 
 @dataclass(frozen=True)
@@ -337,39 +438,111 @@ class Target:
         if start >= len(events):
             raise ValueError("target must advance")
         delta = readable_delta(canonical_rows[start:], policy=policy, settings=settings)
-        request = decode_json(request_bytes, settings.max_request_bytes)
-        if (
-            type(request) is not list
-            or not request
-            or encode_json(request, settings.max_request_bytes) != request_bytes
-        ):
-            raise ValueError("request must be canonical facade-message JSON")
-        for message in request:
-            if (
-                type(message) is not dict
-                or set(message) != {"role", "content"}
-                or message["role"] not in {"system", "user", "assistant"}
-                or type(message["content"]) is not str
-            ):
-                raise ValueError("unsupported compactor request")
-        if type(route_labels) is not tuple or len(route_labels) != 2:
-            raise ValueError("bound route labels required")
-        for label in route_labels:
-            bounded_text(label, 1024)
-        if policy is not None and route_labels != (policy.issuer_kind, policy.issuer_model):
-            raise ValueError("frozen route differs from trusted reasoning binding")
+        return cls._assemble(
+            session_id=session_id,
+            settings=settings,
+            policy=policy,
+            parent=parent,
+            event_ids=events,
+            message_uids=uids,
+            delta_start=start,
+            delta=delta,
+            request_bytes=request_bytes,
+            route_labels=route_labels,
+        )
+
+    @classmethod
+    def _assemble(
+        cls,
+        *,
+        session_id,
+        settings,
+        policy,
+        parent,
+        event_ids,
+        message_uids,
+        delta_start,
+        delta,
+        request_bytes,
+        route_labels,
+    ):
+        """Request/route admission, then the Target; shared by every constructor.
+
+        ``delta`` is the already-rendered readable delta of the rows from
+        ``delta_start``. One place builds the Target so ``create`` and
+        ``_create_extension`` cannot drift apart field by field.
+        """
+        _require_request_and_route(request_bytes, route_labels, settings=settings, policy=policy)
         return cls(
-            session_id,
-            settings.digest,
-            None if parent is None else parent.generation_id,
-            None if parent is None else parent.summary_sha256,
-            events,
-            uids,
-            start,
-            len(events),
-            _summary_input(None if parent is None else parent.summary_text, delta, settings),
-            request_bytes,
-            route_labels,
+            session_id=session_id,
+            settings_digest=settings.digest,
+            parent_generation=None if parent is None else parent.generation_id,
+            parent_summary_sha256=None if parent is None else parent.summary_sha256,
+            event_ids=event_ids,
+            message_uids=message_uids,
+            delta_start=delta_start,
+            delta_stop=len(event_ids),
+            readable_input=_summary_input(
+                None if parent is None else parent.summary_text, delta, settings
+            ),
+            request_bytes=request_bytes,
+            route_labels=route_labels,
+        )
+
+    @classmethod
+    def _create_extension(
+        cls,
+        delta_rows,
+        *,
+        session_id,
+        settings,
+        policy,
+        parent,
+        prefix,
+        request_bytes,
+        route_labels,
+    ):
+        """``Target.create(parent's rows + delta_rows, parent=parent, ...)``, O(delta).
+
+        ``parent`` is a validated RollingView and ``prefix`` the ``_PrefixState`` its
+        validation produced (callers must tie both to the same validated object).
+        Only ``delta_rows`` are read and canonicalized; the parent's own rows were
+        verified when it was validated, and ``prefix`` carries every cross-row fact
+        the delta can violate (see ``_PrefixState``). Every other check, and the
+        resulting Target, is exactly ``create``'s. An empty ``delta_rows`` is
+        rejected as non-advancing.
+        """
+        bounded_text(session_id, 4096)
+        if any(
+            type(row) is not dict or row.get("session_id", session_id) != session_id
+            for row in delta_rows
+        ):
+            raise ValueError("foreign canonical session")
+        if parent.session_id != session_id or parent.settings_digest != settings.digest:
+            raise ValueError("target is not a parent prefix extension")
+        if not delta_rows:
+            raise ValueError("target must advance")
+        delta_events, delta_uids, payloads = _canonical_rows(
+            delta_rows, policy=policy, settings=settings
+        )
+        # Fail closed on a prefix state that is not the parent's (callers tie them).
+        if prefix.length != len(parent.event_ids):
+            raise ValueError("target is not a parent prefix extension")
+        _extend_prefix(prefix, delta_rows, delta_uids, payloads, settings)
+        delta = _render_delta(delta_rows, delta_events, payloads, settings)
+        prefix_events = parent.event_ids + delta_events
+        prefix_uids = parent.message_uids + delta_uids
+        return cls._assemble(
+            session_id=session_id,
+            settings=settings,
+            policy=policy,
+            parent=parent,
+            event_ids=prefix_events,
+            message_uids=prefix_uids,
+            delta_start=parent.frontier_count,
+            delta=delta,
+            request_bytes=request_bytes,
+            route_labels=route_labels,
         )
 
     def to_bytes(self, settings):
@@ -543,11 +716,17 @@ class _ValidationMemo:
     ``accepted`` holds views the journal itself already cross-checked (see
     RollingJournal._view); validate_generation only reads it. Keys are the SHA-256
     of the exact bytes just reread for this use, never a parent name.
+    ``prefix_states`` is written only by validate_generation after it fully
+    validated that view; an accepted entry is only short-circuited when it is
+    that very validated object.
     """
 
     def __init__(self, store, session_id, policy):
         self.store, self.session_id, self.policy = store, session_id, policy
         self.rows, self.accepted = {}, {}
+        # generation_id -> (view, _PrefixState) recorded only by a completed
+        # validation of that exact view object; see validate_generation.
+        self.prefix_states = {}
 
     def get_event(self, event_id):
         row = deepcopy(self.rows.get(event_id))
@@ -580,9 +759,15 @@ def validate_generation(
     journal must not pass it. Without one, a call-local memo dedupes archive row
     reads within this call only. An accepted hit returns a view already validated
     and journal-cross-checked in this operation, keyed by the sha256 of these exact
-    bytes (and re-checked against bytes, settings digest and the depth bound).
-    Archive rows are read once per memo; a memo is bound to this store, session
-    and policy object and is rejected otherwise.
+    bytes (and re-checked against bytes, settings digest and the depth bound); it
+    short-circuits only when ``prefix_states`` ties it to the very view object a
+    completed validation here produced, otherwise it is validated in full.
+    Validation is incremental: only this generation's own delta rows
+    (``events[delta_start:]``) are read and canonicalized; every earlier row was
+    verified by the generation that introduced it, whose validated prefix state
+    carries what a delta can collide with. Archive rows are read once per memo; a
+    memo is bound to this store, session and policy object and is rejected
+    otherwise.
     """
     if _depth >= settings.max_logical_jobs:
         raise ValueError("generation lineage exceeds campaign bound")
@@ -599,7 +784,11 @@ def validate_generation(
         # The accepted chain has ``sequence`` generations below this depth.
         if _depth + accepted.sequence > settings.max_logical_jobs:
             raise ValueError("generation lineage exceeds campaign bound")
-        return accepted
+        recorded = _memo.prefix_states.get(generation_id)
+        if recorded is not None and recorded[0] is accepted:
+            return accepted
+        # An accepted view this memo cannot tie to a validated prefix state (it
+        # was not produced here) is not trusted as a parent: validate it in full.
     keys = {f.name for f in fields(RollingView)} - {"snapshot_bytes", "generation_id"}
     headers = {"format", "version", "policy_id", "readable_projection_id", "prompt_version"}
     if type(value) is not dict or set(value) != keys | headers:
@@ -644,7 +833,7 @@ def validate_generation(
         raise ValueError("summary hash mismatch")
     if sha256(encode_json(events, settings.max_checkpoint_bytes)) != value["prefix_sha256"]:
         raise ValueError("prefix hash mismatch")
-    parent = None
+    parent, parent_state = None, _EMPTY_PREFIX
     if value["parent_generation"] is not None:
         require_digest(value["parent_generation"])
         require_digest(value["parent_summary_sha256"])
@@ -676,14 +865,26 @@ def validate_generation(
             or tuple(uids[: parent.frontier_count]) != parent.message_uids
         ):
             raise ValueError("generation parent lineage mismatch")
+        # Unreachable while the recursive call above is the only producer of
+        # ``parent`` (it records the state of exactly the view it returns); kept
+        # as a fail-closed guard so a future refactor cannot silently extend an
+        # empty or foreign prefix state.
+        recorded = _memo.prefix_states.get(parent.generation_id)
+        if recorded is None or recorded[0] is not parent:
+            raise ValueError("generation parent state unavailable")
+        parent_state = recorded[1]
     elif (
         value["parent_summary_sha256"] is not None
         or value["delta_start"] != 0
         or value["sequence"] != 1
     ):
         raise ValueError("invalid root generation")
+    # Only this generation's own delta is read and canonicalized: every earlier
+    # row was verified by the generation that introduced it (parent chain above),
+    # and the parent's prefix state carries everything a delta can collide with.
+    start = value["delta_start"]
     source = []
-    for event, uid in zip(events, uids):
+    for event, uid in zip(events[start:], uids[start:]):
         if guard:
             guard()
         row = _memo.get_event(event)
@@ -698,8 +899,13 @@ def validate_generation(
         if row.get("session_id", session_id) != session_id:
             raise ValueError("foreign generation source")
         source.append(row)
-    _canonical_rows(source, policy=policy, settings=settings)
-    delta = readable_delta(source[value["delta_start"] :], policy=policy, settings=settings)
+    delta_events, delta_uids, payloads = _canonical_rows(source, policy=policy, settings=settings)
+    state = _extend_prefix(parent_state, source, delta_uids, payloads, settings)
+    # Redundant by construction (each row's hash was re-verified above and the
+    # parent lineage fixed ``start``/length), re-asserted as defence in depth.
+    if len(events) != state.length or tuple(events[start:]) != delta_events:
+        raise ValueError("generation source unavailable or changed")
+    delta = _render_delta(source, delta_events, payloads, settings)
     if (
         sha256(_summary_input(None if parent is None else parent.summary_text, delta, settings))
         != value["summary_input_sha256"]
@@ -711,6 +917,7 @@ def validate_generation(
         del value[key]
     value["event_ids"], value["message_uids"] = tuple(events), tuple(uids)
     view = RollingView(snapshot_bytes, generation_id, **value)
+    _memo.prefix_states[generation_id] = (view, state)
     if _validated is not None:
         _validated.append(view)
     return view

@@ -265,13 +265,14 @@ def test_open_fully_validates_each_generation_at_most_once(tmp_path, monkeypatch
     with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
         # Opening reconciles in one operation, reaching every generation as a job parent,
         # as the manifest head and as an artifact; shared ancestors are validated once.
-        assert set(full) == {view.message_uids for view in views}
+        # Canonicalization is incremental: each generation checks only its own delta.
+        assert set(full) == {view.message_uids[view.delta_start :] for view in views}
         assert max(full.values()) == 1, dict(full)
         full.clear()
         # A later operation starts from nothing (no cross-operation state) but is
         # itself linear.
         assert journal.load_view() == views[-1]
-        assert set(full) == {view.message_uids for view in views}
+        assert set(full) == {view.message_uids[view.delta_start :] for view in views}
         assert max(full.values()) == 1, dict(full)
 
 
