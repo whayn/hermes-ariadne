@@ -169,6 +169,75 @@ def test_canonical_occurrence_and_order_mutants(mutation):
         tracer.assert_checkpoint(rows, expected)
 
 
+def test_actual_worker_registers_guard_as_live_audit_hook(tmp_path):
+    """The worker's own registration must block a real forbidden open() in a fresh process."""
+    import subprocess
+    import sys
+
+    worker = Path(tracer.__file__).parent / "fixtures" / "rolling_worker.py"
+    tree = ast.parse(worker.read_text())
+    names = [getattr(node, "name", None) for node in tree.body]
+    guard_index = names.index("credential_read_guard")
+    hooks = [
+        index
+        for index, node in enumerate(tree.body)
+        if isinstance(node, ast.Expr)
+        and ast.unparse(node) == "sys.addaudithook(credential_read_guard)"
+    ]
+    assert len(hooks) == 1 and hooks[0] > guard_index, "worker must register its guard"
+    third_party = {"httpx", "openai", "hermes_ariadne", "run_agent", "hermes_state", "agent"}
+
+    def imports_third_party(node):
+        if isinstance(node, ast.Import):
+            return any(alias.name.split(".")[0] in third_party for alias in node.names)
+        if isinstance(node, ast.ImportFrom):
+            return (node.module or "").split(".")[0] in third_party
+        return False
+
+    first_bootstrap = next(i for i, n in enumerate(tree.body) if imports_third_party(n))
+    assert hooks[0] < first_bootstrap, "guard must be live before any host/SDK import"
+    record = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and [t.id for t in node.targets if isinstance(t, ast.Name)] == ["credential_violations"]
+    ]
+    assert len(record) == 1, "worker must record guard violations at module level"
+    nodes = record + [tree.body[guard_index], tree.body[hooks[0]]]
+    home = tmp_path / "synthetic" / "isolated-home"
+    managed = tmp_path / "synthetic-managed"
+    home.mkdir(parents=True)
+    managed.mkdir()
+    target = tmp_path / "outside" / "auth.json"
+    target.parent.mkdir()
+    target.write_text("SYNTHETIC OUTSIDE SENTINEL")
+    script = "\n".join(
+        [
+            "import json, os, sys",
+            "from pathlib import Path",
+            f"home = Path({str(home)!r})",
+            f"managed = Path({str(managed)!r})",
+            ast.unparse(ast.Module(body=nodes, type_ignores=[])),
+            "blocked = False",
+            "try:",
+            f"    open({str(target)!r}).read()",
+            "except AssertionError:",
+            "    blocked = True",
+            "print(json.dumps({'blocked': blocked, 'violations': credential_violations}))",
+        ]
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={"PATH": os.environ.get("PATH", "")},
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"blocked": True, "violations": ["auth.json"]}
+    assert "SYNTHETIC OUTSIDE SENTINEL" not in result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("escape", ["outside", "symlink", "traversal"])
 def test_actual_worker_guard_is_purely_extracted_and_rejects_shared_reads(tmp_path, escape):
     worker = Path(tracer.__file__).parent / "fixtures" / "rolling_worker.py"

@@ -90,7 +90,8 @@ def select(engine, db, tag):
         request, conversation_messages=history, incoming_message=incoming, budget_tokens=100000
     )
     assert request == before
-    if result:
+    if result is not None:
+        assert result, "a usable selection must be a nonempty replacement request"
         assert result[:2] == request[:2]
         count = engine._pinned.frontier_count
         assert result[3:] == request[2 + count :]
@@ -610,6 +611,20 @@ def test_actual_completion_caller_clones_raw_messages_and_stop_reason(tmp_path, 
     db.rows = exchange("A") + exchange("B")
     messages = restored(db.rows)
     before = copy.deepcopy(messages)
+    received = []
+    on_turn_complete = engine.on_turn_complete
+
+    def mutating_callback(callback_messages, *args, **kwargs):
+        # Spy that damages whatever it receives: only a real host clone keeps
+        # the caller's transcript intact.
+        result = on_turn_complete(callback_messages, *args, **kwargs)
+        received.append(callback_messages)
+        for message in callback_messages:
+            message["content"] = "callback mutated"
+        callback_messages.append({"role": "user", "content": "callback appended"})
+        return result
+
+    monkeypatch.setattr(engine, "on_turn_complete", mutating_callback)
     namespace["_notify_context_engine_turn_complete"](
         SimpleNamespace(context_compressor=engine, session_id="s"),
         messages,
@@ -623,6 +638,7 @@ def test_actual_completion_caller_clones_raw_messages_and_stop_reason(tmp_path, 
         turn_exit_reason=reasons[0],
     )
     assert len(facade.calls) == 1 and messages == before
+    assert len(received) == 1 and received[0] is not messages
 
 
 def test_duplicate_turn_id_after_restart_cannot_charge_another_delta(tmp_path, monkeypatch):
