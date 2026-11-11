@@ -2,5 +2,5 @@
 # Update these deliberately and verify the Python 3.11/3.14 archive matrix.
 pytest==9.2.0
 build==1.6.1
-ruff==0.17.3
+ruff==0.17.4
 setuptools==84.2.1
