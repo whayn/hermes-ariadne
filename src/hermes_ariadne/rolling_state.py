@@ -164,22 +164,12 @@ class RollingJournal:
                 if companion.exists() and not existed:
                     raise ValueError("orphaned rolling journal companion")
             if not existed:
-                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-                os.close(fd)
+                self._initialize()
             self._conn = sqlite3.connect(self.path, timeout=0)
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.execute("PRAGMA synchronous=FULL")
             with self._transaction():
-                if not existed:
-                    for sql in SCHEMA:
-                        self._conn.execute(sql)
-                    self._conn.execute(f"PRAGMA application_id={APPLICATION_ID}")
-                    self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-                    self._conn.execute(
-                        "INSERT INTO campaign VALUES(1,?,?,1,0,0,NULL,NULL,NULL)",
-                        (session_id, settings.digest),
-                    )
                 self._validate_schema()
                 self._validate_records()
                 had_reserved = self._conn.execute(
@@ -240,6 +230,52 @@ class RollingJournal:
         except BaseException:
             self._conn.rollback()
             raise
+
+    def _initialize(self):
+        # Build and commit the complete schema under a private temporary name,
+        # then rename it into place under the exclusive writer lock. A process
+        # exit leaves either no journal (plus an orphaned temporary removed on
+        # the next open) or a complete one, so an empty or truncated journal is
+        # never a normal state and keeps failing closed.
+        fd, name = tempfile.mkstemp(prefix=".rolling-", dir=self.directory)
+        os.close(fd)
+        try:
+            conn = sqlite3.connect(name, timeout=0)
+            try:
+                conn.execute("PRAGMA synchronous=FULL")
+                with conn:
+                    for sql in SCHEMA:
+                        conn.execute(sql)
+                    conn.execute(f"PRAGMA application_id={APPLICATION_ID}")
+                    conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                    conn.execute(
+                        "INSERT INTO campaign VALUES(1,?,?,1,0,0,NULL,NULL,NULL)",
+                        (self.session_id, self.settings.digest),
+                    )
+            finally:
+                conn.close()
+            os.replace(name, self.path)
+            fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        finally:
+            for leftover in (name, name + "-journal"):
+                if os.path.exists(leftover):
+                    os.unlink(leftover)
+
+    def _remove_orphaned_temporaries(self):
+        # _atomic temporaries are only live while the exclusive writer lock is
+        # held; under that lock any remaining one is an interrupted write.
+        for directory in (self.directory, self.generations):
+            for item in directory.iterdir():
+                if not item.name.startswith(".rolling-"):
+                    continue
+                info = item.lstat()
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError("invalid rolling temporary artifact")
+                item.unlink()
 
     def _validate_schema(self):
         if (
@@ -676,6 +712,7 @@ class RollingJournal:
             # Charge interrupted reservations before callback-capable source reads.
             for row in self._conn.execute("SELECT job_id FROM jobs").fetchall():
                 self._validate_target(self._job(row[0])[1])
+            self._remove_orphaned_temporaries()
             view = self._load_view()
             for index, artifact in enumerate(self.generations.iterdir()):
                 if index >= self.settings.max_logical_jobs:
