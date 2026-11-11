@@ -171,6 +171,16 @@ full provider fit (tool schemas, output runway and provider overhead also matter
 A declined `select_context` returns `None`: Hermes can send the original request,
 which can overflow. This is **not a dispatch veto** or a universal size guarantee.
 
+**Known performance limit (#19).** Every request and every rolling navigation call
+reopens the session journal, and each open re-validates the full ancestry of every
+published generation against the archive. The cost grows cubically with the number
+of published generations: measured on a synthetic journal, about 0.5 s per open
+after 8 generations, 2.9 s after 16 and 18 s after 32. Long sessions, which rolling
+is meant for, are therefore not usable yet. This blocks activation for normal use.
+If a session exceeds `max_prefix_events` before the trigger threshold is reached,
+or the logical-job budget is exhausted, rolling status reports `unavailable` while
+any retained view keeps being served; the label is coarser than the cause.
+
 ## Durable state, rollback and evidence
 
 Rolling journal schema v2 retains work/charge lineage. Existing v1 journals fail
