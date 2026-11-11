@@ -120,7 +120,7 @@ class RollingJournal:
         self._conn = None
         self._lock_fd = None
         self._busy = False
-        self._memo = None
+        self._memo = _ValidationMemo(store, session_id, policy)
         self._check()
         root = Path(home).absolute()
         for item in (root, *root.parents):
@@ -191,6 +191,7 @@ class RollingJournal:
             raise
 
     def close(self):
+        self._memo = None
         if self._conn is not None:
             self._conn.close()
             self._conn = None
@@ -213,18 +214,24 @@ class RollingJournal:
 
     @contextmanager
     def _operation(self):
+        # Refuse nested entry before taking ownership: a caught reentry error must
+        # not clear the active caller's memo or busy flag. If it escapes, that
+        # caller's operation boundary performs the failure cleanup instead.
         if self._busy or self._conn is None:
             raise ValueError("rolling journal closed or reentrant operation")
         self._busy = True
         try:
-            # Fresh per operation and discarded below: archive/journal changes
-            # between operations must always be reread, never cached.
-            self._memo = _ValidationMemo(self.store, self.session_id, self.policy)
+            # One insert-only archive snapshot per open, never across requests.
+            if self._memo is None:
+                self._memo = _ValidationMemo(self.store, self.session_id, self.policy)
             self._check()
             yield
             self._check()
-        finally:
+        except BaseException:
+            # A failed operation must not leave partially accepted validation state.
             self._memo = None
+            raise
+        finally:
             self._busy = False
 
     @contextmanager
@@ -427,7 +434,9 @@ class RollingJournal:
                 != current.snapshot_bytes
             ):
                 raise ValueError("unjournaled or mismatching generation")
-            # Only now is it accepted for the rest of this operation.
+            # Only ready/published immutable results are accepted for this open.
+            # Supported writes can only move these ready -> published; reservation,
+            # failure, recovery, campaign and lifecycle checks remain fresh.
             if self._memo is not None:
                 self._memo.accepted[current.generation_id] = current
         return view
@@ -446,7 +455,7 @@ class RollingJournal:
             if target.parent_generation is None
             else self._view(self._parent_bytes(target.parent_generation))
         )
-        # The journal-cross-checked parent was fully validated in this operation, so
+        # The journal-cross-checked parent was fully validated in this open, so
         # only the delta needs reading and canonicalizing. The prefix state is
         # trusted only when it is tied to that exact view object; else rebuild in full.
         recorded = (
@@ -554,121 +563,124 @@ class RollingJournal:
     def reserve(
         self, job_id, request_bytes, attachment_guard, route_guard, *, charging_callback_id=None
     ):
-        if not callable(attachment_guard) or not callable(route_guard):
-            raise ValueError("live capture guards required")
-        if charging_callback_id is not None:
-            bounded_text(charging_callback_id, 4096)
-        with self._operation(), self._transaction():
-            self._check(attachment_guard, route_guard)
-            job, target = self._job(job_id)
-            if request_bytes != target.request_bytes:
-                raise ValueError("frozen request mismatch")
-            if job["state"] in {"reserved", "ready", "published"}:
-                return False  # duplicate callback never receives invocation permission
-            if job["state"] != "planned":
-                raise ValueError("failed or uncertain target cannot retry")
+        with self._operation():
+            if not callable(attachment_guard) or not callable(route_guard):
+                raise ValueError("live capture guards required")
             if charging_callback_id is not None:
-                if self._conn.execute(
-                    "SELECT 1 FROM jobs WHERE state!='planned' AND charging_callback_id IS NULL"
-                ).fetchone():
-                    raise ValueError("unknown charging callback in historical reservation")
-                if self._conn.execute(
-                    "SELECT 1 FROM jobs WHERE charging_callback_id=?", (charging_callback_id,)
-                ).fetchone():
-                    return False
-            self._validate_target(target)
-            self._check(attachment_guard, route_guard)
-            campaign = self._campaign()
-            size = len(request_bytes)
-            if (
-                campaign["blocked_reason"]
-                or size > self.settings.max_request_bytes
-                or campaign["logical_reservations"] >= self.settings.max_logical_jobs
-                or campaign["cumulative_request_bytes"] + size
-                > self.settings.max_total_request_bytes
-            ):
-                raise ValueError("rolling logical budget exhausted")
-            self._conn.execute(
-                "UPDATE jobs SET state='reserved',reserved_request_bytes=?,charging_callback_id=? WHERE job_id=?",
-                (size, charging_callback_id, job_id),
-            )
-            self._conn.execute(
-                "UPDATE targets SET status='reserved' WHERE target_id=?", (target.target_id,)
-            )
-            self._conn.execute(
-                "UPDATE campaign SET logical_reservations=logical_reservations+1,cumulative_request_bytes=cumulative_request_bytes+?",
-                (size,),
-            )
-            self._check(attachment_guard, route_guard)
+                bounded_text(charging_callback_id, 4096)
+            with self._transaction():
+                self._check(attachment_guard, route_guard)
+                job, target = self._job(job_id)
+                if request_bytes != target.request_bytes:
+                    raise ValueError("frozen request mismatch")
+                if job["state"] in {"reserved", "ready", "published"}:
+                    return False  # duplicate callback never receives invocation permission
+                if job["state"] != "planned":
+                    raise ValueError("failed or uncertain target cannot retry")
+                if charging_callback_id is not None:
+                    if self._conn.execute(
+                        "SELECT 1 FROM jobs WHERE state!='planned' AND charging_callback_id IS NULL"
+                    ).fetchone():
+                        raise ValueError("unknown charging callback in historical reservation")
+                    if self._conn.execute(
+                        "SELECT 1 FROM jobs WHERE charging_callback_id=?", (charging_callback_id,)
+                    ).fetchone():
+                        return False
+                self._validate_target(target)
+                self._check(attachment_guard, route_guard)
+                campaign = self._campaign()
+                size = len(request_bytes)
+                if (
+                    campaign["blocked_reason"]
+                    or size > self.settings.max_request_bytes
+                    or campaign["logical_reservations"] >= self.settings.max_logical_jobs
+                    or campaign["cumulative_request_bytes"] + size
+                    > self.settings.max_total_request_bytes
+                ):
+                    raise ValueError("rolling logical budget exhausted")
+                self._conn.execute(
+                    "UPDATE jobs SET state='reserved',reserved_request_bytes=?,charging_callback_id=? WHERE job_id=?",
+                    (size, charging_callback_id, job_id),
+                )
+                self._conn.execute(
+                    "UPDATE targets SET status='reserved' WHERE target_id=?", (target.target_id,)
+                )
+                self._conn.execute(
+                    "UPDATE campaign SET logical_reservations=logical_reservations+1,cumulative_request_bytes=cumulative_request_bytes+?",
+                    (size,),
+                )
+                self._check(attachment_guard, route_guard)
         return True
 
     def record_ready(self, job_id, validated_summary, attribution, observed_usage):
-        bounded_text(validated_summary, self.settings.max_summary_bytes)
-        if type(attribution) is not dict or set(attribution) != {"provider", "model"}:
-            raise ValueError("bounded result attribution required")
-        for label in attribution.values():
-            bounded_text(label, 1024)
-        attribution_bytes = encode_json(attribution, 8192)
-        usage = (
-            None
-            if observed_usage is None
-            else encode_json({"kind": "reported_or_defaulted", "value": observed_usage}, 8192)
-        )
-        with self._operation(), self._transaction():
-            job, target = self._job(job_id)
-            if job["state"] in {"ready", "published"}:
-                if (
-                    job["validated_text"] != validated_summary
-                    or job["attribution"] != attribution_bytes
-                    or job["usage_observed"] != usage
-                ):
-                    raise ValueError("immutable ready result mismatch")
-                return
-            if job["state"] != "reserved":
-                raise ValueError("ready requires a charged reservation")
-            self._conn.execute(
-                "UPDATE jobs SET state='ready',validated_text=?,text_sha256=?,attribution=?,usage_observed=? WHERE job_id=?",
-                (
-                    validated_summary,
-                    sha256(validated_summary.encode("utf-8")),
-                    attribution_bytes,
-                    usage,
-                    job_id,
-                ),
+        with self._operation():
+            bounded_text(validated_summary, self.settings.max_summary_bytes)
+            if type(attribution) is not dict or set(attribution) != {"provider", "model"}:
+                raise ValueError("bounded result attribution required")
+            for label in attribution.values():
+                bounded_text(label, 1024)
+            attribution_bytes = encode_json(attribution, 8192)
+            usage = (
+                None
+                if observed_usage is None
+                else encode_json({"kind": "reported_or_defaulted", "value": observed_usage}, 8192)
             )
-            self._conn.execute(
-                "UPDATE targets SET status='ready' WHERE target_id=?", (target.target_id,)
-            )
-            self._check()
+            with self._transaction():
+                job, target = self._job(job_id)
+                if job["state"] in {"ready", "published"}:
+                    if (
+                        job["validated_text"] != validated_summary
+                        or job["attribution"] != attribution_bytes
+                        or job["usage_observed"] != usage
+                    ):
+                        raise ValueError("immutable ready result mismatch")
+                    return
+                if job["state"] != "reserved":
+                    raise ValueError("ready requires a charged reservation")
+                self._conn.execute(
+                    "UPDATE jobs SET state='ready',validated_text=?,text_sha256=?,attribution=?,usage_observed=? WHERE job_id=?",
+                    (
+                        validated_summary,
+                        sha256(validated_summary.encode("utf-8")),
+                        attribution_bytes,
+                        usage,
+                        job_id,
+                    ),
+                )
+                self._conn.execute(
+                    "UPDATE targets SET status='ready' WHERE target_id=?", (target.target_id,)
+                )
+                self._check()
 
     def record_failed_or_uncertain(self, job_id, reason, *, uncertain=False):
-        if (
-            reason
-            not in {
-                "invalid_output",
-                "facade_error",
-                "capture_changed",
-                "source_changed",
-                "interrupted",
-                "restart_uncertain",
-            }
-            or type(uncertain) is not bool
-        ):
-            raise ValueError("unsupported safe failure code")
-        state = "uncertain" if uncertain else "failed"
-        with self._operation(), self._transaction():
-            job, target = self._job(job_id)
-            if job["state"] == state and job["error_code"] == reason:
-                return
-            if job["state"] != "reserved":
-                raise ValueError("failure requires a reserved job")
-            self._conn.execute(
-                "UPDATE jobs SET state=?,error_code=? WHERE job_id=?", (state, reason, job_id)
-            )
-            self._conn.execute(
-                "UPDATE targets SET status=? WHERE target_id=?", (state, target.target_id)
-            )
-            self._conn.execute("UPDATE campaign SET blocked_reason=?", (reason,))
+        with self._operation():
+            if (
+                reason
+                not in {
+                    "invalid_output",
+                    "facade_error",
+                    "capture_changed",
+                    "source_changed",
+                    "interrupted",
+                    "restart_uncertain",
+                }
+                or type(uncertain) is not bool
+            ):
+                raise ValueError("unsupported safe failure code")
+            state = "uncertain" if uncertain else "failed"
+            with self._transaction():
+                job, target = self._job(job_id)
+                if job["state"] == state and job["error_code"] == reason:
+                    return
+                if job["state"] != "reserved":
+                    raise ValueError("failure requires a reserved job")
+                self._conn.execute(
+                    "UPDATE jobs SET state=?,error_code=? WHERE job_id=?", (state, reason, job_id)
+                )
+                self._conn.execute(
+                    "UPDATE targets SET status=? WHERE target_id=?", (state, target.target_id)
+                )
+                self._conn.execute("UPDATE campaign SET blocked_reason=?", (reason,))
 
     def _manifest(self, view):
         return encode_json(

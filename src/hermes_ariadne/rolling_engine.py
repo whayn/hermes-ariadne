@@ -653,6 +653,7 @@ class RollingAriadneEngine(AriadneEngine):
                             retirement_policy=POLICY_ID,
                             reasoning_policy=scope.policy,
                             parent_loader=journal._parent_bytes,
+                            _journal=journal,
                             guard=lambda: self._guard(scope),
                         )
                         view = latest
@@ -682,6 +683,7 @@ class RollingAriadneEngine(AriadneEngine):
                     retirement_policy=POLICY_ID,
                     reasoning_policy=scope.policy,
                     parent_loader=journal._parent_bytes,
+                    _journal=journal,
                     guard=lambda: self._guard(scope, pin),
                 )
                 with self._lock:
@@ -713,6 +715,7 @@ class RollingAriadneEngine(AriadneEngine):
                         settings=self._settings,
                         reasoning_policy=scope.policy,
                         parent_loader=journal._parent_bytes,
+                        _journal=journal,
                         guard=lambda: self._guard(scope, pin),
                     )
             with self._lock:

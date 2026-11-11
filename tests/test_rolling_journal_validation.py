@@ -68,18 +68,17 @@ def test_open_reads_each_archive_event_once(tmp_path, monkeypatch, count):
         assert sum(reads.values()) == len(events) == 2 * (count + 1)
         reads.clear()
         assert journal.load_view() == views[-1]
-        assert set(reads) == set(views[-1].event_ids)
-        assert max(reads.values()) == 1
+        assert not reads  # same open retains its insert-only source snapshot
 
 
-def test_each_operation_rereads_sources_no_cross_operation_cache(tmp_path, monkeypatch):
+def test_each_open_rereads_sources_no_cross_open_cache(tmp_path, monkeypatch):
     store, settings, views, _, _ = chain(tmp_path, 3)
     reads = count_reads(monkeypatch, store)
     with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
         for _ in range(2):
             reads.clear()
             journal.load_view()
-            assert set(reads) == set(views[-1].event_ids)
+            assert not reads  # operations within this open share validation
     reads.clear()
     with rolling_state.RollingJournal(tmp_path, "s", settings, store=store):
         assert set(reads) == set(views[-1].event_ids)
@@ -152,14 +151,16 @@ def test_archive_tamper_of_shared_root_source_refuses_open(tmp_path, mutation, m
         assert conn.execute("SELECT count(*) FROM jobs WHERE state='published'").fetchone()[0] == 5
 
 
-def test_archive_change_between_operations_is_seen(tmp_path):
+def test_archive_change_between_opens_is_seen(tmp_path):
     store, settings, views, _, _ = chain(tmp_path, 4)
     with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
         assert journal.load_view() == views[-1]
         with sqlite3.connect(store.path) as conn:
             conn.execute("DELETE FROM observations WHERE event_id=?", (views[0].event_ids[0],))
-        with pytest.raises(ValueError, match="source"):
-            journal.load_view()
+        # Direct archive mutation is unsupported within an open snapshot.
+        assert journal.load_view() == views[-1]
+    with pytest.raises(ValueError, match="source"):
+        rolling_state.RollingJournal(tmp_path, "s", settings, store=store)
 
 
 def test_ancestor_journal_text_mismatch_refuses_open(tmp_path):

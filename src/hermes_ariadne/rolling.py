@@ -705,14 +705,14 @@ def generation_bytes(
 
 
 class _ValidationMemo:
-    """Per-operation validation memo; never shared across operations or requests.
+    """Request-local validation memo; never shared across journal opens.
 
     Scoped to one (store, session, reasoning policy); validate_generation rejects
     a memo whose scope differs from the call's. ``rows`` is a snapshot of the
-    archive for this operation and only avoids repeated reads: every use still
-    re-verifies the row hash, message_uid and session, and callers receive
-    independent copies. An archive change during an operation is not seen by it;
-    the next operation (a new memo) rereads and detects it.
+    insert-only archive for this open and only avoids repeated reads: every row
+    use still re-verifies its hash, message_uid and session, and callers receive
+    independent copies. Direct archive mutation within an open is unsupported;
+    the next open (a new memo) rereads and detects it. Settings bind on first use.
     ``accepted`` holds views the journal itself already cross-checked (see
     RollingJournal._view); validate_generation only reads it. Keys are the SHA-256
     of the exact bytes just reread for this use, never a parent name.
@@ -724,6 +724,7 @@ class _ValidationMemo:
     def __init__(self, store, session_id, policy):
         self.store, self.session_id, self.policy = store, session_id, policy
         self.rows, self.accepted = {}, {}
+        self.settings_digest: str | None = None
         # generation_id -> (view, _PrefixState) recorded only by a completed
         # validation of that exact view object; see validate_generation.
         self.prefix_states = {}
@@ -758,7 +759,7 @@ def validate_generation(
     ``_memo`` is journal-internal (RollingJournal._operation); callers outside the
     journal must not pass it. Without one, a call-local memo dedupes archive row
     reads within this call only. An accepted hit returns a view already validated
-    and journal-cross-checked in this operation, keyed by the sha256 of these exact
+    and journal-cross-checked in this open, keyed by the sha256 of these exact
     bytes (and re-checked against bytes, settings digest and the depth bound); it
     short-circuits only when ``prefix_states`` ties it to the very view object a
     completed validation here produced, otherwise it is validated in full.
@@ -777,6 +778,10 @@ def validate_generation(
         _memo = _ValidationMemo(store, session_id, policy)
     if _memo.store is not store or _memo.session_id != session_id or _memo.policy is not policy:
         raise ValueError("validation memo scope mismatch")
+    if _memo.settings_digest is None:
+        _memo.settings_digest = settings.digest
+    elif _memo.settings_digest != settings.digest:
+        raise ValueError("validation memo scope mismatch")
     accepted = _memo.accepted.get(generation_id)
     if accepted is not None:
         if accepted.snapshot_bytes != snapshot_bytes or accepted.settings_digest != settings.digest:
@@ -786,6 +791,30 @@ def validate_generation(
             raise ValueError("generation lineage exceeds campaign bound")
         recorded = _memo.prefix_states.get(generation_id)
         if recorded is not None and recorded[0] is accepted:
+            # Archive rows are insert-only, artifacts are not: reread and bind
+            # every ancestor's exact bytes even when this head is accepted.
+            if accepted.parent_generation is not None:
+                if parent_loader is None:
+                    raise ValueError("parent generation unavailable")
+                if guard:
+                    guard()
+                data = parent_loader(accepted.parent_generation)
+                if guard:
+                    guard()
+                if sha256(data) != accepted.parent_generation:
+                    raise ValueError("generation parent lineage mismatch")
+                validate_generation(
+                    data,
+                    store,
+                    session_id,
+                    settings,
+                    policy=policy,
+                    parent_loader=parent_loader,
+                    guard=guard,
+                    _depth=_depth + 1,
+                    _validated=_validated,
+                    _memo=_memo,
+                )
             return accepted
         # An accepted view this memo cannot tie to a validated prefix state (it
         # was not produced here) is not trusted as a parent: validate it in full.
@@ -924,13 +953,42 @@ def validate_generation(
 
 
 def revalidate_view(
-    view, store, session_id, settings, *, policy=None, parent_loader=None, guard=None
+    view,
+    store,
+    session_id,
+    settings,
+    *,
+    policy=None,
+    parent_loader=None,
+    guard=None,
+    _journal=None,
 ):
     """Recheck exact immutable bytes, all source dependencies and parent lineage.
 
     Never trust a dataclass's exposed fields instead of its validated snapshot.
     Scope/settings are supplied by the caller, not by model-controlled arguments.
+    The engine may supply its explicit open journal to reuse that request's
+    validation; its bounded artifact reader is authoritative and rereads the
+    head and every ancestor. Independent calls retain fresh call-local validation.
     """
+    if _journal is not None:
+        with _journal._operation():
+            if type(view) is not RollingView:
+                raise ValueError("trusted rolling view required")
+            if (
+                _journal.store is not store
+                or _journal.session_id != session_id
+                or _journal.settings.digest != settings.digest
+                or _journal.policy is not policy
+                or (parent_loader is not None and parent_loader != _journal._parent_bytes)
+            ):
+                raise ValueError("validation journal scope mismatch")
+            _journal._check(guard)
+            checked = _journal._view(_journal._parent_bytes(view.generation_id))
+            _journal._check(guard)
+            if checked != view:
+                raise ValueError("rolling view differs from its exact snapshot")
+            return checked
     if type(view) is not RollingView:
         raise ValueError("trusted rolling view required")
     checked = validate_generation(
