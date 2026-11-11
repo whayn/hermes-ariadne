@@ -172,11 +172,18 @@ A declined `select_context` returns `None`: Hermes can send the original request
 which can overflow. This is **not a dispatch veto** or a universal size guarantee.
 
 **Known performance limit (#19).** Every request and every rolling navigation call
-reopens the session journal, and each open re-validates the full ancestry of every
-published generation against the archive. The cost grows cubically with the number
-of published generations: measured on a synthetic journal, about 0.5 s per open
-after 8 generations, 2.9 s after 16 and 18 s after 32. Long sessions, which rolling
-is meant for, are therefore not usable yet. This blocks activation for normal use.
+reopens the session journal and revalidates the pinned view. Validation is
+memoized within one journal operation only: each archive event is read once, and
+each generation is validated and cross-checked against the journal once per open.
+There is no cross-request cache, so each request still revalidates every published
+generation. Archive reads per open are linear in source events. CPU time grows
+roughly quadratically, because each generation canonicalizes its own source
+prefix. Measured on a synthetic aarch64 journal at the default 64-job bound: one
+open takes 128 archive reads and about 1.3 s (previously 187,200 reads and 129 s).
+A later `load_view` takes about 0.7 s and one view revalidation about 0.5 s. These
+are component timings, not an end-to-end request measurement. Whether this
+per-request cost is acceptable, or a separately invalidated cross-request cache is
+needed, is still open; activation for normal use remains blocked on that decision.
 If a session exceeds `max_prefix_events` before the trigger threshold is reached,
 or the logical-job budget is exhausted, rolling status reports `unavailable` while
 any retained view keeps being served; the label is coarser than the cause.

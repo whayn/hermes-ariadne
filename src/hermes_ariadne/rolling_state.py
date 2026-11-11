@@ -23,6 +23,7 @@ from .rolling import (
     FORMAT,
     VERSION,
     Target,
+    _ValidationMemo,
     bounded_text,
     decode_json,
     encode_json,
@@ -119,6 +120,7 @@ class RollingJournal:
         self._conn = None
         self._lock_fd = None
         self._busy = False
+        self._memo = None
         self._check()
         root = Path(home).absolute()
         for item in (root, *root.parents):
@@ -215,10 +217,14 @@ class RollingJournal:
             raise ValueError("rolling journal closed or reentrant operation")
         self._busy = True
         try:
+            # Fresh per operation and discarded below: archive/journal changes
+            # between operations must always be reread, never cached.
+            self._memo = _ValidationMemo(self.store, self.session_id, self.policy)
             self._check()
             yield
             self._check()
         finally:
+            self._memo = None
             self._busy = False
 
     @contextmanager
@@ -407,6 +413,7 @@ class RollingJournal:
             parent_loader=self._parent_bytes,
             guard=self._check,
             _validated=validated,
+            _memo=self._memo,
         )
         # Reuse the exact bytes/objects already validated, including all ancestors.
         for current in validated:
@@ -420,6 +427,9 @@ class RollingJournal:
                 != current.snapshot_bytes
             ):
                 raise ValueError("unjournaled or mismatching generation")
+            # Only now is it accepted for the rest of this operation.
+            if self._memo is not None:
+                self._memo.accepted[current.generation_id] = current
         return view
 
     def _validate_target(self, target):
@@ -440,7 +450,11 @@ class RollingJournal:
         for event in target.event_ids:
             require_digest(event)
             self._check()
-            source.append(self.store.get_event(event, session_id=self.session_id))
+            source.append(
+                self.store.get_event(event, session_id=self.session_id)
+                if self._memo is None
+                else self._memo.get_event(event)
+            )
             self._check()
         rebuilt = Target.create(
             source,
