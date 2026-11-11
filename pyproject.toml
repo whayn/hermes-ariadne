@@ -27,7 +27,7 @@ ariadne-install = "hermes_ariadne.install:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-hermes_ariadne = ["plugin.yaml", "prepared_plugin.yaml"]
+hermes_ariadne = ["plugin.yaml", "prepared_plugin.yaml", "rolling_plugin.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

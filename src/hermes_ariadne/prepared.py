@@ -712,26 +712,34 @@ def _occurrences(messages, *, durable=False, reasoning_policies=None):
     return identities
 
 
-def _reasoning_permissions(history, active, request, count, policy):
-    """Bind readable companions before excluding them from comparison-only views."""
+def _reasoning_permissions(history, active, request, count, policy, *, retirement_policy=None):
+    """Bind companions; aged permission is a separate explicit representation policy.
+
+    The default remains retained-only, including for the existing prepared engines.
+    """
+    if retirement_policy not in (None, "aged-codex-retirement-v1"):
+        raise ValueError("unsupported retirement policy")
     permissions = [None] * len(history)
     if policy is None:
         return permissions  # Preserve the legacy reasoning-free comparison path.
     _require_reasoning_policy(policy)
-    for index in range(max(len(history), len(active), len(request))):
-        rows = [rows[index] for rows in (active, history, request) if index < len(rows)]
+    views = (active, history) if request is None else (active, history, request)
+    for index in range(max(map(len, views))):
+        rows = [rows[index] for rows in views if index < len(rows)]
         if not any(m.get("codex_reasoning_items") not in (None, "", False, [], {}) for m in rows):
             continue
-        if not count <= index < min(len(active), len(history), len(request)):
+        lower = 0 if retirement_policy == "aged-codex-retirement-v1" else count
+        if not lower <= index < min(map(len, views)):
             raise ValueError("encrypted reasoning requires a retained active source")
-        source, restored, assembled = active[index], history[index], request[index]
+        source, restored = active[index], history[index]
+        assembled = None if request is None else request[index]
         for key in ("reasoning", "reasoning_content"):
             value = source[key]  # Both canonical SQL columns are required.
             if value is not None and type(value) is not str:
                 raise ValueError("invalid canonical reasoning companion")
             if type(value) is str:
                 value.encode("utf-8")
-            if key in assembled:
+            if assembled is not None and key in assembled:
                 raise ValueError("readable reasoning in assembled request")
             if value is None:
                 if restored.get(key) is not None:
@@ -762,6 +770,51 @@ def _comparison_payloads(messages, policies, *, wire=False, durable=False):
                 reasoning_ids.add(ident)
         payloads.append(payload)
     return payloads
+
+
+def _exact_payloads(history, active, policies, *, assembled=None):
+    """Shared audited canonical/restored comparison; assembled is real or absent.
+
+    Callers establish UID coverage separately. A callback has no assembled view;
+    omitting it proves only the actual canonical/restored correspondence.
+    """
+    raw_payload = _comparison_payloads(history, policies)
+    if any(m["role"] not in {"user", "assistant", "tool"} for m in raw_payload):
+        raise ValueError("host role inside history")
+    active_payload = _comparison_payloads(active, policies, durable=True)
+    for index, replay in enumerate(raw_payload):
+        items = replay.get("codex_message_items")
+        if items:
+            text = items[0]["content"][0]["text"]
+            # Only restored outer content may strip, never the canonical replay.
+            if index >= len(active_payload) or active_payload[index]["content"] != text:
+                raise ValueError("Codex replay requires exact active source")
+    for source, replay, message in zip(active_payload, raw_payload, history):
+        if canonical_json(source) == canonical_json(replay):
+            continue
+        if (
+            message.get("_db_persisted") is True
+            and source["role"] in {"user", "assistant"}
+            and isinstance(source["content"], str)
+            and canonical_json({**source, "content": source["content"].strip()})
+            == canonical_json(replay)
+        ):
+            continue
+        raise ValueError("active/conversation payload mismatch")
+    if assembled is not None and canonical_json(
+        _comparison_payloads(assembled, policies, wire=True)
+    ) != canonical_json(raw_payload):
+        raise ValueError("request must be an exact one-to-one mapping")
+    return raw_payload
+
+
+def _exact_occurrences(history, active, policies):
+    occurrences = _occurrences(history, reasoning_policies=policies)
+    if canonical_json(
+        _occurrences(active, durable=True, reasoning_policies=policies)
+    ) != canonical_json(occurrences[: len(active)]):
+        raise ValueError("active/conversation occurrence mismatch")
+    return occurrences
 
 
 def _alignment(prepared, request, conversation, incoming, active, reasoning_policy=None):
@@ -802,38 +855,7 @@ def _alignment(prepared, request, conversation, incoming, active, reasoning_poli
     ):
         raise ValueError("prepared source is not the exact active prefix")
     policies = _reasoning_permissions(history, active, request[split:], count, reasoning_policy)
-    raw_payload = _comparison_payloads(history, policies)
-    if any(m["role"] not in {"user", "assistant", "tool"} for m in raw_payload):
-        raise ValueError("host role inside history")
-    active_payload = _comparison_payloads(active, policies, durable=True)
-    for index, replay in enumerate(raw_payload):
-        items = replay.get("codex_message_items")
-        if items:
-            text = items[0]["content"][0]["text"]
-            # Bind every replay carrier to an exact canonical active text too;
-            # only the outer restored content may strip. A stamp alone is not
-            # source evidence. Comparisons below bind the untrimmed carrier.
-            if index >= len(active_payload) or active_payload[index]["content"] != text:
-                raise ValueError("Codex replay requires exact active source")
-    for source, replay, message in zip(active_payload, raw_payload, history):
-        if canonical_json(source) == canonical_json(replay):
-            continue
-        # SessionDB._loaded_view_content strips restored user/assistant text.
-        # Admit only that narrow projection on born-durable replay dicts: keep
-        # exact source hashes above and the actual assembled request below.
-        if (
-            message.get("_db_persisted") is True
-            and source["role"] in {"user", "assistant"}
-            and isinstance(source["content"], str)
-            and canonical_json({**source, "content": source["content"].strip()})
-            == canonical_json(replay)
-        ):
-            continue
-        raise ValueError("active/conversation payload mismatch")
-    if canonical_json(_comparison_payloads(request[split:], policies, wire=True)) != canonical_json(
-        raw_payload
-    ):
-        raise ValueError("request must be an exact one-to-one mapping")
+    raw_payload = _exact_payloads(history, active, policies, assembled=request[split:])
     if any(
         m.get("session_id", prepared.projection.session_id) != prepared.projection.session_id
         for m in active
@@ -858,11 +880,7 @@ def _alignment(prepared, request, conversation, incoming, active, reasoning_poli
         raise ValueError(
             "retain the previous exchange and complete current turn at a user boundary"
         )
-    occurrences = _occurrences(history, reasoning_policies=policies)
-    if canonical_json(
-        _occurrences(active, durable=True, reasoning_policies=policies)
-    ) != canonical_json(occurrences[: len(active)]):
-        raise ValueError("active/conversation occurrence mismatch")
+    _exact_occurrences(history, active, policies)
     _tool_sequence(raw_payload[count:])
     return split
 
