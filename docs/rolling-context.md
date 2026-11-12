@@ -172,18 +172,47 @@ A declined `select_context` returns `None`: Hermes can send the original request
 which can overflow. This is **not a dispatch veto** or a universal size guarantee.
 
 **Known performance limit (#19).** Every request and every rolling navigation call
-reopens the session journal and revalidates the pinned view. Validation is
-memoized within one journal operation only: each archive event is read once, and
-each generation is validated and cross-checked against the journal once per open.
-There is no cross-request cache, so each request still revalidates every published
-generation. Archive reads per open are linear in source events. CPU time grows
-roughly quadratically, because each generation canonicalizes its own source
-prefix. Measured on a synthetic aarch64 journal at the default 64-job bound: one
-open takes 128 archive reads and about 1.3 s (previously 187,200 reads and 129 s).
-A later `load_view` takes about 0.7 s and one view revalidation about 0.5 s. These
-are component timings, not an end-to-end request measurement. Whether this
-per-request cost is acceptable, or a separately invalidated cross-request cache is
-needed, is still open; activation for normal use remains blocked on that decision.
+reopens the session journal and revalidates the pinned view. One journal open now
+shares its validation memo across reconciliation, loading and revalidation until
+close. A failed operation discards it; caught nested reentry does not take ownership
+of the outer operation's state. Each archive event is read once for validation in
+that scope. Current host-row comparisons and accounting/recovery checks stay fresh.
+Generation and target validation canonicalize deltas against validated parent
+identity state rather than repeatedly canonicalizing complete prefixes.
+
+There is no persistent or cross-request cache. Supported archive writes are
+insert-only: direct SQL mutation during an open is outside its source-snapshot
+contract; a new open rereads sources and detects corruption. Artifact head and
+ancestor bytes are still reread and exact-hash-bound during cached view reuse.
+Retained identity sets can consume O(generations × prefix events) memory, and
+artifact rereads still repeat filesystem/hash work.
+
+On a synthetic aarch64 real-engine benchmark with approximately 8 KB exchanges,
+64 generations and 737 KB of request messages, selection takes 256 archive reads
+and 7.32 s, versus 1,024 reads and 17.93 s on the operation-local memo baseline.
+Navigation takes 6.78 s versus 10.26 s; completion 7.51 s versus 15.18 s. These
+exclude model/network latency and use an injected deterministic facade. The
+intermediate delta-only checkpoint was faster (4.18 s selection): request-wide
+reuse reduces reads but mandatory ancestor-artifact rereads offset CPU savings.
+Measured increasing generation counts (single runs; seconds, no model/network):
+
+| Generations | Baseline select reads | New select reads | Baseline select | New select | Baseline navigation | New navigation | Baseline completion | New completion |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 128 | 32 | 0.5703 | 0.3277 | 0.3167 | 0.1909 | 1.0241 | 0.4583 |
+| 16 | 256 | 64 | 1.5882 | 0.6430 | 0.8843 | 0.4958 | 2.3623 | 0.9919 |
+| 32 | 512 | 128 | 5.2808 | 1.9009 | 2.9009 | 1.6180 | 7.2290 | 2.5299 |
+| 48 | 768 | 192 | 10.5435 | 4.1566 | 6.0787 | 3.6810 | 14.2758 | 4.9713 |
+| 64 | 1024 | 256 | 17.9324 | 7.3210 | 10.2612 | 6.7756 | 15.1836 | 7.5089 |
+
+Baseline: `0119048`; new code: `acd83eb`. Navigation also resolves requested host
+rows; completion includes legitimate current-host comparisons, not just validation.
+The disposable SDK directory used for these timing runs was later found absent;
+no model/native transport was exercised, but these are not pinned-SDK compatibility
+measurements. Full native compatibility is checked separately.
+
+This is not an end-to-end latency sign-off. Keep #19 open and activation blocked;
+remove remaining request-local artifact duplication before deciding whether a
+cross-request cache with explicit invalidation and memory limits is justified.
 If a session exceeds `max_prefix_events` before the trigger threshold is reached,
 or the logical-job budget is exhausted, rolling status reports `unavailable` while
 any retained view keeps being served; the label is coarser than the cause.
