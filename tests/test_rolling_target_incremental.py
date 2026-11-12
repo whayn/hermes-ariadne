@@ -7,6 +7,7 @@ import sys
 from collections import Counter
 
 import pytest
+from rolling_prefix_helpers import empty_prefix
 from test_rolling_incremental import (
     REQUEST,
     ROUTE,
@@ -472,7 +473,7 @@ def test_extension_rejects_a_prefix_state_that_is_not_the_parents(tmp_path):
         "request_bytes": REQUEST,
         "route_labels": ROUTE,
     }
-    for wrong in (rolling._EMPTY_PREFIX, dataclasses.replace(prefix, length=prefix.length + 1)):
+    for wrong in (empty_prefix(), dataclasses.replace(prefix, length=prefix.length + 1)):
         with pytest.raises(ValueError, match="target is not a parent prefix extension"):
             rolling.Target._create_extension(copy.deepcopy(c), prefix=wrong, **common)
     good = rolling.Target._create_extension(copy.deepcopy(c), prefix=prefix, **common)

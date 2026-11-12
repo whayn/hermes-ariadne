@@ -224,9 +224,12 @@ class RollingJournal:
             # One insert-only archive snapshot per open, never across requests.
             if self._memo is None:
                 self._memo = _ValidationMemo(self.store, self.session_id, self.policy)
-            self._check()
-            yield
-            self._check()
+            # The memo's operation scope owns the ancestor artifact binding:
+            # every operation rereads and rebinds each ancestor exactly once.
+            with self._memo.operation():
+                self._check()
+                yield
+                self._check()
         except BaseException:
             # A failed operation must not leave partially accepted validation state.
             self._memo = None

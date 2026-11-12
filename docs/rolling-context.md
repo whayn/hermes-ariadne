@@ -182,10 +182,19 @@ identity state rather than repeatedly canonicalizing complete prefixes.
 
 There is no persistent or cross-request cache. Supported archive writes are
 insert-only: direct SQL mutation during an open is outside its source-snapshot
-contract; a new open rereads sources and detects corruption. Artifact head and
-ancestor bytes are still reread and exact-hash-bound during cached view reuse.
-Retained identity sets can consume O(generations × prefix events) memory, and
-artifact rereads still repeat filesystem/hash work.
+contract; a new open rereads sources and detects corruption. Artifact head bytes
+are hashed on every use. Every journal operation rereads and exact-hash-binds each
+ancestor artifact at most once per operation (the first time that operation reaches
+it); another operation never reuses that binding, so one operation's artifact work
+is linear in generations. An ancestor file rewritten on disk after it was bound
+within an operation is not seen until the next operation: artifacts are
+content-addressed and written once by supported code.
+Validated identity state is shared: each generation keeps its lineage and a memo
+index maps every delta identity to its introducing generation(s). For a linear
+chain retained state is O(distinct identities + generations²) rather than one
+whole-prefix set per generation; branches add one (identity, introducing
+generation) entry each. The selection/navigation/completion timings below predate
+these two changes.
 
 On a synthetic aarch64 real-engine benchmark with approximately 8 KB exchanges,
 64 generations and 737 KB of request messages, selection takes 256 archive reads

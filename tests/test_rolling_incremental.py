@@ -7,14 +7,16 @@ native-shaped rows (tool calls, occurrence uids, Codex reasoning/message items),
 including violations that span the parent/delta boundary.
 
 ``incremental_verdict`` MODELS the composition (``_canonical_rows`` per chunk +
-``_extend_prefix``); it is not the shipped code path. The ``E2E`` cases exercise
-the real ``validate_generation`` on forged generation bytes over a real store.
+the test-only ``extend_prefix`` over the shipped primitives); it is not the
+shipped code path. The ``E2E`` cases exercise the real ``validate_generation`` on
+forged generation bytes over a real store.
 """
 
 import copy
 import json
 
 import pytest
+from rolling_prefix_helpers import empty_prefix, extend_prefix, identities
 from test_rolling_journal_validation import chain
 from test_rolling_selection import POLICY, exchange
 from test_rolling_validation_memo import loader
@@ -83,11 +85,11 @@ def full_verdict(chunks, settings):
 
 def incremental_verdict(chunks, settings):
     """The generation-by-generation path: root validated whole, then delta + boundary."""
-    state = rolling._EMPTY_PREFIX
+    state = empty_prefix()
     try:
         for chunk in copy.deepcopy(chunks):
             _, uids, payloads = rolling._canonical_rows(chunk, policy=POLICY, settings=settings)
-            state = rolling._extend_prefix(state, chunk, uids, payloads, settings)
+            state = extend_prefix(state, chunk, uids, payloads, settings)
     except ValueError as exc:
         return str(exc)
     return "ok"
@@ -263,11 +265,11 @@ def test_boundary_rejections_keep_the_audited_messages(build, message):
 def test_state_is_built_from_audited_outputs_only():
     a = exchange("a")
     _, uids, payloads = rolling._canonical_rows(copy.deepcopy(a), policy=POLICY, settings=SETTINGS)
-    state = rolling._extend_prefix(rolling._EMPTY_PREFIX, a, uids, payloads, SETTINGS)
+    state = extend_prefix(empty_prefix(), a, uids, payloads, SETTINGS)
     assert state.length == 4
-    assert state.message_uids == frozenset(row["message_uid"] for row in a)
-    assert state.reasoning_ids == {"rs_aowner0"} | {f"rs_aanswer{i}" for i in range(4)}
-    assert state.occurrence_uids == {"occ_a"}
+    assert identities(state, "message") == frozenset(row["message_uid"] for row in a)
+    assert identities(state, "reasoning") == {"rs_aowner0"} | {f"rs_aanswer{i}" for i in range(4)}
+    assert identities(state, "occurrence") == {"occ_a"}
 
 
 # --- end to end: the code that actually runs (forged generation bytes + EventStore) ---

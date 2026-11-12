@@ -9,8 +9,9 @@ rolling_selection. Neither module schedules work or changes the host runtime.
 import hashlib
 import json
 import math
+from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 
 from .prepared import (
     ReasoningReplayPolicy,
@@ -126,9 +127,14 @@ def encode_json(value, limit):
     return bytes(output)
 
 
-def decode_json(data, limit):
+def _admit_json_bytes(data, limit):
+    """The admission check for JSON input: exact ``bytes`` within ``limit``."""
     if type(data) is not bytes or len(data) > limit:
         raise ValueError("invalid or oversized JSON bytes")
+
+
+def decode_json(data, limit):
+    _admit_json_bytes(data, limit)
 
     def pairs(items):
         result = {}
@@ -167,8 +173,8 @@ class RollingSettings:
     timeout: int = 60
 
     def __post_init__(self):
-        for field in fields(self):
-            value = getattr(self, field.name)
+        for spec in fields(self):
+            value = getattr(self, spec.name)
             if type(value) is not int or not 0 < value <= 2**31 - 1:
                 raise ValueError("rolling limits must be positive bounded integers")
 
@@ -250,32 +256,51 @@ class _PrefixState:
     pass one ``RollingSettings`` (a generation's header must carry its digest), so
     a state is never extended under a different policy or limit.
 
-    Memory: the id sets are O(G*N) in total when every generation of a chain keeps
-    its own state (G generations, N rows each), bounded by ``max_logical_jobs`` x
-    ``max_prefix_events`` and held only for one operation's memo.
+    Representation: a state does not hold its prefix's identities. It holds the
+    ``lineage`` (the introducer ids of every link of its validated chain,
+    itself included) and a reference to a shared ``index`` mapping each kind's
+    identity to the introducer(s) whose validated delta contained it. The
+    prefix contains an identity exactly when one of its introducers is in the
+    lineage, so sibling branches extending one parent never see each other's
+    identities. Only a completed validation records into the index (see
+    ``_record_identities``); checking an extension never writes.
+
+    Memory per index: one entry per distinct (identity, introducing
+    generation) pair plus O(G) lineage ids per state, i.e. O(distinct
+    identities + G^2) for a linear chain, instead of a whole-prefix union per
+    generation.
     """
 
     length: int
-    message_uids: frozenset
-    reasoning_ids: frozenset
-    occurrence_uids: frozenset
+    lineage: frozenset
+    # Shared by every state of one memo: excluded from equality and repr.
+    index: dict = field(compare=False, repr=False)
+
+    def extends(self, view):
+        """Whether this is the validated state of ``view``'s whole prefix."""
+        return self.length == len(view.event_ids) and view.generation_id in self.lineage
 
 
-_EMPTY_PREFIX = _PrefixState(0, frozenset(), frozenset(), frozenset())
+_IDENTITY_KINDS = (
+    ("message", "missing or duplicate logical identity"),
+    ("reasoning", "duplicate retained reasoning identity"),
+    ("occurrence", "occurrence identities must be unique"),
+)
 
 
-def _extend_prefix(prefix, rows, uids, payloads, settings):
-    """State of ``prefix`` plus ``rows`` (already ``_canonical_rows``-valid).
+def _new_identity_index():
+    return {kind: {} for kind, _ in _IDENTITY_KINDS}
 
-    ``prefix`` is the state of the validated parent prefix (``_EMPTY_PREFIX`` for
-    a root). Rejects a total length over the bound and any identity the delta
-    shares with the prefix, exactly where ``_canonical_rows`` of the whole prefix
-    would. The disjointness checks are defence in depth where another layer
-    already rejects: a repeated message uid is pre-empted by the generation
-    header's duplicate-source check, but a state must not rely on its caller.
-    """
-    if prefix.length + len(rows) > settings.max_prefix_events:
-        raise ValueError("nonempty bounded canonical rows required")
+
+def _introduced_in(introducers, lineage):
+    """Whether an index entry (one introducer, or a set of them) meets ``lineage``."""
+    if type(introducers) is set:
+        return not introducers.isdisjoint(lineage)
+    return introducers in lineage
+
+
+def _delta_identities(rows, uids, payloads):
+    """(message uids, reasoning ids, occurrence uids) of already-validated delta rows."""
     reasoning = []
     for payload in payloads:
         items = payload.get("codex_reasoning_items")
@@ -286,20 +311,46 @@ def _extend_prefix(prefix, rows, uids, payloads, settings):
         mapping = _identity_value(row, "tool_call_uids")
         if mapping is not None:
             occurrences.extend(uid for uid in mapping.values() if uid is not None)
-    messages = frozenset(uids)
-    reasoning, occurrences = frozenset(reasoning), frozenset(occurrences)
-    if not prefix.message_uids.isdisjoint(messages):
-        raise ValueError("missing or duplicate logical identity")
-    if not prefix.reasoning_ids.isdisjoint(reasoning):
-        raise ValueError("duplicate retained reasoning identity")
-    if not prefix.occurrence_uids.isdisjoint(occurrences):
-        raise ValueError("occurrence identities must be unique")
-    return _PrefixState(
-        prefix.length + len(rows),
-        prefix.message_uids | messages,
-        prefix.reasoning_ids | reasoning,
-        prefix.occurrence_uids | occurrences,
-    )
+    return frozenset(uids), frozenset(reasoning), frozenset(occurrences)
+
+
+def _check_prefix_extension(prefix, rows, uids, payloads, settings):
+    """Reject ``rows`` (already ``_canonical_rows``-valid) extending ``prefix``.
+
+    Rejects a total length over the bound and any identity the delta shares
+    with the prefix, exactly where ``_canonical_rows`` of the whole prefix
+    would, and in the same order. Read-only: returns the delta's identity sets
+    for a caller that later records them after ITS validation completes. The
+    disjointness checks are defence in depth where another layer already
+    rejects: a repeated message uid is pre-empted by the generation header's
+    duplicate-source check, but a state must not rely on its caller.
+    """
+    if prefix.length + len(rows) > settings.max_prefix_events:
+        raise ValueError("nonempty bounded canonical rows required")
+    delta = _delta_identities(rows, uids, payloads)
+    if not prefix.lineage:
+        return delta  # a root prefix has nothing to collide with
+    for (kind, message), identities in zip(_IDENTITY_KINDS, delta):
+        table = prefix.index[kind]
+        for identity in identities:
+            introducers = table.get(identity)
+            if introducers is not None and _introduced_in(introducers, prefix.lineage):
+                raise ValueError(message)
+    return delta
+
+
+def _record_identities(index, introducer, delta):
+    """Record that ``introducer``'s validated delta contains ``delta``'s identities."""
+    for (kind, _), identities in zip(_IDENTITY_KINDS, delta):
+        table = index[kind]
+        for identity in identities:
+            introducers = table.get(identity)
+            if introducers is None:
+                table[identity] = introducer
+            elif type(introducers) is set:
+                introducers.add(introducer)
+            elif introducers != introducer:
+                table[identity] = {introducers, introducer}
 
 
 def readable_delta(
@@ -526,9 +577,10 @@ class Target:
             delta_rows, policy=policy, settings=settings
         )
         # Fail closed on a prefix state that is not the parent's (callers tie them).
-        if prefix.length != len(parent.event_ids):
+        if not prefix.extends(parent):
             raise ValueError("target is not a parent prefix extension")
-        _extend_prefix(prefix, delta_rows, delta_uids, payloads, settings)
+        # Check only: a target never records identity state.
+        _check_prefix_extension(prefix, delta_rows, delta_uids, payloads, settings)
         delta = _render_delta(delta_rows, delta_events, payloads, settings)
         prefix_events = parent.event_ids + delta_events
         prefix_uids = parent.message_uids + delta_uids
@@ -559,7 +611,7 @@ class Target:
         return self._canonical_bytes(settings.max_checkpoint_bytes)
 
     def _canonical_bytes(self, limit):
-        data = {field.name: getattr(self, field.name) for field in fields(self)}
+        data = {spec.name: getattr(self, spec.name) for spec in fields(self)}
         for key in ("event_ids", "message_uids", "route_labels"):
             data[key] = list(data[key])
         for key in ("readable_input", "request_bytes"):
@@ -719,6 +771,13 @@ class _ValidationMemo:
     ``prefix_states`` is written only by validate_generation after it fully
     validated that view; an accepted entry is only short-circuited when it is
     that very validated object.
+    ``bound`` is None except inside ``operation()`` (one RollingJournal
+    operation: a fresh set on entry, None again on exit; a failed operation
+    drops the whole memo). validate_generation adds a parent id only after it
+    reread that parent's exact bytes through ``parent_loader`` in this
+    operation, they hashed to the id and validated (with every ancestor reached
+    the same way) to the view its prefix state is tied to. A bound id skips the
+    reread only while that view is also the accepted one; see ``parent_view``.
     """
 
     def __init__(self, store, session_id, policy):
@@ -728,6 +787,31 @@ class _ValidationMemo:
         # generation_id -> (view, _PrefixState) recorded only by a completed
         # validation of that exact view object; see validate_generation.
         self.prefix_states = {}
+        # Shared identity index of every validated delta (see _PrefixState):
+        # {kind: {identity: introducer | {introducers}}}. A value is a single
+        # generation id, or a set of two or more when sibling branches
+        # introduced the same identity; never an empty set. Written only by
+        # _record_identities, after a whole validation has passed.
+        self.identities = _new_identity_index()
+        self.bound: set | None = None
+
+    @contextmanager
+    def operation(self):
+        """Scope of one journal operation: ``bound`` is a fresh set inside, None outside.
+
+        Every operation rereads and rebinds each ancestor itself; nothing bound
+        here survives it. The journal drops the whole memo when the operation
+        fails, so a failed operation never leaves a binding behind either.
+        """
+        self.bound = set()
+        try:
+            yield
+        finally:
+            self.bound = None
+
+    def empty_prefix(self):
+        """The state of a root generation's (empty) parent prefix in this memo."""
+        return _PrefixState(0, frozenset(), self.identities)
 
     def get_event(self, event_id):
         row = deepcopy(self.rows.get(event_id))
@@ -772,7 +856,9 @@ def validate_generation(
     """
     if _depth >= settings.max_logical_jobs:
         raise ValueError("generation lineage exceeds campaign bound")
-    value = decode_json(snapshot_bytes, settings.max_checkpoint_bytes)
+    # decode_json's own admission, applied before hashing: accepted bytes are
+    # bound by hash and exact comparison and never decoded again.
+    _admit_json_bytes(snapshot_bytes, settings.max_checkpoint_bytes)
     generation_id = sha256(snapshot_bytes)
     if _memo is None:  # rows only: dedupe shared prefix reads within this one call
         _memo = _ValidationMemo(store, session_id, policy)
@@ -782,6 +868,60 @@ def validate_generation(
         _memo.settings_digest = settings.digest
     elif _memo.settings_digest != settings.digest:
         raise ValueError("validation memo scope mismatch")
+
+    def parent_view(digest, *, prehash):
+        """The validated parent ``digest``: reread and hash-bound once per operation.
+
+        ``prehash`` hashes the reread bytes against ``digest`` before validating
+        them (the accepted-head walk, where nothing else ties them to the name).
+
+        ``_memo.bound`` (journal operations only, else None) holds the parents
+        whose exact bytes were reread through ``parent_loader`` in THIS
+        operation, hashed to their name and resolved to the view their
+        prefix state is tied to, after their own ancestors were reached the
+        same way. A bound parent skips the reread only while it is ALSO the
+        tied accepted (journal-cross-checked) view; the depth bound is still
+        applied to the skipped chain. Anything else is reread.
+        """
+        bound = _memo.bound
+        if bound is not None and digest in bound:
+            hit = _memo.accepted.get(digest)
+            recorded = _memo.prefix_states.get(digest)
+            if hit is not None and recorded is not None and recorded[0] is hit:
+                if _depth + 1 + hit.sequence > settings.max_logical_jobs:
+                    raise ValueError("generation lineage exceeds campaign bound")
+                return hit
+        if parent_loader is None:
+            raise ValueError("parent generation unavailable")
+        if guard:
+            guard()
+        data = parent_loader(digest)
+        if guard:
+            guard()
+        if prehash and sha256(data) != digest:
+            raise ValueError("generation parent lineage mismatch")
+        parent = validate_generation(
+            data,
+            store,
+            session_id,
+            settings,
+            policy=policy,
+            parent_loader=parent_loader,
+            guard=guard,
+            _depth=_depth + 1,
+            _validated=_validated,
+            _memo=_memo,
+        )
+        recorded = _memo.prefix_states.get(digest)
+        if (
+            bound is not None
+            and parent.generation_id == digest
+            and recorded is not None
+            and recorded[0] is parent
+        ):
+            bound.add(digest)
+        return parent
+
     accepted = _memo.accepted.get(generation_id)
     if accepted is not None:
         if accepted.snapshot_bytes != snapshot_bytes or accepted.settings_digest != settings.digest:
@@ -792,32 +932,14 @@ def validate_generation(
         recorded = _memo.prefix_states.get(generation_id)
         if recorded is not None and recorded[0] is accepted:
             # Archive rows are insert-only, artifacts are not: reread and bind
-            # every ancestor's exact bytes even when this head is accepted.
+            # every ancestor's exact bytes (once per journal operation) even
+            # when this head is accepted.
             if accepted.parent_generation is not None:
-                if parent_loader is None:
-                    raise ValueError("parent generation unavailable")
-                if guard:
-                    guard()
-                data = parent_loader(accepted.parent_generation)
-                if guard:
-                    guard()
-                if sha256(data) != accepted.parent_generation:
-                    raise ValueError("generation parent lineage mismatch")
-                validate_generation(
-                    data,
-                    store,
-                    session_id,
-                    settings,
-                    policy=policy,
-                    parent_loader=parent_loader,
-                    guard=guard,
-                    _depth=_depth + 1,
-                    _validated=_validated,
-                    _memo=_memo,
-                )
+                parent_view(accepted.parent_generation, prehash=True)
             return accepted
         # An accepted view this memo cannot tie to a validated prefix state (it
         # was not produced here) is not trusted as a parent: validate it in full.
+    value = decode_json(snapshot_bytes, settings.max_checkpoint_bytes)
     keys = {f.name for f in fields(RollingView)} - {"snapshot_bytes", "generation_id"}
     headers = {"format", "version", "policy_id", "readable_projection_id", "prompt_version"}
     if type(value) is not dict or set(value) != keys | headers:
@@ -862,29 +984,11 @@ def validate_generation(
         raise ValueError("summary hash mismatch")
     if sha256(encode_json(events, settings.max_checkpoint_bytes)) != value["prefix_sha256"]:
         raise ValueError("prefix hash mismatch")
-    parent, parent_state = None, _EMPTY_PREFIX
+    parent, parent_state = None, _memo.empty_prefix()
     if value["parent_generation"] is not None:
         require_digest(value["parent_generation"])
         require_digest(value["parent_summary_sha256"])
-        if parent_loader is None:
-            raise ValueError("parent generation unavailable")
-        if guard:
-            guard()
-        data = parent_loader(value["parent_generation"])
-        if guard:
-            guard()
-        parent = validate_generation(
-            data,
-            store,
-            session_id,
-            settings,
-            policy=policy,
-            parent_loader=parent_loader,
-            guard=guard,
-            _depth=_depth + 1,
-            _validated=_validated,
-            _memo=_memo,
-        )
+        parent = parent_view(value["parent_generation"], prehash=False)
         if (
             parent.generation_id != value["parent_generation"]
             or parent.summary_sha256 != value["parent_summary_sha256"]
@@ -899,7 +1003,12 @@ def validate_generation(
         # as a fail-closed guard so a future refactor cannot silently extend an
         # empty or foreign prefix state.
         recorded = _memo.prefix_states.get(parent.generation_id)
-        if recorded is None or recorded[0] is not parent:
+        if (
+            recorded is None
+            or recorded[0] is not parent
+            or recorded[1].index is not _memo.identities
+            or not recorded[1].extends(parent)
+        ):
             raise ValueError("generation parent state unavailable")
         parent_state = recorded[1]
     elif (
@@ -929,10 +1038,12 @@ def validate_generation(
             raise ValueError("foreign generation source")
         source.append(row)
     delta_events, delta_uids, payloads = _canonical_rows(source, policy=policy, settings=settings)
-    state = _extend_prefix(parent_state, source, delta_uids, payloads, settings)
+    # Check only: this generation's identities are recorded after every check below.
+    delta_identities = _check_prefix_extension(parent_state, source, delta_uids, payloads, settings)
+    length = parent_state.length + len(source)
     # Redundant by construction (each row's hash was re-verified above and the
     # parent lineage fixed ``start``/length), re-asserted as defence in depth.
-    if len(events) != state.length or tuple(events[start:]) != delta_events:
+    if len(events) != length or tuple(events[start:]) != delta_events:
         raise ValueError("generation source unavailable or changed")
     delta = _render_delta(source, delta_events, payloads, settings)
     if (
@@ -946,6 +1057,10 @@ def validate_generation(
         del value[key]
     value["event_ids"], value["message_uids"] = tuple(events), tuple(uids)
     view = RollingView(snapshot_bytes, generation_id, **value)
+    # Validation is complete: record this delta's identities under this
+    # generation, and its state as its parent's lineage plus itself.
+    _record_identities(_memo.identities, generation_id, delta_identities)
+    state = _PrefixState(length, parent_state.lineage | {generation_id}, _memo.identities)
     _memo.prefix_states[generation_id] = (view, state)
     if _validated is not None:
         _validated.append(view)
