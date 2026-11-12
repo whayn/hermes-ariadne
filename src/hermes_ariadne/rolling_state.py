@@ -23,11 +23,11 @@ from .rolling import (
     FORMAT,
     VERSION,
     Target,
+    _generation_matches,
     _ValidationMemo,
     bounded_text,
     decode_json,
     encode_json,
-    generation_bytes,
     require_digest,
     sha256,
     validate_generation,
@@ -371,9 +371,16 @@ class RollingJournal:
         row = self._conn.execute(
             "SELECT payload,payload_sha256 FROM targets WHERE target_id=?", (target_id,)
         ).fetchone()
-        target = Target.from_bytes(row["payload"], self.settings)
-        if sha256(row["payload"]) != row["payload_sha256"] or target.target_id != target_id:
+        payload = row["payload"]
+        digest = sha256(payload) if type(payload) is bytes else None
+        cached = None if self._memo is None else self._memo.targets.get(digest)
+        # A hit is a Target already parsed and verified from these exact bytes in
+        # this open; anything else (including non-bytes) is parsed and rejected here.
+        target = cached if cached is not None else Target.from_bytes(payload, self.settings)
+        if digest != row["payload_sha256"] or target.target_id != target_id:
             raise ValueError("frozen target hash mismatch")
+        if self._memo is not None:
+            self._memo.targets[digest] = target
         return target
 
     def _job(self, job_id):
@@ -431,10 +438,9 @@ class RollingJournal:
             if (
                 job["state"] not in {"ready", "published"}
                 or job["validated_text"] != current.summary_text
-                or generation_bytes(
-                    target, job["validated_text"], sequence=current.sequence, settings=self.settings
-                )
-                != current.snapshot_bytes
+                # Same verdict as comparing generation_bytes(target, text, ...)
+                # with the snapshot, without re-encoding the whole prefix.
+                or not _generation_matches(current, target, job["validated_text"])
             ):
                 raise ValueError("unjournaled or mismatching generation")
             # Only ready/published immutable results are accepted for this open.

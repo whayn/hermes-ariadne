@@ -87,14 +87,14 @@ def test_each_open_rereads_sources_no_cross_open_cache(tmp_path, monkeypatch):
 def test_shared_ancestor_validated_once_per_open(tmp_path, monkeypatch):
     store, settings, views, _, _ = chain(tmp_path, 5, pending=True)
     checked = Counter()
-    original = rolling_state.generation_bytes
+    original = rolling_state._generation_matches
 
-    def counting(target, summary, *, sequence, settings=None):
-        checked[sequence] += 1
-        return original(target, summary, sequence=sequence, settings=settings)
+    def counting(view, target, summary):
+        checked[view.sequence] += 1
+        return original(view, target, summary)
 
     # The journal cross-check runs once for every newly validated generation.
-    monkeypatch.setattr(rolling_state, "generation_bytes", counting)
+    monkeypatch.setattr(rolling_state, "_generation_matches", counting)
     with rolling_state.RollingJournal(tmp_path, "s", settings, store=store):
         assert checked == Counter(range(1, 6))
 

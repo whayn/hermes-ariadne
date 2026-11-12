@@ -33,18 +33,19 @@ def spy_artifact_reads(monkeypatch):
 
 
 def spy_decodes(monkeypatch):
-    """Every ``rolling.decode_json`` call, keyed by the SHA-256 of the decoded bytes.
+    """Every JSON decode in ``rolling``, keyed by the SHA-256 of the decoded bytes.
 
+    ``decode_json`` and the canonical-check callers all go through ``_decode_json``.
     Use ``generation_decodes`` to keep only the decodes of generation snapshots.
     """
     decodes = Counter()
-    original = rolling.decode_json
+    original = rolling._decode_json
 
     def counting(data, limit):
         decodes[rolling.sha256(data)] += 1
         return original(data, limit)
 
-    monkeypatch.setattr(rolling, "decode_json", counting)
+    monkeypatch.setattr(rolling, "_decode_json", counting)
     return decodes
 
 

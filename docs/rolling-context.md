@@ -214,15 +214,42 @@ Tracemalloc peaks at 64 generations (256 source events) are 22.1 MiB selection,
 23.6 MiB navigation and 25.0 MiB completion; they are not RSS. A separate journal
 open benchmark with 64 generations reached 65,536 source events (not the 100,000
 cap): retained identity state fell from about 224 MiB to 4.2 MiB and ancestor
-artifact reads per open from 4,161 to 192, but that open still took 317 s. Most
-of it re-serializes every job's full frozen target and generation (`_job`,
-`Target.from_bytes`, `target_id`, generation bytes), which is O(generations ×
-source events) per open.
+artifact reads per open from 4,161 to 192, but that open still took 317 s.
 
-This is not an end-to-end latency sign-off. Keep #19 open and activation blocked;
-remove the remaining per-open target/job re-serialization and measure at the event
-cap before deciding whether a cross-request cache with explicit invalidation and
-memory limits is justified.
+**Journal open re-serialization (#22).** An open still rereads and hashes every
+stored target payload and generation artifact, but decodes each exact payload once
+per open and reuses the result (`_ValidationMemo.targets`, keyed by the payload's
+hash, rechecked on every use). A target's identity is the hash of its verified
+canonical bytes; the journal cross-check compares a validated generation's fields
+with its target instead of regenerating its bytes; strict decoding produces the
+canonical encoding that the byte-equality check reuses; validated views share their
+parent's source identities. Durable identities are unchanged and pinned in
+`tests/test_rolling_identity_pins.py`; no file format changed.
+
+`scripts/bench_rolling_open.py` reproduces this: 64 generations of native-shaped
+Codex exchanges, single untraced opens on a 2-core aarch64 host, Python 3.14;
+65,536 and 100,000 opened in place (fixture contents verified unchanged).
+
+| Source events | Open s before → after | `encode_json` MiB per open before → after | Max RSS MiB before → after |
+| ---: | ---: | ---: | ---: |
+| 256 | 1.66 → 0.65 | 13.7 → 2.4 | 33.5 → 34.4 |
+| 4,096 | 19.4 → 7.5 | 205 → 33 | 92.7 → 93.1 |
+| 16,384 | 77.1 → 29.5 | 822 → 131 | 329 → 302 |
+| 65,536 | 318.8 → 119.0 | 3,311 → 526 | 1,300 → 1,133 |
+| 100,000 | 482.5 → 189.3 | 5,062 → 804 | 1,650 → 1,681 |
+
+Opens are now about 2.5× faster and grow linearly with source events at fixed
+generations, but 189 s at the 100,000-event cap is not usable per request. A
+profile at 16,384 events attributes roughly a third of the remaining time to the
+one strict decode of each stored target and generation (each still holds its whole
+prefix, so their total size is O(generations × source events)) and roughly half
+to per-open source revalidation (every archive row is reread, hashed and
+canonicalized, both for its generation and its target). Neither is removable by
+caching within one open without changing the stored format or the per-open
+freshness contract.
+
+This is not an end-to-end latency sign-off. Keep #19 open and activation blocked
+until opens at the event cap are usable per request.
 If a session exceeds `max_prefix_events` before the trigger threshold is reached,
 or the logical-job budget is exhausted, rolling status reports `unavailable` while
 any retained view keeps being served; the label is coarser than the cause.
