@@ -16,7 +16,8 @@ deltas fit; ``max_prefix_events`` stays at its default 100,000, so
 ``--events 100000`` exercises the real cap.
 
 ``measure`` copies the fixture to a fresh temporary home (an open may write the
-journal), then reports one JSON line: the open (``RollingJournal(...)``, which
+journal; ``--in-place`` opens DIR itself when disk space is short), then reports
+one JSON line: the open (``RollingJournal(...)``, which
 runs ``_reconcile``), ``load_view``, generation-artifact reads, and the bytes
 produced by ``encode_json`` during the open. Fixtures are byte-identical across
 Ariadne revisions that preserve durable identities, so one fixture can be
@@ -214,11 +215,12 @@ def build(directory, events, generations):
     }
 
 
-def measure(directory, profile):
+def measure(directory, profile, in_place=False):
     config = settings()
     with tempfile.TemporaryDirectory(prefix="bench-rolling-") as scratch:
-        home = Path(scratch) / "home"
-        shutil.copytree(directory, home)
+        home = Path(directory) if in_place else Path(scratch) / "home"
+        if not in_place:
+            shutil.copytree(directory, home)
         store = EventStore(home / "ariadne" / "events.sqlite3")
         reads = {"count": 0, "bytes": 0}
         encoded = {"calls": 0, "bytes": 0}
@@ -291,11 +293,16 @@ def main(argv=None):
     measure_parser = commands.add_parser("measure", help="time one journal open of DIR")
     measure_parser.add_argument("directory")
     measure_parser.add_argument("--profile", type=int, default=0, metavar="LINES")
+    measure_parser.add_argument(
+        "--in-place",
+        action="store_true",
+        help="open DIR itself instead of a copy (large fixtures; the open may write it)",
+    )
     args = parser.parse_args(argv)
     if args.command == "build":
         result = build(args.directory, args.events, args.generations)
     else:
-        result = measure(args.directory, args.profile)
+        result = measure(args.directory, args.profile, args.in_place)
     profile = result.pop("profile", None)
     print(json.dumps(result), flush=True)
     if profile:
