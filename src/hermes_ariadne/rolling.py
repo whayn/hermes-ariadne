@@ -9,6 +9,7 @@ rolling_selection. Neither module schedules work or changes the host runtime.
 import hashlib
 import json
 import math
+from copy import deepcopy
 from dataclasses import asdict, dataclass, fields
 
 from .prepared import (
@@ -530,6 +531,33 @@ def generation_bytes(
     )
 
 
+class _ValidationMemo:
+    """Per-operation validation memo; never shared across operations or requests.
+
+    Scoped to one (store, session, reasoning policy); validate_generation rejects
+    a memo whose scope differs from the call's. ``rows`` is a snapshot of the
+    archive for this operation and only avoids repeated reads: every use still
+    re-verifies the row hash, message_uid and session, and callers receive
+    independent copies. An archive change during an operation is not seen by it;
+    the next operation (a new memo) rereads and detects it.
+    ``accepted`` holds views the journal itself already cross-checked (see
+    RollingJournal._view); validate_generation only reads it. Keys are the SHA-256
+    of the exact bytes just reread for this use, never a parent name.
+    """
+
+    def __init__(self, store, session_id, policy):
+        self.store, self.session_id, self.policy = store, session_id, policy
+        self.rows, self.accepted = {}, {}
+
+    def get_event(self, event_id):
+        row = deepcopy(self.rows.get(event_id))
+        if row is None:
+            row = self.store.get_event(event_id, session_id=self.session_id)
+            if row is not None:  # a missing row is never cached
+                self.rows[event_id] = deepcopy(row)
+        return row
+
+
 def validate_generation(
     snapshot_bytes: bytes,
     store,
@@ -541,16 +569,37 @@ def validate_generation(
     guard=None,
     _depth=0,
     _validated=None,
+    _memo=None,
 ) -> RollingView:
     """Hash the supplied exact bytes once, then validate those same bytes.
 
     Parent loader returns exact bounded bytes, never an unchecked prebuilt view.
     Optional guard is an actual raising capture callback around archive/parent IO.
+
+    ``_memo`` is journal-internal (RollingJournal._operation); callers outside the
+    journal must not pass it. Without one, a call-local memo dedupes archive row
+    reads within this call only. An accepted hit returns a view already validated
+    and journal-cross-checked in this operation, keyed by the sha256 of these exact
+    bytes (and re-checked against bytes, settings digest and the depth bound).
+    Archive rows are read once per memo; a memo is bound to this store, session
+    and policy object and is rejected otherwise.
     """
     if _depth >= settings.max_logical_jobs:
         raise ValueError("generation lineage exceeds campaign bound")
     value = decode_json(snapshot_bytes, settings.max_checkpoint_bytes)
     generation_id = sha256(snapshot_bytes)
+    if _memo is None:  # rows only: dedupe shared prefix reads within this one call
+        _memo = _ValidationMemo(store, session_id, policy)
+    if _memo.store is not store or _memo.session_id != session_id or _memo.policy is not policy:
+        raise ValueError("validation memo scope mismatch")
+    accepted = _memo.accepted.get(generation_id)
+    if accepted is not None:
+        if accepted.snapshot_bytes != snapshot_bytes or accepted.settings_digest != settings.digest:
+            raise ValueError("rolling generation identity mismatch")
+        # The accepted chain has ``sequence`` generations below this depth.
+        if _depth + accepted.sequence > settings.max_logical_jobs:
+            raise ValueError("generation lineage exceeds campaign bound")
+        return accepted
     keys = {f.name for f in fields(RollingView)} - {"snapshot_bytes", "generation_id"}
     headers = {"format", "version", "policy_id", "readable_projection_id", "prompt_version"}
     if type(value) is not dict or set(value) != keys | headers:
@@ -616,6 +665,7 @@ def validate_generation(
             guard=guard,
             _depth=_depth + 1,
             _validated=_validated,
+            _memo=_memo,
         )
         if (
             parent.generation_id != value["parent_generation"]
@@ -636,7 +686,7 @@ def validate_generation(
     for event, uid in zip(events, uids):
         if guard:
             guard()
-        row = store.get_event(event, session_id=session_id)
+        row = _memo.get_event(event)
         if guard:
             guard()
         if (
