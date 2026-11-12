@@ -193,35 +193,36 @@ Validated identity state is shared: each generation keeps its lineage and a memo
 index maps every delta identity to its introducing generation(s). For a linear
 chain retained state is O(distinct identities + generations²) rather than one
 whole-prefix set per generation; branches add one (identity, introducing
-generation) entry each. The selection/navigation/completion timings below predate
-these two changes.
+generation) entry each.
 
-On a synthetic aarch64 real-engine benchmark with approximately 8 KB exchanges,
-64 generations and 737 KB of request messages, selection takes 256 archive reads
-and 7.32 s, versus 1,024 reads and 17.93 s on the operation-local memo baseline.
-Navigation takes 6.78 s versus 10.26 s; completion 7.51 s versus 15.18 s. These
-exclude model/network latency and use an injected deterministic facade. The
-intermediate delta-only checkpoint was faster (4.18 s selection): request-wide
-reuse reduces reads but mandatory ancestor-artifact rereads offset CPU savings.
-Measured increasing generation counts (single runs; seconds, no model/network):
+Synthetic aarch64 real-engine benchmark: approximately 8 KB exchanges (737 KB of
+request messages at 64 generations), injected deterministic facade, no
+model/network latency, single runs. "Before" is the operation-local memo (#20,
+`d02fe9f`); "after" is this code. Archive reads are `select_context` validation
+reads; navigation also resolves requested host rows and completion includes
+legitimate current-host comparisons.
 
-| Generations | Baseline select reads | New select reads | Baseline select | New select | Baseline navigation | New navigation | Baseline completion | New completion |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 8 | 128 | 32 | 0.5703 | 0.3277 | 0.3167 | 0.1909 | 1.0241 | 0.4583 |
-| 16 | 256 | 64 | 1.5882 | 0.6430 | 0.8843 | 0.4958 | 2.3623 | 0.9919 |
-| 32 | 512 | 128 | 5.2808 | 1.9009 | 2.9009 | 1.6180 | 7.2290 | 2.5299 |
-| 48 | 768 | 192 | 10.5435 | 4.1566 | 6.0787 | 3.6810 | 14.2758 | 4.9713 |
-| 64 | 1024 | 256 | 17.9324 | 7.3210 | 10.2612 | 6.7756 | 15.1836 | 7.5089 |
+| Generations | Select reads before → after | Select s before → after | Navigation s before → after | Completion s before → after |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 128 → 32 | 0.570 → 0.198 | 0.317 → 0.139 | 1.024 → 0.559 |
+| 16 | 256 → 64 | 1.588 → 0.519 | 0.884 → 0.321 | 2.362 → 0.750 |
+| 32 | 512 → 128 | 5.281 → 0.891 | 2.901 → 0.664 | 7.229 → 1.408 |
+| 48 | 768 → 192 | 10.544 → 1.481 | 6.079 → 1.166 | 14.276 → 2.313 |
+| 64 | 1024 → 256 | 17.932 → 2.414 | 10.261 → 1.771 | 15.184 → 2.457 |
 
-Baseline: `0119048`; new code: `acd83eb`. Navigation also resolves requested host
-rows; completion includes legitimate current-host comparisons, not just validation.
-The disposable SDK directory used for these timing runs was later found absent;
-no model/native transport was exercised, but these are not pinned-SDK compatibility
-measurements. Full native compatibility is checked separately.
+Tracemalloc peaks at 64 generations (256 source events) are 22.1 MiB selection,
+23.6 MiB navigation and 25.0 MiB completion; they are not RSS. A separate journal
+open benchmark with 64 generations reached 65,536 source events (not the 100,000
+cap): retained identity state fell from about 224 MiB to 4.2 MiB and ancestor
+artifact reads per open from 4,161 to 192, but that open still took 317 s. Most
+of it re-serializes every job's full frozen target and generation (`_job`,
+`Target.from_bytes`, `target_id`, generation bytes), which is O(generations ×
+source events) per open.
 
 This is not an end-to-end latency sign-off. Keep #19 open and activation blocked;
-remove remaining request-local artifact duplication before deciding whether a
-cross-request cache with explicit invalidation and memory limits is justified.
+remove the remaining per-open target/job re-serialization and measure at the event
+cap before deciding whether a cross-request cache with explicit invalidation and
+memory limits is justified.
 If a session exceeds `max_prefix_events` before the trigger threshold is reached,
 or the logical-job budget is exhausted, rolling status reports `unavailable` while
 any retained view keeps being served; the label is coarser than the cause.
