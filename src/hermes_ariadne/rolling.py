@@ -9,12 +9,14 @@ rolling_selection. Neither module schedules work or changes the host runtime.
 import hashlib
 import json
 import math
+from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 
 from .prepared import (
     ReasoningReplayPolicy,
     _comparison_payloads,
+    _identity_value,
     _occurrences,
     _reasoning_resource_preflight,
     _require_reasoning_policy,
@@ -125,9 +127,14 @@ def encode_json(value, limit):
     return bytes(output)
 
 
-def decode_json(data, limit):
+def _admit_json_bytes(data, limit):
+    """The admission check for JSON input: exact ``bytes`` within ``limit``."""
     if type(data) is not bytes or len(data) > limit:
         raise ValueError("invalid or oversized JSON bytes")
+
+
+def decode_json(data, limit):
+    _admit_json_bytes(data, limit)
 
     def pairs(items):
         result = {}
@@ -166,8 +173,8 @@ class RollingSettings:
     timeout: int = 60
 
     def __post_init__(self):
-        for field in fields(self):
-            value = getattr(self, field.name)
+        for spec in fields(self):
+            value = getattr(self, spec.name)
             if type(value) is not int or not 0 < value <= 2**31 - 1:
                 raise ValueError("rolling limits must be positive bounded integers")
 
@@ -231,6 +238,121 @@ def _canonical_rows(rows, *, policy, settings):
     return tuple(event_ids), tuple(row["message_uid"] for row in rows), payloads
 
 
+@dataclass(frozen=True)
+class _PrefixState:
+    """Cross-row identity state of a validated completed-exchange prefix.
+
+    A valid prefix ends at a completed exchange (last row an assistant without
+    tool calls), so no tool call is pending and the next row must be a user row:
+    the ONLY cross-row facts a following delta can violate are uniqueness of
+    message uids, retained reasoning item ids and tool-call occurrence uids, and
+    the total length bound. Everything else ``_canonical_rows`` checks is per row
+    or per exchange. The values come from the audited functions' own outputs
+    (``_canonical_rows`` uids/payloads, ``_identity_value`` of validated rows).
+
+    Precondition: every link of the chain this state summarizes was canonicalized
+    with the SAME reasoning policy object and settings digest as the delta it is
+    extended with. ``_ValidationMemo`` is scoped to one policy object and callers
+    pass one ``RollingSettings`` (a generation's header must carry its digest), so
+    a state is never extended under a different policy or limit.
+
+    Representation: a state does not hold its prefix's identities. It holds the
+    ``lineage`` (the introducer ids of every link of its validated chain,
+    itself included) and a reference to a shared ``index`` mapping each kind's
+    identity to the introducer(s) whose validated delta contained it. The
+    prefix contains an identity exactly when one of its introducers is in the
+    lineage, so sibling branches extending one parent never see each other's
+    identities. Only a completed validation records into the index (see
+    ``_record_identities``); checking an extension never writes.
+
+    Memory per index: one entry per distinct (identity, introducing
+    generation) pair plus O(G) lineage ids per state, i.e. O(distinct
+    identities + G^2) for a linear chain, instead of a whole-prefix union per
+    generation.
+    """
+
+    length: int
+    lineage: frozenset
+    # Shared by every state of one memo: excluded from equality and repr.
+    index: dict = field(compare=False, repr=False)
+
+    def extends(self, view):
+        """Whether this is the validated state of ``view``'s whole prefix."""
+        return self.length == len(view.event_ids) and view.generation_id in self.lineage
+
+
+_IDENTITY_KINDS = (
+    ("message", "missing or duplicate logical identity"),
+    ("reasoning", "duplicate retained reasoning identity"),
+    ("occurrence", "occurrence identities must be unique"),
+)
+
+
+def _new_identity_index():
+    return {kind: {} for kind, _ in _IDENTITY_KINDS}
+
+
+def _introduced_in(introducers, lineage):
+    """Whether an index entry (one introducer, or a set of them) meets ``lineage``."""
+    if type(introducers) is set:
+        return not introducers.isdisjoint(lineage)
+    return introducers in lineage
+
+
+def _delta_identities(rows, uids, payloads):
+    """(message uids, reasoning ids, occurrence uids) of already-validated delta rows."""
+    reasoning = []
+    for payload in payloads:
+        items = payload.get("codex_reasoning_items")
+        if items:
+            reasoning.extend(item["id"] for item in items)
+    occurrences = []
+    for row in rows:
+        mapping = _identity_value(row, "tool_call_uids")
+        if mapping is not None:
+            occurrences.extend(uid for uid in mapping.values() if uid is not None)
+    return frozenset(uids), frozenset(reasoning), frozenset(occurrences)
+
+
+def _check_prefix_extension(prefix, rows, uids, payloads, settings):
+    """Reject ``rows`` (already ``_canonical_rows``-valid) extending ``prefix``.
+
+    Rejects a total length over the bound and any identity the delta shares
+    with the prefix, exactly where ``_canonical_rows`` of the whole prefix
+    would, and in the same order. Read-only: returns the delta's identity sets
+    for a caller that later records them after ITS validation completes. The
+    disjointness checks are defence in depth where another layer already
+    rejects: a repeated message uid is pre-empted by the generation header's
+    duplicate-source check, but a state must not rely on its caller.
+    """
+    if prefix.length + len(rows) > settings.max_prefix_events:
+        raise ValueError("nonempty bounded canonical rows required")
+    delta = _delta_identities(rows, uids, payloads)
+    if not prefix.lineage:
+        return delta  # a root prefix has nothing to collide with
+    for (kind, message), identities in zip(_IDENTITY_KINDS, delta):
+        table = prefix.index[kind]
+        for identity in identities:
+            introducers = table.get(identity)
+            if introducers is not None and _introduced_in(introducers, prefix.lineage):
+                raise ValueError(message)
+    return delta
+
+
+def _record_identities(index, introducer, delta):
+    """Record that ``introducer``'s validated delta contains ``delta``'s identities."""
+    for (kind, _), identities in zip(_IDENTITY_KINDS, delta):
+        table = index[kind]
+        for identity in identities:
+            introducers = table.get(identity)
+            if introducers is None:
+                table[identity] = introducer
+            elif type(introducers) is set:
+                introducers.add(introducer)
+            elif introducers != introducer:
+                table[identity] = {introducers, introducer}
+
+
 def readable_delta(
     canonical_rows: list[dict],
     *,
@@ -245,6 +367,11 @@ def readable_delta(
     """
     settings = settings or RollingSettings()
     events, _, payloads = _canonical_rows(canonical_rows, policy=policy, settings=settings)
+    return _render_delta(canonical_rows, events, payloads, settings)
+
+
+def _render_delta(canonical_rows, events, payloads, settings):
+    """Whitelist already-canonicalized delta rows (``events``/``payloads`` are theirs)."""
     if sum(row["role"] == "user" for row in canonical_rows) > settings.max_delta_exchanges:
         raise ValueError("too many delta exchanges")
     result = []
@@ -271,6 +398,31 @@ def _summary_input(parent_summary, delta, settings):
         },
         settings.max_request_bytes,
     )
+
+
+def _require_request_and_route(request_bytes, route_labels, *, settings, policy):
+    """Request/route admission shared by every Target constructor."""
+    request = decode_json(request_bytes, settings.max_request_bytes)
+    if (
+        type(request) is not list
+        or not request
+        or encode_json(request, settings.max_request_bytes) != request_bytes
+    ):
+        raise ValueError("request must be canonical facade-message JSON")
+    for message in request:
+        if (
+            type(message) is not dict
+            or set(message) != {"role", "content"}
+            or message["role"] not in {"system", "user", "assistant"}
+            or type(message["content"]) is not str
+        ):
+            raise ValueError("unsupported compactor request")
+    if type(route_labels) is not tuple or len(route_labels) != 2:
+        raise ValueError("bound route labels required")
+    for label in route_labels:
+        bounded_text(label, 1024)
+    if policy is not None and route_labels != (policy.issuer_kind, policy.issuer_model):
+        raise ValueError("frozen route differs from trusted reasoning binding")
 
 
 @dataclass(frozen=True)
@@ -337,39 +489,112 @@ class Target:
         if start >= len(events):
             raise ValueError("target must advance")
         delta = readable_delta(canonical_rows[start:], policy=policy, settings=settings)
-        request = decode_json(request_bytes, settings.max_request_bytes)
-        if (
-            type(request) is not list
-            or not request
-            or encode_json(request, settings.max_request_bytes) != request_bytes
-        ):
-            raise ValueError("request must be canonical facade-message JSON")
-        for message in request:
-            if (
-                type(message) is not dict
-                or set(message) != {"role", "content"}
-                or message["role"] not in {"system", "user", "assistant"}
-                or type(message["content"]) is not str
-            ):
-                raise ValueError("unsupported compactor request")
-        if type(route_labels) is not tuple or len(route_labels) != 2:
-            raise ValueError("bound route labels required")
-        for label in route_labels:
-            bounded_text(label, 1024)
-        if policy is not None and route_labels != (policy.issuer_kind, policy.issuer_model):
-            raise ValueError("frozen route differs from trusted reasoning binding")
+        return cls._assemble(
+            session_id=session_id,
+            settings=settings,
+            policy=policy,
+            parent=parent,
+            event_ids=events,
+            message_uids=uids,
+            delta_start=start,
+            delta=delta,
+            request_bytes=request_bytes,
+            route_labels=route_labels,
+        )
+
+    @classmethod
+    def _assemble(
+        cls,
+        *,
+        session_id,
+        settings,
+        policy,
+        parent,
+        event_ids,
+        message_uids,
+        delta_start,
+        delta,
+        request_bytes,
+        route_labels,
+    ):
+        """Request/route admission, then the Target; shared by every constructor.
+
+        ``delta`` is the already-rendered readable delta of the rows from
+        ``delta_start``. One place builds the Target so ``create`` and
+        ``_create_extension`` cannot drift apart field by field.
+        """
+        _require_request_and_route(request_bytes, route_labels, settings=settings, policy=policy)
         return cls(
-            session_id,
-            settings.digest,
-            None if parent is None else parent.generation_id,
-            None if parent is None else parent.summary_sha256,
-            events,
-            uids,
-            start,
-            len(events),
-            _summary_input(None if parent is None else parent.summary_text, delta, settings),
-            request_bytes,
-            route_labels,
+            session_id=session_id,
+            settings_digest=settings.digest,
+            parent_generation=None if parent is None else parent.generation_id,
+            parent_summary_sha256=None if parent is None else parent.summary_sha256,
+            event_ids=event_ids,
+            message_uids=message_uids,
+            delta_start=delta_start,
+            delta_stop=len(event_ids),
+            readable_input=_summary_input(
+                None if parent is None else parent.summary_text, delta, settings
+            ),
+            request_bytes=request_bytes,
+            route_labels=route_labels,
+        )
+
+    @classmethod
+    def _create_extension(
+        cls,
+        delta_rows,
+        *,
+        session_id,
+        settings,
+        policy,
+        parent,
+        prefix,
+        request_bytes,
+        route_labels,
+    ):
+        """``Target.create(parent's rows + delta_rows, parent=parent, ...)``, O(delta).
+
+        ``parent`` is a validated RollingView and ``prefix`` the ``_PrefixState`` its
+        validation produced (callers must tie both to the same validated object).
+        Only ``delta_rows`` are read and canonicalized; the parent's own rows were
+        verified when it was validated, and ``prefix`` carries every cross-row fact
+        the delta can violate (see ``_PrefixState``). Every other check, and the
+        resulting Target, is exactly ``create``'s. An empty ``delta_rows`` is
+        rejected as non-advancing.
+        """
+        bounded_text(session_id, 4096)
+        if any(
+            type(row) is not dict or row.get("session_id", session_id) != session_id
+            for row in delta_rows
+        ):
+            raise ValueError("foreign canonical session")
+        if parent.session_id != session_id or parent.settings_digest != settings.digest:
+            raise ValueError("target is not a parent prefix extension")
+        if not delta_rows:
+            raise ValueError("target must advance")
+        delta_events, delta_uids, payloads = _canonical_rows(
+            delta_rows, policy=policy, settings=settings
+        )
+        # Fail closed on a prefix state that is not the parent's (callers tie them).
+        if not prefix.extends(parent):
+            raise ValueError("target is not a parent prefix extension")
+        # Check only: a target never records identity state.
+        _check_prefix_extension(prefix, delta_rows, delta_uids, payloads, settings)
+        delta = _render_delta(delta_rows, delta_events, payloads, settings)
+        prefix_events = parent.event_ids + delta_events
+        prefix_uids = parent.message_uids + delta_uids
+        return cls._assemble(
+            session_id=session_id,
+            settings=settings,
+            policy=policy,
+            parent=parent,
+            event_ids=prefix_events,
+            message_uids=prefix_uids,
+            delta_start=parent.frontier_count,
+            delta=delta,
+            request_bytes=request_bytes,
+            route_labels=route_labels,
         )
 
     def to_bytes(self, settings):
@@ -386,7 +611,7 @@ class Target:
         return self._canonical_bytes(settings.max_checkpoint_bytes)
 
     def _canonical_bytes(self, limit):
-        data = {field.name: getattr(self, field.name) for field in fields(self)}
+        data = {spec.name: getattr(self, spec.name) for spec in fields(self)}
         for key in ("event_ids", "message_uids", "route_labels"):
             data[key] = list(data[key])
         for key in ("readable_input", "request_bytes"):
@@ -532,22 +757,61 @@ def generation_bytes(
 
 
 class _ValidationMemo:
-    """Per-operation validation memo; never shared across operations or requests.
+    """Request-local validation memo; never shared across journal opens.
 
     Scoped to one (store, session, reasoning policy); validate_generation rejects
     a memo whose scope differs from the call's. ``rows`` is a snapshot of the
-    archive for this operation and only avoids repeated reads: every use still
-    re-verifies the row hash, message_uid and session, and callers receive
-    independent copies. An archive change during an operation is not seen by it;
-    the next operation (a new memo) rereads and detects it.
+    insert-only archive for this open and only avoids repeated reads: every row
+    use still re-verifies its hash, message_uid and session, and callers receive
+    independent copies. Direct archive mutation within an open is unsupported;
+    the next open (a new memo) rereads and detects it. Settings bind on first use.
     ``accepted`` holds views the journal itself already cross-checked (see
     RollingJournal._view); validate_generation only reads it. Keys are the SHA-256
     of the exact bytes just reread for this use, never a parent name.
+    ``prefix_states`` is written only by validate_generation after it fully
+    validated that view; an accepted entry is only short-circuited when it is
+    that very validated object.
+    ``bound`` is None except inside ``operation()`` (one RollingJournal
+    operation: a fresh set on entry, None again on exit; a failed operation
+    drops the whole memo). validate_generation adds a parent id only after it
+    reread that parent's exact bytes through ``parent_loader`` in this
+    operation, they hashed to the id and validated (with every ancestor reached
+    the same way) to the view its prefix state is tied to. A bound id skips the
+    reread only while that view is also the accepted one; see ``parent_view``.
     """
 
     def __init__(self, store, session_id, policy):
         self.store, self.session_id, self.policy = store, session_id, policy
         self.rows, self.accepted = {}, {}
+        self.settings_digest: str | None = None
+        # generation_id -> (view, _PrefixState) recorded only by a completed
+        # validation of that exact view object; see validate_generation.
+        self.prefix_states = {}
+        # Shared identity index of every validated delta (see _PrefixState):
+        # {kind: {identity: introducer | {introducers}}}. A value is a single
+        # generation id, or a set of two or more when sibling branches
+        # introduced the same identity; never an empty set. Written only by
+        # _record_identities, after a whole validation has passed.
+        self.identities = _new_identity_index()
+        self.bound: set | None = None
+
+    @contextmanager
+    def operation(self):
+        """Scope of one journal operation: ``bound`` is a fresh set inside, None outside.
+
+        Every operation rereads and rebinds each ancestor itself; nothing bound
+        here survives it. The journal drops the whole memo when the operation
+        fails, so a failed operation never leaves a binding behind either.
+        """
+        self.bound = set()
+        try:
+            yield
+        finally:
+            self.bound = None
+
+    def empty_prefix(self):
+        """The state of a root generation's (empty) parent prefix in this memo."""
+        return _PrefixState(0, frozenset(), self.identities)
 
     def get_event(self, event_id):
         row = deepcopy(self.rows.get(event_id))
@@ -579,19 +843,85 @@ def validate_generation(
     ``_memo`` is journal-internal (RollingJournal._operation); callers outside the
     journal must not pass it. Without one, a call-local memo dedupes archive row
     reads within this call only. An accepted hit returns a view already validated
-    and journal-cross-checked in this operation, keyed by the sha256 of these exact
-    bytes (and re-checked against bytes, settings digest and the depth bound).
-    Archive rows are read once per memo; a memo is bound to this store, session
-    and policy object and is rejected otherwise.
+    and journal-cross-checked in this open, keyed by the sha256 of these exact
+    bytes (and re-checked against bytes, settings digest and the depth bound); it
+    short-circuits only when ``prefix_states`` ties it to the very view object a
+    completed validation here produced, otherwise it is validated in full.
+    Validation is incremental: only this generation's own delta rows
+    (``events[delta_start:]``) are read and canonicalized; every earlier row was
+    verified by the generation that introduced it, whose validated prefix state
+    carries what a delta can collide with. Archive rows are read once per memo; a
+    memo is bound to this store, session and policy object and is rejected
+    otherwise.
     """
     if _depth >= settings.max_logical_jobs:
         raise ValueError("generation lineage exceeds campaign bound")
-    value = decode_json(snapshot_bytes, settings.max_checkpoint_bytes)
+    # decode_json's own admission, applied before hashing: accepted bytes are
+    # bound by hash and exact comparison and never decoded again.
+    _admit_json_bytes(snapshot_bytes, settings.max_checkpoint_bytes)
     generation_id = sha256(snapshot_bytes)
     if _memo is None:  # rows only: dedupe shared prefix reads within this one call
         _memo = _ValidationMemo(store, session_id, policy)
     if _memo.store is not store or _memo.session_id != session_id or _memo.policy is not policy:
         raise ValueError("validation memo scope mismatch")
+    if _memo.settings_digest is None:
+        _memo.settings_digest = settings.digest
+    elif _memo.settings_digest != settings.digest:
+        raise ValueError("validation memo scope mismatch")
+
+    def parent_view(digest, *, prehash):
+        """The validated parent ``digest``: reread and hash-bound once per operation.
+
+        ``prehash`` hashes the reread bytes against ``digest`` before validating
+        them (the accepted-head walk, where nothing else ties them to the name).
+
+        ``_memo.bound`` (journal operations only, else None) holds the parents
+        whose exact bytes were reread through ``parent_loader`` in THIS
+        operation, hashed to their name and resolved to the view their
+        prefix state is tied to, after their own ancestors were reached the
+        same way. A bound parent skips the reread only while it is ALSO the
+        tied accepted (journal-cross-checked) view; the depth bound is still
+        applied to the skipped chain. Anything else is reread.
+        """
+        bound = _memo.bound
+        if bound is not None and digest in bound:
+            hit = _memo.accepted.get(digest)
+            recorded = _memo.prefix_states.get(digest)
+            if hit is not None and recorded is not None and recorded[0] is hit:
+                if _depth + 1 + hit.sequence > settings.max_logical_jobs:
+                    raise ValueError("generation lineage exceeds campaign bound")
+                return hit
+        if parent_loader is None:
+            raise ValueError("parent generation unavailable")
+        if guard:
+            guard()
+        data = parent_loader(digest)
+        if guard:
+            guard()
+        if prehash and sha256(data) != digest:
+            raise ValueError("generation parent lineage mismatch")
+        parent = validate_generation(
+            data,
+            store,
+            session_id,
+            settings,
+            policy=policy,
+            parent_loader=parent_loader,
+            guard=guard,
+            _depth=_depth + 1,
+            _validated=_validated,
+            _memo=_memo,
+        )
+        recorded = _memo.prefix_states.get(digest)
+        if (
+            bound is not None
+            and parent.generation_id == digest
+            and recorded is not None
+            and recorded[0] is parent
+        ):
+            bound.add(digest)
+        return parent
+
     accepted = _memo.accepted.get(generation_id)
     if accepted is not None:
         if accepted.snapshot_bytes != snapshot_bytes or accepted.settings_digest != settings.digest:
@@ -599,7 +929,17 @@ def validate_generation(
         # The accepted chain has ``sequence`` generations below this depth.
         if _depth + accepted.sequence > settings.max_logical_jobs:
             raise ValueError("generation lineage exceeds campaign bound")
-        return accepted
+        recorded = _memo.prefix_states.get(generation_id)
+        if recorded is not None and recorded[0] is accepted:
+            # Archive rows are insert-only, artifacts are not: reread and bind
+            # every ancestor's exact bytes (once per journal operation) even
+            # when this head is accepted.
+            if accepted.parent_generation is not None:
+                parent_view(accepted.parent_generation, prehash=True)
+            return accepted
+        # An accepted view this memo cannot tie to a validated prefix state (it
+        # was not produced here) is not trusted as a parent: validate it in full.
+    value = decode_json(snapshot_bytes, settings.max_checkpoint_bytes)
     keys = {f.name for f in fields(RollingView)} - {"snapshot_bytes", "generation_id"}
     headers = {"format", "version", "policy_id", "readable_projection_id", "prompt_version"}
     if type(value) is not dict or set(value) != keys | headers:
@@ -644,29 +984,11 @@ def validate_generation(
         raise ValueError("summary hash mismatch")
     if sha256(encode_json(events, settings.max_checkpoint_bytes)) != value["prefix_sha256"]:
         raise ValueError("prefix hash mismatch")
-    parent = None
+    parent, parent_state = None, _memo.empty_prefix()
     if value["parent_generation"] is not None:
         require_digest(value["parent_generation"])
         require_digest(value["parent_summary_sha256"])
-        if parent_loader is None:
-            raise ValueError("parent generation unavailable")
-        if guard:
-            guard()
-        data = parent_loader(value["parent_generation"])
-        if guard:
-            guard()
-        parent = validate_generation(
-            data,
-            store,
-            session_id,
-            settings,
-            policy=policy,
-            parent_loader=parent_loader,
-            guard=guard,
-            _depth=_depth + 1,
-            _validated=_validated,
-            _memo=_memo,
-        )
+        parent = parent_view(value["parent_generation"], prehash=False)
         if (
             parent.generation_id != value["parent_generation"]
             or parent.summary_sha256 != value["parent_summary_sha256"]
@@ -676,14 +998,31 @@ def validate_generation(
             or tuple(uids[: parent.frontier_count]) != parent.message_uids
         ):
             raise ValueError("generation parent lineage mismatch")
+        # Unreachable while the recursive call above is the only producer of
+        # ``parent`` (it records the state of exactly the view it returns); kept
+        # as a fail-closed guard so a future refactor cannot silently extend an
+        # empty or foreign prefix state.
+        recorded = _memo.prefix_states.get(parent.generation_id)
+        if (
+            recorded is None
+            or recorded[0] is not parent
+            or recorded[1].index is not _memo.identities
+            or not recorded[1].extends(parent)
+        ):
+            raise ValueError("generation parent state unavailable")
+        parent_state = recorded[1]
     elif (
         value["parent_summary_sha256"] is not None
         or value["delta_start"] != 0
         or value["sequence"] != 1
     ):
         raise ValueError("invalid root generation")
+    # Only this generation's own delta is read and canonicalized: every earlier
+    # row was verified by the generation that introduced it (parent chain above),
+    # and the parent's prefix state carries everything a delta can collide with.
+    start = value["delta_start"]
     source = []
-    for event, uid in zip(events, uids):
+    for event, uid in zip(events[start:], uids[start:]):
         if guard:
             guard()
         row = _memo.get_event(event)
@@ -698,8 +1037,15 @@ def validate_generation(
         if row.get("session_id", session_id) != session_id:
             raise ValueError("foreign generation source")
         source.append(row)
-    _canonical_rows(source, policy=policy, settings=settings)
-    delta = readable_delta(source[value["delta_start"] :], policy=policy, settings=settings)
+    delta_events, delta_uids, payloads = _canonical_rows(source, policy=policy, settings=settings)
+    # Check only: this generation's identities are recorded after every check below.
+    delta_identities = _check_prefix_extension(parent_state, source, delta_uids, payloads, settings)
+    length = parent_state.length + len(source)
+    # Redundant by construction (each row's hash was re-verified above and the
+    # parent lineage fixed ``start``/length), re-asserted as defence in depth.
+    if len(events) != length or tuple(events[start:]) != delta_events:
+        raise ValueError("generation source unavailable or changed")
+    delta = _render_delta(source, delta_events, payloads, settings)
     if (
         sha256(_summary_input(None if parent is None else parent.summary_text, delta, settings))
         != value["summary_input_sha256"]
@@ -711,19 +1057,53 @@ def validate_generation(
         del value[key]
     value["event_ids"], value["message_uids"] = tuple(events), tuple(uids)
     view = RollingView(snapshot_bytes, generation_id, **value)
+    # Validation is complete: record this delta's identities under this
+    # generation, and its state as its parent's lineage plus itself.
+    _record_identities(_memo.identities, generation_id, delta_identities)
+    state = _PrefixState(length, parent_state.lineage | {generation_id}, _memo.identities)
+    _memo.prefix_states[generation_id] = (view, state)
     if _validated is not None:
         _validated.append(view)
     return view
 
 
 def revalidate_view(
-    view, store, session_id, settings, *, policy=None, parent_loader=None, guard=None
+    view,
+    store,
+    session_id,
+    settings,
+    *,
+    policy=None,
+    parent_loader=None,
+    guard=None,
+    _journal=None,
 ):
     """Recheck exact immutable bytes, all source dependencies and parent lineage.
 
     Never trust a dataclass's exposed fields instead of its validated snapshot.
     Scope/settings are supplied by the caller, not by model-controlled arguments.
+    The engine may supply its explicit open journal to reuse that request's
+    validation; its bounded artifact reader is authoritative and rereads the
+    head and every ancestor. Independent calls retain fresh call-local validation.
     """
+    if _journal is not None:
+        with _journal._operation():
+            if type(view) is not RollingView:
+                raise ValueError("trusted rolling view required")
+            if (
+                _journal.store is not store
+                or _journal.session_id != session_id
+                or _journal.settings.digest != settings.digest
+                or _journal.policy is not policy
+                or (parent_loader is not None and parent_loader != _journal._parent_bytes)
+            ):
+                raise ValueError("validation journal scope mismatch")
+            _journal._check(guard)
+            checked = _journal._view(_journal._parent_bytes(view.generation_id))
+            _journal._check(guard)
+            if checked != view:
+                raise ValueError("rolling view differs from its exact snapshot")
+            return checked
     if type(view) is not RollingView:
         raise ValueError("trusted rolling view required")
     checked = validate_generation(

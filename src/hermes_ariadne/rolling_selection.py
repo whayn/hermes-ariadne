@@ -74,6 +74,7 @@ def validate_rolling_alignment(
     reasoning_policy=None,
     parent_loader=None,
     guard=None,
+    _journal=None,
 ):
     if retirement_policy != POLICY_ID:
         raise ValueError("explicit aged-state retirement policy required")
@@ -85,6 +86,7 @@ def validate_rolling_alignment(
         policy=reasoning_policy,
         parent_loader=parent_loader,
         guard=guard,
+        _journal=_journal,
     )
     _admit_messages(request, conversation, active, [incoming])
     split = _leading(request)
@@ -158,6 +160,7 @@ def select_rolling(
     reasoning_policy=None,
     parent_loader=None,
     guard=None,
+    _journal=None,
 ):
     """Decline means original-request fallback, never a dispatch veto/fit proof."""
     diagnostics = {
@@ -187,6 +190,7 @@ def select_rolling(
             reasoning_policy=reasoning_policy,
             parent_loader=parent_loader,
             guard=guard,
+            _journal=_journal,
         )
         memory = navigation(view)
         diagnostics["history_bytes"] = len(memory.encode("utf-8"))

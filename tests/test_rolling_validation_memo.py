@@ -1,4 +1,4 @@
-"""Per-operation validation memo (#19): scope, copy isolation, depth parity, linear reads."""
+"""Request-local validation memo (#19): scope, copy isolation, depth parity, linear reads."""
 
 import json
 import sqlite3
@@ -122,18 +122,19 @@ def _forge(settings, view, text):
     return rolling.encode_json(value, settings.max_checkpoint_bytes)
 
 
-def test_journal_memo_lives_only_inside_an_operation(tmp_path):
+def test_journal_memo_lives_only_inside_an_open(tmp_path):
     store, settings, views, *_ = chain(tmp_path, 3)
     with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
-        assert journal._memo is None
+        memo = journal._memo
+        assert memo is not None
         with journal._operation():
-            memo = journal._memo
+            assert journal._memo is memo
             assert memo.store is store and memo.session_id == "s"
             journal._view(journal._parent_bytes(views[-1].generation_id))
             assert set(memo.accepted) == {view.generation_id for view in views}
-        assert journal._memo is None
+        assert journal._memo is memo
         with journal._operation():
-            assert journal._memo is not memo and not journal._memo.accepted
+            assert journal._memo is memo and journal._memo.accepted
     with pytest.raises(ValueError):
         with journal._operation():
             pass
@@ -150,7 +151,8 @@ def test_operation_exception_resets_memo_and_busy_and_journal_stays_usable(tmp_p
         assert journal._memo is None
         assert journal._busy is False
         assert journal.load_view() == views[-1]
-        assert journal._memo is None
+        assert journal._memo is not None
+    assert journal._memo is None
 
 
 def test_generation_accepted_only_after_journal_cross_check(tmp_path):
@@ -161,8 +163,8 @@ def test_generation_accepted_only_after_journal_cross_check(tmp_path):
             forged = _forge(settings, views[-1], "forged head")
             with pytest.raises(ValueError, match="unjournaled or mismatching generation"):
                 journal._view(forged)
-            # The cross-checked root ancestor is accepted; the forged head never is.
-            assert set(journal._memo.accepted) == {views[0].generation_id}
+            # Opening accepted the real chain; the forged head never is.
+            assert set(journal._memo.accepted) == {v.generation_id for v in views}
             assert journal._view(views[-1].snapshot_bytes) == views[-1]
             assert views[-1].generation_id in journal._memo.accepted
             assert rolling.sha256(forged) not in journal._memo.accepted
@@ -176,14 +178,14 @@ def test_accepted_parent_is_found_by_reread_bytes_not_by_name(tmp_path):
         original = journal._parent_bytes
         with journal._operation():
             assert journal._view(root.snapshot_bytes) == root
-            assert set(journal._memo.accepted) == {root.generation_id}
+            assert set(journal._memo.accepted) == {v.generation_id for v in views}
             # The parent *name* is an accepted id, but the bytes reread under it differ.
             journal._parent_bytes = lambda digest: (
                 forged if digest == root.generation_id else original(digest)
             )
             with pytest.raises(ValueError, match="lineage"):
                 journal._view(views[1].snapshot_bytes)
-            assert set(journal._memo.accepted) == {root.generation_id}
+            assert set(journal._memo.accepted) == {v.generation_id for v in views}
 
 
 def test_memoized_reads_are_still_guarded_and_still_verified(tmp_path, monkeypatch):
@@ -265,14 +267,13 @@ def test_open_fully_validates_each_generation_at_most_once(tmp_path, monkeypatch
     with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
         # Opening reconciles in one operation, reaching every generation as a job parent,
         # as the manifest head and as an artifact; shared ancestors are validated once.
-        assert set(full) == {view.message_uids for view in views}
+        # Canonicalization is incremental: each generation checks only its own delta.
+        assert set(full) == {view.message_uids[view.delta_start :] for view in views}
         assert max(full.values()) == 1, dict(full)
         full.clear()
-        # A later operation starts from nothing (no cross-operation state) but is
-        # itself linear.
+        # A later operation in this open reuses the validated source snapshot.
         assert journal.load_view() == views[-1]
-        assert set(full) == {view.message_uids for view in views}
-        assert max(full.values()) == 1, dict(full)
+        assert not full
 
 
 def test_memo_bound_to_reasoning_policy_is_enforced(tmp_path):

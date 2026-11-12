@@ -240,7 +240,9 @@ def test_read_capture_guard_and_reentry_prevent_write(tmp_path, monkeypatch):
     with rolling_state.RollingJournal(tmp_path, "s", settings, store=store, guard=guard) as journal:
         frozen = target(store, settings, 1)
         journal.freeze_target(frozen)
-        original = store.get_event
+        # A reserve in this open reads the request snapshot, not the store again.
+        # Revoke during that real memo read to retain cache-hit lifecycle coverage.
+        original = journal._memo.get_event
 
         def rebind(*args, **kwargs):
             nonlocal stale
@@ -248,7 +250,7 @@ def test_read_capture_guard_and_reentry_prevent_write(tmp_path, monkeypatch):
             stale = True
             return value
 
-        monkeypatch.setattr(store, "get_event", rebind)
+        monkeypatch.setattr(journal._memo, "get_event", rebind)
         with pytest.raises(ValueError, match="capture changed"):
             journal.reserve(frozen.job_id, frozen.request_bytes, guard, guard)
         stale = False

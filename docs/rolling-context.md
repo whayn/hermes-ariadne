@@ -172,18 +172,57 @@ A declined `select_context` returns `None`: Hermes can send the original request
 which can overflow. This is **not a dispatch veto** or a universal size guarantee.
 
 **Known performance limit (#19).** Every request and every rolling navigation call
-reopens the session journal and revalidates the pinned view. Validation is
-memoized within one journal operation only: each archive event is read once, and
-each generation is validated and cross-checked against the journal once per open.
-There is no cross-request cache, so each request still revalidates every published
-generation. Archive reads per open are linear in source events. CPU time grows
-roughly quadratically, because each generation canonicalizes its own source
-prefix. Measured on a synthetic aarch64 journal at the default 64-job bound: one
-open takes 128 archive reads and about 1.3 s (previously 187,200 reads and 129 s).
-A later `load_view` takes about 0.7 s and one view revalidation about 0.5 s. These
-are component timings, not an end-to-end request measurement. Whether this
-per-request cost is acceptable, or a separately invalidated cross-request cache is
-needed, is still open; activation for normal use remains blocked on that decision.
+reopens the session journal and revalidates the pinned view. One journal open now
+shares its validation memo across reconciliation, loading and revalidation until
+close. A failed operation discards it; caught nested reentry does not take ownership
+of the outer operation's state. Each archive event is read once for validation in
+that scope. Current host-row comparisons and accounting/recovery checks stay fresh.
+Generation and target validation canonicalize deltas against validated parent
+identity state rather than repeatedly canonicalizing complete prefixes.
+
+There is no persistent or cross-request cache. Supported archive writes are
+insert-only: direct SQL mutation during an open is outside its source-snapshot
+contract; a new open rereads sources and detects corruption. Artifact head bytes
+are hashed on every use. Every journal operation rereads and exact-hash-binds each
+ancestor artifact at most once per operation (the first time that operation reaches
+it); another operation never reuses that binding, so one operation's artifact work
+is linear in generations. An ancestor file rewritten on disk after it was bound
+within an operation is not seen until the next operation: artifacts are
+content-addressed and written once by supported code.
+Validated identity state is shared: each generation keeps its lineage and a memo
+index maps every delta identity to its introducing generation(s). For a linear
+chain retained state is O(distinct identities + generations²) rather than one
+whole-prefix set per generation; branches add one (identity, introducing
+generation) entry each.
+
+Synthetic aarch64 real-engine benchmark: approximately 8 KB exchanges (737 KB of
+request messages at 64 generations), injected deterministic facade, no
+model/network latency, single runs. "Before" is the operation-local memo (#20,
+`d02fe9f`); "after" is this code. Archive reads are `select_context` validation
+reads; navigation also resolves requested host rows and completion includes
+legitimate current-host comparisons.
+
+| Generations | Select reads before → after | Select s before → after | Navigation s before → after | Completion s before → after |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 128 → 32 | 0.570 → 0.198 | 0.317 → 0.139 | 1.024 → 0.559 |
+| 16 | 256 → 64 | 1.588 → 0.519 | 0.884 → 0.321 | 2.362 → 0.750 |
+| 32 | 512 → 128 | 5.281 → 0.891 | 2.901 → 0.664 | 7.229 → 1.408 |
+| 48 | 768 → 192 | 10.544 → 1.481 | 6.079 → 1.166 | 14.276 → 2.313 |
+| 64 | 1024 → 256 | 17.932 → 2.414 | 10.261 → 1.771 | 15.184 → 2.457 |
+
+Tracemalloc peaks at 64 generations (256 source events) are 22.1 MiB selection,
+23.6 MiB navigation and 25.0 MiB completion; they are not RSS. A separate journal
+open benchmark with 64 generations reached 65,536 source events (not the 100,000
+cap): retained identity state fell from about 224 MiB to 4.2 MiB and ancestor
+artifact reads per open from 4,161 to 192, but that open still took 317 s. Most
+of it re-serializes every job's full frozen target and generation (`_job`,
+`Target.from_bytes`, `target_id`, generation bytes), which is O(generations ×
+source events) per open.
+
+This is not an end-to-end latency sign-off. Keep #19 open and activation blocked;
+remove the remaining per-open target/job re-serialization and measure at the event
+cap before deciding whether a cross-request cache with explicit invalidation and
+memory limits is justified.
 If a session exceeds `max_prefix_events` before the trigger threshold is reached,
 or the logical-job budget is exhausted, rolling status reports `unavailable` while
 any retained view keeps being served; the label is coarser than the cause.

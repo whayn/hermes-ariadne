@@ -53,6 +53,7 @@ def handle_rolling_tool(
     reasoning_policy=None,
     parent_loader=None,
     guard=None,
+    _journal=None,
 ):
     """The engine supplies pin/scope; arguments cannot pick artifacts or paths.
 
@@ -89,6 +90,7 @@ def handle_rolling_tool(
             policy=reasoning_policy,
             parent_loader=parent_loader,
             guard=guard,
+            _journal=_journal,
         )
         # Revalidation checks EVERY dependency and parent, even for empty pages.
         # Resolve roles from exact source versions, never a mutable active index.
