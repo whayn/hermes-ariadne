@@ -873,11 +873,16 @@ class RollingVerificationCache:
 
     The scope is (archive path, session, settings digest, reasoning policy);
     binding a different scope discards everything. Entries are recorded only
-    after a journal operation completes successfully. ``max_source_ids`` bounds
-    the total length of the source-id sequences the entries carry (ids and
-    uids counted once per entry; shared tuples are not deduplicated), and
-    ``max_entries`` the entry count; the least recently used entries are
-    evicted first. Eviction only costs a full revalidation.
+    after a journal operation completes successfully. ``max_entries`` bounds
+    the entry count. ``max_source_ids`` bounds the summed weight of entries,
+    where an entry weighs the length of its event-id sequence: its equally long
+    message-uid sequence, delta identity sets, summary text and readable input
+    are not counted, and a tuple shared by several entries is counted once per
+    entry. It is therefore a count bound, not a byte limit (the benchmark at the
+    100,000-event cap measured ~135 MiB retained for a weight of ~6.5 million).
+    An entry heavier than the bound is not recorded; otherwise the least
+    recently used entries are evicted first. Eviction only costs a full
+    revalidation.
     """
 
     def __init__(self, *, max_entries=512, max_source_ids=2 * 64 * 100000):

@@ -268,9 +268,11 @@ reservation state. It skips only decoding, canonicalizing, rendering and
 summary-input hashing of bytes that did not change. Entries are recorded only
 when a journal operation completes; a refused or failed operation records
 nothing. Binding another scope discards everything; least-recently-used entries
-are evicted beyond an entry bound and a bound on the total source-id sequence
-length they carry (engine default: 8 × `max_logical_jobs` entries, 2 ×
-`max_logical_jobs` × `max_prefix_events` ids). It is never persisted: the first
+are evicted beyond an entry bound and a weight bound, where an entry weighs the
+length of its event-id sequence (engine default: 8 × `max_logical_jobs` entries,
+weight 2 × `max_logical_jobs` × `max_prefix_events`). The weight bound is a count,
+not a byte limit: uid sequences, identity sets and texts are not counted, so
+retained memory is measured separately below. It is never persisted: the first
 open after a process start, scope change or eviction pays the full cost above.
 Durable formats and identities are unchanged.
 
