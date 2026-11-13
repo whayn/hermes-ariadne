@@ -215,8 +215,33 @@ def build(directory, events, generations):
     }
 
 
-def measure(directory, profile, in_place=False):
+def retained_mib(cache):
+    """Deep size of the objects the cache's entries keep alive (each object once)."""
+    seen, size = set(), 0
+    stack = [known for known, _ in cache._entries.values()]
+    while stack:
+        item = stack.pop()
+        if id(item) in seen or item is None or isinstance(item, (type, int, bool)):
+            continue
+        seen.add(id(item))
+        size += sys.getsizeof(item)
+        if isinstance(item, dict):
+            stack.extend(item.keys())
+            stack.extend(item.values())
+        elif isinstance(item, (tuple, list, set, frozenset)):
+            stack.extend(item)
+        elif hasattr(item, "__dict__"):
+            size += sys.getsizeof(vars(item))
+            stack.extend(vars(item).values())
+    return round(size / 2**20, 1)
+
+
+def measure(directory, profile, in_place=False, cache=False):
     config = settings()
+    # --cache: one RollingVerificationCache shared by every open below, as an
+    # engine holds one. The first open is cold (it populates the cache); a
+    # second, warm open is then timed separately.
+    extra = {"cache": rolling.RollingVerificationCache()} if cache else {}
     with tempfile.TemporaryDirectory(prefix="bench-rolling-") as scratch:
         home = Path(directory) if in_place else Path(scratch) / "home"
         if not in_place:
@@ -244,7 +269,7 @@ def measure(directory, profile, in_place=False):
         try:
             started = time.perf_counter()
             journal = rolling_state.RollingJournal(
-                home, SESSION, config, store=store, policy=POLICY
+                home, SESSION, config, store=store, policy=POLICY, **extra
             )
             open_s = time.perf_counter() - started
             open_reads, open_encoded = dict(reads), dict(encoded)
@@ -254,6 +279,21 @@ def measure(directory, profile, in_place=False):
                 load_s = time.perf_counter() - started
             finally:
                 journal.close()
+            if cache:
+                reads.update(count=0, bytes=0)
+                encoded.update(calls=0, bytes=0)
+                started = time.perf_counter()
+                journal = rolling_state.RollingJournal(
+                    home, SESSION, config, store=store, policy=POLICY, **extra
+                )
+                warm_open_s = time.perf_counter() - started
+                warm_reads, warm_encoded = dict(reads), dict(encoded)
+                try:
+                    started = time.perf_counter()
+                    assert journal.load_view() == view
+                    warm_load_s = time.perf_counter() - started
+                finally:
+                    journal.close()
         finally:
             rolling_state._read, rolling.encode_json = read, encode
             rolling_state.encode_json = encode
@@ -271,10 +311,21 @@ def measure(directory, profile, in_place=False):
             "load_view_s": round(load_s, 3),
             "maxrss_mib": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1),
         }
+        if cache:
+            result.update(
+                warm_open_s=round(warm_open_s, 3),
+                warm_open_artifact_reads=warm_reads["count"],
+                warm_open_encode_json_mib=round(warm_encoded["bytes"] / 2**20, 2),
+                warm_load_view_s=round(warm_load_s, 3),
+                cache=extra["cache"].stats(),
+                cache_retained_mib=retained_mib(extra["cache"]),
+            )
         if profile:
             profiler = cProfile.Profile()
             profiler.enable()
-            rolling_state.RollingJournal(home, SESSION, config, store=store, policy=POLICY).close()
+            rolling_state.RollingJournal(
+                home, SESSION, config, store=store, policy=POLICY, **extra
+            ).close()
             profiler.disable()
             stream = io.StringIO()
             stats = pstats.Stats(profiler, stream=stream).sort_stats("cumulative")
@@ -298,11 +349,16 @@ def main(argv=None):
         action="store_true",
         help="open DIR itself instead of a copy (large fixtures; the open may write it)",
     )
+    measure_parser.add_argument(
+        "--cache",
+        action="store_true",
+        help="share a RollingVerificationCache across opens and also time a warm open",
+    )
     args = parser.parse_args(argv)
     if args.command == "build":
         result = build(args.directory, args.events, args.generations)
     else:
-        result = measure(args.directory, args.profile, args.in_place)
+        result = measure(args.directory, args.profile, args.in_place, args.cache)
     profile = result.pop("profile", None)
     print(json.dumps(result), flush=True)
     if profile:

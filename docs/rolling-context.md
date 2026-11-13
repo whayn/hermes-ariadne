@@ -180,7 +180,8 @@ that scope. Current host-row comparisons and accounting/recovery checks stay fre
 Generation and target validation canonicalize deltas against validated parent
 identity state rather than repeatedly canonicalizing complete prefixes.
 
-There is no persistent or cross-request cache. Supported archive writes are
+There is no persistent cache. Without a verification cache (below), nothing is
+reused across requests. Supported archive writes are
 insert-only: direct SQL mutation during an open is outside its source-snapshot
 contract; a new open rereads sources and detects corruption. Artifact head bytes
 are hashed on every use. Every journal operation rereads and exact-hash-binds each
@@ -250,6 +251,51 @@ freshness contract.
 
 This is not an end-to-end latency sign-off. Keep #19 open and activation blocked
 until opens at the event cap are usable per request.
+
+**Cross-open verification cache.** The rolling engine passes one process-local
+`RollingVerificationCache` per agent (clones get their own) to every journal open;
+`RollingJournal(cache=None)` behaves exactly as above. It records only results
+that are deterministic functions of hashed bytes in one scope (archive path,
+session, settings digest, reasoning-policy value): a generation artifact whose
+bytes hash to its id was fully validated, and a target payload whose bytes hash
+to its id parsed to a given target that was fully validated against its parent.
+A later open still rereads and hashes every artifact and target payload, has the
+store reread and rehash every referenced archive row in the session
+(`EventStore.verify_events`), rereads every ancestor through the parent loader,
+and rechecks lineage, identity collisions, length bounds, the journal
+cross-check of every generation and all campaign, accounting, recovery and
+reservation state. It skips only decoding, canonicalizing, rendering and
+summary-input hashing of bytes that did not change. Entries are recorded only
+when a journal operation completes; a refused or failed operation records
+nothing. Binding another scope discards everything; least-recently-used entries
+are evicted beyond an entry bound and a bound on the total source-id sequence
+length they carry (engine default: 8 × `max_logical_jobs` entries, 2 ×
+`max_logical_jobs` × `max_prefix_events` ids). It is never persisted: the first
+open after a process start, scope change or eviction pays the full cost above.
+Durable formats and identities are unchanged.
+
+A differential test changes archive rows (payload, observation, session, uid),
+artifacts, the manifest, job text/state, target payloads (including a
+consistently rehashed forgery), accounting and leftover artifacts after warming
+the cache, and requires exactly the uncached verdict.
+
+`bench_rolling_open.py measure --cache` times the first (cold) open, which fills
+the cache, and then a second open with the same cache, on the fixtures above
+(single runs, same host; retained size is a deep `sys.getsizeof` walk of the
+objects entries keep alive, not RSS):
+
+| Source events | Cold open s | Warm open s | Warm `load_view` s | Cache retained MiB |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 | 0.69 | 0.24 | 0.04 | 0.6 |
+| 4,096 | 7.7 | 0.46 | 0.05 | 5.6 |
+| 16,384 | 29.1 | 1.30 | 0.11 | 21.7 |
+| 65,536 | 119.4 | 4.96 | 0.33 | 86.1 |
+| 100,000 | 180.1 | 7.46 | 0.50 | 135.3 |
+
+A warm open at the cap is about 24× faster but still several seconds: it rereads
+and rehashes about 1 GiB of stored targets and generations (each still holds its
+whole prefix) plus every archive row. Reducing that further needs the stored
+format to hold only deltas.
 If a session exceeds `max_prefix_events` before the trigger threshold is reached,
 or the logical-job budget is exhausted, rolling status reports `unavailable` while
 any retained view keeps being served; the label is coarser than the cause.

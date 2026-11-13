@@ -22,7 +22,9 @@ from .receipts import _fingerprint
 from .rolling import (
     FORMAT,
     VERSION,
+    RollingVerificationCache,
     Target,
+    _check_known_extension,
     _generation_matches,
     _ValidationMemo,
     bounded_text,
@@ -108,8 +110,12 @@ def _atomic(path, data):
 
 
 class RollingJournal:
-    def __init__(self, home, session_id, settings, *, store, policy=None, guard=None):
+    def __init__(self, home, session_id, settings, *, store, policy=None, guard=None, cache=None):
         bounded_text(session_id, 4096)
+        if cache is not None and type(cache) is not RollingVerificationCache:
+            raise ValueError("unsupported rolling verification cache")
+        # Optional owner-held cross-open cache of content-addressed verdicts.
+        self.cache = cache
         self.settings, self.session_id, self.store, self.policy = (
             settings,
             session_id,
@@ -120,7 +126,7 @@ class RollingJournal:
         self._conn = None
         self._lock_fd = None
         self._busy = False
-        self._memo = _ValidationMemo(store, session_id, policy)
+        self._memo = _ValidationMemo(store, session_id, policy, cache, settings.digest)
         self._check()
         root = Path(home).absolute()
         for item in (root, *root.parents):
@@ -223,13 +229,17 @@ class RollingJournal:
         try:
             # One insert-only archive snapshot per open, never across requests.
             if self._memo is None:
-                self._memo = _ValidationMemo(self.store, self.session_id, self.policy)
+                self._memo = _ValidationMemo(
+                    self.store, self.session_id, self.policy, self.cache, self.settings.digest
+                )
             # The memo's operation scope owns the ancestor artifact binding:
             # every operation rereads and rebinds each ancestor exactly once.
             with self._memo.operation():
                 self._check()
                 yield
                 self._check()
+            # Only a completed operation's verdicts reach the cross-open cache.
+            self._memo.promote()
         except BaseException:
             # A failed operation must not leave partially accepted validation state.
             self._memo = None
@@ -373,10 +383,11 @@ class RollingJournal:
         ).fetchone()
         payload = row["payload"]
         digest = sha256(payload) if type(payload) is bytes else None
-        cached = None if self._memo is None else self._memo.targets.get(digest)
-        # A hit is a Target already parsed and verified from these exact bytes in
-        # this open; anything else (including non-bytes) is parsed and rejected here.
-        target = cached if cached is not None else Target.from_bytes(payload, self.settings)
+        known = None if self._memo is None or digest is None else self._memo.known_target(digest)
+        # A hit is a Target already parsed and verified from these exact bytes (in
+        # this open or, through the cache, an earlier one in this scope); anything
+        # else (including non-bytes) is parsed and rejected here.
+        target = known.target if known is not None else Target.from_bytes(payload, self.settings)
         if digest != row["payload_sha256"] or target.target_id != target_id:
             raise ValueError("frozen target hash mismatch")
         if self._memo is not None:
@@ -472,6 +483,10 @@ class RollingJournal:
             if parent is None or self._memo is None
             else self._memo.prefix_states.get(parent.generation_id)
         )
+        if self._memo is not None and (parent is None or (recorded and recorded[0] is parent)):
+            known = self._memo.known_target(target.target_id)
+            if known is not None and known.delta is not None and known.target == target:
+                return self._validate_known(target, parent, recorded, known.delta)
         if recorded is not None and recorded[0] is parent:
             return self._validate_extension(target, parent, recorded[1])
         source = []
@@ -495,6 +510,40 @@ class RollingJournal:
         )
         if rebuilt != target:
             raise ValueError("frozen target source or identity mismatch")
+        if parent is None and self._memo is not None:
+            # A root target has no prefix to collide with: no identity sets needed.
+            self._memo.record_target(target, ())
+        return target
+
+    def _validate_known(self, target, parent, recorded, delta):
+        """Same verdict as a full validation of a target already validated in scope.
+
+        ``target`` (bound by its id to its exact canonical payload) passed a
+        complete validation against this parent, its rows and settings in this
+        scope. Recheck what is not a function of those bytes: the parent was
+        just revalidated, the prefix still extends it, every delta row is still
+        archived in this session with its exact bytes, and identity collisions
+        against the parent's validated lineage and the length bound.
+        """
+        start = 0 if parent is None else parent.frontier_count
+        if parent is not None and len(delta) != 3:
+            raise ValueError("frozen target source or identity mismatch")
+        if parent is not None and (
+            target.parent_generation != parent.generation_id
+            or target.event_ids[:start] != parent.event_ids
+            or target.message_uids[:start] != parent.message_uids
+        ):
+            raise ValueError("target is not a parent prefix extension")
+        # A missing row is refused with the message a full rebuild gives (it
+        # receives no row mapping for it).
+        self._memo.require_sources(
+            target.event_ids[start:], self._check, "foreign canonical session"
+        )
+        if parent is not None:
+            _check_known_extension(recorded[1], len(target.event_ids) - start, delta, self.settings)
+        elif len(target.event_ids) > self.settings.max_prefix_events:
+            raise ValueError("target source bound")
+        self._memo.record_target(target, delta)
         return target
 
     def _validate_extension(self, target, parent, prefix):
@@ -516,6 +565,7 @@ class RollingJournal:
             self._check()
             source.append(self._memo.get_event(event))
             self._check()
+        identities = []
         rebuilt = Target._create_extension(
             source,
             session_id=self.session_id,
@@ -525,9 +575,11 @@ class RollingJournal:
             prefix=prefix,
             request_bytes=target.request_bytes,
             route_labels=target.route_labels,
+            _identities=identities,
         )
         if rebuilt != target:
             raise ValueError("frozen target source or identity mismatch")
+        self._memo.record_target(target, identities[0])
         return target
 
     def pending_target(self):

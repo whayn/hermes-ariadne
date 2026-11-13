@@ -28,6 +28,7 @@ from .retrieval import _error
 from .rolling import (
     POLICY_ID,
     RollingSettings,
+    RollingVerificationCache,
     Target,
     completed_exchange_starts,
     decode_json,
@@ -130,6 +131,12 @@ class RollingAriadneEngine(AriadneEngine):
         }
         self._llm = llm
         self._settings = settings or RollingSettings()
+        # Content-addressed verdicts reused across this engine's journal opens;
+        # every byte is still reread and hashed per open (RollingVerificationCache).
+        self._verification = RollingVerificationCache(
+            max_entries=8 * self._settings.max_logical_jobs,
+            max_source_ids=2 * self._settings.max_logical_jobs * self._settings.max_prefix_events,
+        )
         self._route_labels = ("unbound", "unbound")
         self._published = None
         self._pinned = None
@@ -310,6 +317,7 @@ class RollingAriadneEngine(AriadneEngine):
             store=scope.store,
             policy=scope.policy,
             guard=lambda: self._guard(scope),
+            cache=self._verification,
         ) as journal:
             yield journal
 

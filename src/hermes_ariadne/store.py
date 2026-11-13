@@ -63,6 +63,12 @@ def validate_schema(conn):
     return False
 
 
+def _require_event_id(event_id):
+    # ``strip`` leaves nothing exactly when every character is a lowercase hex digit.
+    if not isinstance(event_id, str) or len(event_id) != 64 or event_id.strip("0123456789abcdef"):
+        raise ValueError("event_id must be a canonical lowercase SHA-256 identity")
+
+
 def canonical_json(value):
     # UTF-8/surrogatepass BLOBs distinguish literal UTF-16 pairs from scalar emoji.
     # ASCII JSON escapes would coalesce them, losing the exact observed string.
@@ -163,12 +169,7 @@ class EventStore:
 
     def get_event(self, event_id, *, session_id):
         """Read an exact archived version only within an explicitly selected session."""
-        if (
-            not isinstance(event_id, str)
-            or len(event_id) != 64
-            or any(char not in "0123456789abcdef" for char in event_id)
-        ):
-            raise ValueError("event_id must be a canonical lowercase SHA-256 identity")
+        _require_event_id(event_id)
         if not isinstance(session_id, str):
             raise ValueError("session_id must be explicit")
         with self._connection() as conn:
@@ -183,6 +184,34 @@ class EventStore:
         if hashlib.sha256(payload).hexdigest() != event_id:
             raise ValueError("archived event payload does not match its identity")
         return json.loads(payload.decode("utf-8", "surrogatepass"))
+
+    def verify_events(self, event_ids, *, session_id):
+        """The ids among ``event_ids`` archived in ``session_id``, payloads rehashed.
+
+        The same session scope and payload-hash check as ``get_event``, batched
+        and without decoding. A payload that no longer hashes to its id raises.
+        """
+        ids = list(event_ids)
+        for event_id in ids:
+            _require_event_id(event_id)
+        if not isinstance(session_id, str):
+            raise ValueError("session_id must be explicit")
+        found = set()
+        with self._connection() as conn:
+            for start in range(0, len(ids), 500):
+                chunk = ids[start : start + 500]
+                rows = conn.execute(
+                    "SELECT event_id, payload_json FROM events e WHERE e.event_id IN ("
+                    + ",".join("?" * len(chunk))
+                    + ") AND EXISTS (SELECT 1 FROM observations o "
+                    "WHERE o.event_id=e.event_id AND o.session_id=?)",
+                    (*chunk, session_id),
+                )
+                for event_id, payload in rows:
+                    if hashlib.sha256(payload).hexdigest() != event_id:
+                        raise ValueError("archived event payload does not match its identity")
+                    found.add(event_id)
+        return found
 
     def search(self, query, *, session_id, limit=20, offset=0):
         if type(limit) is not int or not 1 <= limit <= 100:
