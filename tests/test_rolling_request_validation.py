@@ -55,6 +55,20 @@ def test_cached_generation_still_rereads_ancestor_bytes(tmp_path, index, operati
                 rolling_state.RollingJournal(tmp_path, "s", settings, store=store)
 
 
+def count_source_checks(monkeypatch, store):
+    """``count_reads`` plus every id the store rehashed in a batched presence check."""
+    reads = count_reads(monkeypatch, store)
+    original = store.verify_events
+
+    def counting(event_ids, *, session_id):
+        found = original(event_ids, session_id=session_id)
+        reads.update(found)
+        return found
+
+    monkeypatch.setattr(store, "verify_events", counting)
+    return reads
+
+
 def test_engine_selection_and_empty_page_read_sources_once(tmp_path, monkeypatch):
     from test_rolling_engine import complete, select, setup_engine
     from test_rolling_selection import exchange
@@ -67,7 +81,9 @@ def test_engine_selection_and_empty_page_read_sources_once(tmp_path, monkeypatch
         complete(engine, db, tag)
     assert engine._published.sequence == 6
     db.rows += exchange("H", complete=False)[:1]
-    reads = count_reads(monkeypatch, engine._store)
+    # Each referenced archive event is still reread and rehashed once per request;
+    # the engine's verification cache only skips decoding/canonicalizing it again.
+    reads = count_source_checks(monkeypatch, engine._store)
     assert select(engine, db, "H") is not None
     assert set(reads) == set(engine._published.event_ids)
     assert set(reads.values()) == {1}

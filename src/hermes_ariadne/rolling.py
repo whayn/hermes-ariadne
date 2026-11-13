@@ -9,9 +9,11 @@ rolling_selection. Neither module schedules work or changes the host runtime.
 import hashlib
 import json
 import math
+import threading
+from collections import OrderedDict
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from functools import cached_property
 
 from .prepared import (
@@ -356,15 +358,27 @@ def _check_prefix_extension(prefix, rows, uids, payloads, settings):
     if prefix.length + len(rows) > settings.max_prefix_events:
         raise ValueError("nonempty bounded canonical rows required")
     delta = _delta_identities(rows, uids, payloads)
+    _check_delta_identities(prefix, delta)
+    return delta
+
+
+def _check_known_extension(prefix, count, delta, settings):
+    """``_check_prefix_extension`` for a delta of ``count`` rows whose identity
+    sets ``delta`` a completed validation already derived from the same rows."""
+    if prefix.length + count > settings.max_prefix_events:
+        raise ValueError("nonempty bounded canonical rows required")
+    _check_delta_identities(prefix, delta)
+
+
+def _check_delta_identities(prefix, delta):
     if not prefix.lineage:
-        return delta  # a root prefix has nothing to collide with
+        return  # a root prefix has nothing to collide with
     for (kind, message), identities in zip(_IDENTITY_KINDS, delta):
         table = prefix.index[kind]
         for identity in identities:
             introducers = table.get(identity)
             if introducers is not None and _introduced_in(introducers, prefix.lineage):
                 raise ValueError(message)
-    return delta
 
 
 def _record_identities(index, introducer, delta):
@@ -580,6 +594,7 @@ class Target:
         prefix,
         request_bytes,
         route_labels,
+        _identities=None,
     ):
         """``Target.create(parent's rows + delta_rows, parent=parent, ...)``, O(delta).
 
@@ -607,8 +622,11 @@ class Target:
         # Fail closed on a prefix state that is not the parent's (callers tie them).
         if not prefix.extends(parent):
             raise ValueError("target is not a parent prefix extension")
-        # Check only: a target never records identity state.
-        _check_prefix_extension(prefix, delta_rows, delta_uids, payloads, settings)
+        # Check only: a target never records identity state. ``_identities``
+        # (journal-internal) receives the checked delta identity sets.
+        identities = _check_prefix_extension(prefix, delta_rows, delta_uids, payloads, settings)
+        if _identities is not None:
+            _identities.append(identities)
         delta = _render_delta(delta_rows, delta_events, payloads, settings)
         prefix_events = parent.event_ids + delta_events
         prefix_uids = parent.message_uids + delta_uids
@@ -826,6 +844,124 @@ def _generation_matches(view, target, summary_text):
     )
 
 
+@dataclass(frozen=True)
+class _KnownGeneration:
+    """Fields of a generation a completed validation accepted, minus its bytes."""
+
+    fields: dict
+    delta: tuple  # (message uids, reasoning ids, occurrence uids) of its own delta
+
+
+@dataclass(frozen=True)
+class _KnownTarget:
+    target: "Target"
+    delta: tuple | None  # identity sets of its validated delta; None: parsed only
+
+
+class RollingVerificationCache:
+    """Content-addressed verification results shared by one owner's journal opens.
+
+    Process-local and never persisted. Every key is the SHA-256 of exact bytes
+    (a generation artifact or a frozen target payload), and every one of those
+    bytes is still reread and hashed on each use; every archive row is still
+    present in the session with bytes hashing to its id (``EventStore``
+    rehashes on every read). What is reused is only what is a deterministic
+    function of those hashed bytes under one scope: decoding, canonicalization,
+    source-row canonicalization, rendering and summary-input hashing. Journal
+    state (job states, texts, reservations, recovery), lineage, ancestor
+    rereads, identity collisions and bounds are rechecked on every open.
+
+    The scope is (archive path, session, settings digest, reasoning policy);
+    binding a different scope discards everything. Entries are recorded only
+    after a journal operation completes successfully. ``max_entries`` bounds
+    the entry count. ``max_source_ids`` bounds the summed weight of entries,
+    where an entry weighs the length of its event-id sequence: its equally long
+    message-uid sequence, delta identity sets, summary text and readable input
+    are not counted, and a tuple shared by several entries is counted once per
+    entry. It is therefore a count bound, not a byte limit (the benchmark at the
+    100,000-event cap measured ~135 MiB retained for a weight of ~6.5 million).
+    An entry heavier than the bound is not recorded; otherwise the least
+    recently used entries are evicted first. Eviction only costs a full
+    revalidation.
+    """
+
+    def __init__(self, *, max_entries=512, max_source_ids=2 * 64 * 100000):
+        for value in (max_entries, max_source_ids):
+            if type(value) is not int or value <= 0:
+                raise ValueError("cache bounds must be positive integers")
+        self.max_entries, self.max_source_ids = max_entries, max_source_ids
+        self._lock = threading.Lock()
+        self._scope = None
+        self._entries = OrderedDict()  # (kind, digest) -> (_Known*, weight)
+        self._weight = 0
+
+    @staticmethod
+    def scope_key(store, session_id, settings_digest, policy):
+        return (str(store.path.absolute()), session_id, settings_digest, type(policy), policy)
+
+    def _bind(self, scope):
+        if scope != self._scope:
+            self._scope, self._entries, self._weight = scope, OrderedDict(), 0
+
+    def get(self, scope, kind, digest):
+        with self._lock:
+            if scope != self._scope:
+                return None
+            entry = self._entries.get((kind, digest))
+            if entry is None:
+                return None
+            self._entries.move_to_end((kind, digest))
+            return entry[0]
+
+    def put_all(self, scope, items):
+        """Record ``(kind, digest, known, weight)`` items, then evict to the bounds."""
+        with self._lock:
+            self._bind(scope)
+            for kind, digest, known, weight in items:
+                old = self._entries.pop((kind, digest), None)
+                if old is not None:
+                    self._weight -= old[1]
+                    if kind == "target" and known.delta is None and old[0].delta is not None:
+                        known = old[0]  # never downgrade a validated target to parsed-only
+                if weight > self.max_source_ids:
+                    continue
+                self._entries[(kind, digest)] = (known, weight)
+                self._weight += weight
+            while self._entries and (
+                len(self._entries) > self.max_entries or self._weight > self.max_source_ids
+            ):
+                _, (_, weight) = self._entries.popitem(last=False)
+                self._weight -= weight
+
+    def clear(self):
+        with self._lock:
+            self._scope, self._entries, self._weight = None, OrderedDict(), 0
+
+    def stats(self):
+        with self._lock:
+            return {"entries": len(self._entries), "source_ids": self._weight}
+
+
+def _share(known, tuples):
+    """``known`` whose target reuses equal source tuples of accepted views.
+
+    Equal fields serialize identically, so the target id (the hash of the
+    canonical bytes it was parsed from) carries over to the rebuilt object.
+    """
+    target = known.target
+    shared = {}
+    for name in ("event_ids", "message_uids"):
+        sequence = getattr(target, name)
+        candidate = tuples.get((len(sequence), sequence[-1]))
+        if candidate is not None and candidate is not sequence and candidate == sequence:
+            shared[name] = candidate
+    if not shared:
+        return known
+    rebuilt = replace(target, **shared)
+    rebuilt.__dict__["target_id"] = target.target_id
+    return _KnownTarget(rebuilt, known.delta)
+
+
 class _ValidationMemo:
     """Request-local validation memo; never shared across journal opens.
 
@@ -850,14 +986,26 @@ class _ValidationMemo:
     reread only while that view is also the accepted one; see ``parent_view``.
     """
 
-    def __init__(self, store, session_id, policy):
+    def __init__(self, store, session_id, policy, cache=None, settings_digest=None):
         self.store, self.session_id, self.policy = store, session_id, policy
         self.rows, self.accepted = {}, {}
+        # Optional cross-open RollingVerificationCache (journal-owned; see there).
+        # Read through ``known_*``; written only by ``promote`` after a journal
+        # operation succeeded. ``present`` holds archive ids whose exact bytes
+        # were rehashed by the store in this open without being decoded (ids
+        # in ``rows`` were read in full).
+        self.cache, self.present = cache, set()
+        # Only with a cache, for ``promote`` (and reuse within this open):
+        # generation id -> delta identity sets, target id -> _KnownTarget, as
+        # recorded by completed validations in this open. Without a cache the
+        # memo retains no identity state beyond the shared index and lineages.
+        self.deltas, self.validated_targets = {}, {}
         # sha256(exact target payload bytes) -> Target parsed from those bytes in
         # this open. The payload is still reread and hashed on every use; only the
         # decode/canonical/identity work on bytes already verified is reused.
         self.targets = {}
-        self.settings_digest: str | None = None
+        # Bound on first validation, or up front by a journal (its settings).
+        self.settings_digest: str | None = settings_digest
         # generation_id -> (view, _PrefixState) recorded only by a completed
         # validation of that exact view object; see validate_generation.
         self.prefix_states = {}
@@ -868,6 +1016,10 @@ class _ValidationMemo:
         # _record_identities, after a whole validation has passed.
         self.identities = _new_identity_index()
         self.bound: set | None = None
+
+    def record_target(self, target, delta):
+        if self.cache is not None:
+            self.validated_targets[target.target_id] = _KnownTarget(target, delta)
 
     @contextmanager
     def operation(self):
@@ -894,6 +1046,81 @@ class _ValidationMemo:
             if row is not None:  # a missing row is never cached
                 self.rows[event_id] = deepcopy(row)
         return row
+
+    def _scope(self):
+        if self.cache is None or self.settings_digest is None:
+            return None
+        return RollingVerificationCache.scope_key(
+            self.store, self.session_id, self.settings_digest, self.policy
+        )
+
+    def known_generation(self, generation_id):
+        scope = self._scope()
+        return None if scope is None else self.cache.get(scope, "generation", generation_id)
+
+    def known_target(self, digest):
+        """A _KnownTarget for these exact payload bytes: this open's, else the cache's."""
+        hit = self.validated_targets.get(digest)
+        if hit is not None:
+            return hit
+        scope = self._scope()
+        hit = None if scope is None else self.cache.get(scope, "target", digest)
+        if hit is not None:
+            return hit
+        target = self.targets.get(digest)
+        return None if target is None else _KnownTarget(target, None)
+
+    def require_sources(
+        self, event_ids, guard=None, message="generation source unavailable or changed"
+    ):
+        """Every id is archived in this session with bytes that still hash to it.
+
+        The store rehashes each payload it returns, so a present id is exactly
+        the row a completed validation of these ids already canonicalized.
+        """
+        missing = [
+            event for event in event_ids if event not in self.rows and event not in self.present
+        ]
+        if not missing:
+            return
+        if guard:
+            guard()
+        found = self.store.verify_events(missing, session_id=self.session_id)
+        if guard:
+            guard()
+        if len(found) != len(set(missing)):
+            raise ValueError(message)
+        self.present.update(found)
+
+    def promote(self):
+        """Record this open's completed, journal-accepted validations in the cache."""
+        scope = self._scope()
+        if scope is None:
+            return
+        items = []
+        tuples = {}
+        for generation_id, view in self.accepted.items():
+            recorded = self.prefix_states.get(generation_id)
+            delta = self.deltas.get(generation_id)
+            if recorded is None or recorded[0] is not view or delta is None:
+                continue
+            fields_ = {
+                spec.name: getattr(view, spec.name)
+                for spec in fields(RollingView)
+                if spec.name not in ("snapshot_bytes", "generation_id")
+            }
+            for sequence in (view.event_ids, view.message_uids):
+                tuples.setdefault((len(sequence), sequence[-1]), sequence)
+            items.append(
+                ("generation", generation_id, _KnownGeneration(fields_, delta), len(view.event_ids))
+            )
+        for digest, known in self.validated_targets.items():
+            items.append(("target", digest, _share(known, tuples), len(known.target.event_ids)))
+        for digest, target in self.targets.items():
+            if digest not in self.validated_targets:
+                known = _share(_KnownTarget(target, None), tuples)
+                items.append(("target", digest, known, len(target.event_ids)))
+        self.cache.put_all(scope, items)
 
 
 def validate_generation(
@@ -1013,6 +1240,67 @@ def validate_generation(
             return accepted
         # An accepted view this memo cannot tie to a validated prefix state (it
         # was not produced here) is not trusted as a parent: validate it in full.
+
+    def parent_lineage(value, events, uids):
+        """The validated parent of ``value`` and its tied prefix state (shared checks)."""
+        parent = parent_view(value["parent_generation"], prehash=False)
+        if (
+            parent.generation_id != value["parent_generation"]
+            or parent.summary_sha256 != value["parent_summary_sha256"]
+            or value["sequence"] != parent.sequence + 1
+            or value["delta_start"] != parent.frontier_count
+            or tuple(events[: parent.frontier_count]) != parent.event_ids
+            or tuple(uids[: parent.frontier_count]) != parent.message_uids
+        ):
+            raise ValueError("generation parent lineage mismatch")
+        # Unreachable while the recursive call above is the only producer of
+        # ``parent`` (it records the state of exactly the view it returns); kept
+        # as a fail-closed guard so a future refactor cannot silently extend an
+        # empty or foreign prefix state.
+        recorded = _memo.prefix_states.get(parent.generation_id)
+        if (
+            recorded is None
+            or recorded[0] is not parent
+            or recorded[1].index is not _memo.identities
+            or not recorded[1].extends(parent)
+        ):
+            raise ValueError("generation parent state unavailable")
+        return parent, recorded[1]
+
+    def accept(value, delta_identities, parent_state, length):
+        view = RollingView(snapshot_bytes, generation_id, **value)
+        # Validation is complete: record this delta's identities under this
+        # generation, and its state as its parent's lineage plus itself.
+        _record_identities(_memo.identities, generation_id, delta_identities)
+        state = _PrefixState(length, parent_state.lineage | {generation_id}, _memo.identities)
+        _memo.prefix_states[generation_id] = (view, state)
+        if _memo.cache is not None:
+            _memo.deltas[generation_id] = delta_identities
+        if _validated is not None:
+            _validated.append(view)
+        return view
+
+    known = _memo.known_generation(generation_id)
+    if known is not None:
+        # A completed validation in this scope already accepted exactly these
+        # bytes (they hash to ``generation_id``): every check that is a function
+        # of the bytes, of rows bound by their ids and of ancestors bound by
+        # theirs gave the verdict recorded here. Recheck what is not: the
+        # parent chain (reread and validated as always), that every delta row
+        # is still archived in this session with its exact bytes, identity
+        # collisions against this lineage, and the length bound.
+        value = dict(known.fields)
+        events, uids = value["event_ids"], value["message_uids"]
+        parent_state = _memo.empty_prefix()
+        if value["parent_generation"] is not None:
+            _, parent_state = parent_lineage(value, events, uids)
+        start = value["delta_start"]
+        _memo.require_sources(events[start:], guard)
+        _check_known_extension(parent_state, len(events) - start, known.delta, settings)
+        length = parent_state.length + len(events) - start
+        if len(events) != length:
+            raise ValueError("generation source unavailable or changed")
+        return accept(value, known.delta, parent_state, length)
     value, canonical = _decode_json(snapshot_bytes, settings.max_checkpoint_bytes)
     keys = {f.name for f in fields(RollingView)} - {"snapshot_bytes", "generation_id"}
     headers = {"format", "version", "policy_id", "readable_projection_id", "prompt_version"}
@@ -1062,29 +1350,7 @@ def validate_generation(
     if value["parent_generation"] is not None:
         require_digest(value["parent_generation"])
         require_digest(value["parent_summary_sha256"])
-        parent = parent_view(value["parent_generation"], prehash=False)
-        if (
-            parent.generation_id != value["parent_generation"]
-            or parent.summary_sha256 != value["parent_summary_sha256"]
-            or value["sequence"] != parent.sequence + 1
-            or value["delta_start"] != parent.frontier_count
-            or tuple(events[: parent.frontier_count]) != parent.event_ids
-            or tuple(uids[: parent.frontier_count]) != parent.message_uids
-        ):
-            raise ValueError("generation parent lineage mismatch")
-        # Unreachable while the recursive call above is the only producer of
-        # ``parent`` (it records the state of exactly the view it returns); kept
-        # as a fail-closed guard so a future refactor cannot silently extend an
-        # empty or foreign prefix state.
-        recorded = _memo.prefix_states.get(parent.generation_id)
-        if (
-            recorded is None
-            or recorded[0] is not parent
-            or recorded[1].index is not _memo.identities
-            or not recorded[1].extends(parent)
-        ):
-            raise ValueError("generation parent state unavailable")
-        parent_state = recorded[1]
+        parent, parent_state = parent_lineage(value, events, uids)
     elif (
         value["parent_summary_sha256"] is not None
         or value["delta_start"] != 0
@@ -1139,15 +1405,7 @@ def validate_generation(
         # a chain retains each source identity once rather than once per generation.
         value["event_ids"] = parent.event_ids + tuple(events[start:])
         value["message_uids"] = parent.message_uids + tuple(uids[start:])
-    view = RollingView(snapshot_bytes, generation_id, **value)
-    # Validation is complete: record this delta's identities under this
-    # generation, and its state as its parent's lineage plus itself.
-    _record_identities(_memo.identities, generation_id, delta_identities)
-    state = _PrefixState(length, parent_state.lineage | {generation_id}, _memo.identities)
-    _memo.prefix_states[generation_id] = (view, state)
-    if _validated is not None:
-        _validated.append(view)
-    return view
+    return accept(value, delta_identities, parent_state, length)
 
 
 def revalidate_view(
