@@ -12,6 +12,7 @@ import math
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields
+from functools import cached_property
 
 from .prepared import (
     ReasoningReplayPolicy,
@@ -35,14 +36,32 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+_HEX = "0123456789abcdef"
+
+
 def require_digest(value):
-    if (
-        type(value) is not str
-        or len(value) != 64
-        or any(c not in "0123456789abcdef" for c in value)
-    ):
+    # ``strip`` leaves nothing exactly when every character is a lowercase hex digit.
+    if type(value) is not str or len(value) != 64 or value.strip(_HEX):
         raise ValueError("invalid SHA-256 identity")
     return value
+
+
+def _encode_digest_list(values, limit):
+    """``encode_json(list(values), limit)``, without the per-item walk for digests.
+
+    A SHA-256 hex digest needs no JSON escaping, so a nonempty list of them that
+    fits the bound encodes as plain concatenation (67 bytes per digest plus the
+    closing bracket). Anything else, including an oversized list, goes through
+    encode_json itself and so gets exactly its bytes or its error.
+    """
+    if (
+        values
+        and 67 * len(values) + 1 <= limit
+        and all(type(value) is str and len(value) == 64 for value in values)
+        and not "".join(values).strip(_HEX)
+    ):
+        return ('["' + '","'.join(values) + '"]').encode("ascii")
+    return encode_json(list(values), limit)
 
 
 def bounded_text(value, limit, *, nonempty=True):
@@ -134,6 +153,15 @@ def _admit_json_bytes(data, limit):
 
 
 def decode_json(data, limit):
+    return _decode_json(data, limit)[0]
+
+
+def _decode_json(data, limit):
+    """``decode_json`` plus the canonical encoding its strictness check produced.
+
+    The second value is ``encode_json(value, limit)``; comparing it with ``data``
+    is exactly the canonical-bytes check a caller would otherwise encode again.
+    """
     _admit_json_bytes(data, limit)
 
     def pairs(items):
@@ -149,8 +177,8 @@ def decode_json(data, limit):
 
     try:
         value = json.loads(data.decode("utf-8"), object_pairs_hook=pairs, parse_constant=invalid)
-        encode_json(value, limit)  # strict Unicode, finite overflowing floats, depth
-        return value
+        # strict Unicode, finite overflowing floats, depth
+        return value, encode_json(value, limit)
     except (RecursionError, UnicodeError, OverflowError) as exc:
         raise ValueError("invalid strict JSON") from exc
 
@@ -598,6 +626,10 @@ class Target:
         )
 
     def to_bytes(self, settings):
+        self._check_bounds(settings)
+        return self._canonical_bytes(settings.max_checkpoint_bytes)
+
+    def _check_bounds(self, settings):
         if len(self.event_ids) > settings.max_prefix_events:
             raise ValueError("target exceeds prefix bound")
         if (
@@ -608,7 +640,6 @@ class Target:
         for key in ("event_ids", "message_uids", "route_labels"):
             if len(getattr(self, key)) > settings.max_prefix_events:
                 raise ValueError("target exceeds sequence bound")
-        return self._canonical_bytes(settings.max_checkpoint_bytes)
 
     def _canonical_bytes(self, limit):
         data = {spec.name: getattr(self, spec.name) for spec in fields(self)}
@@ -620,7 +651,7 @@ class Target:
 
     @classmethod
     def from_bytes(cls, data, settings):
-        value = decode_json(data, settings.max_checkpoint_bytes)
+        value, canonical = _decode_json(data, settings.max_checkpoint_bytes)
         if type(value) is not dict or set(value) != {f.name for f in fields(cls)}:
             raise ValueError("invalid target schema")
         for key in ("event_ids", "message_uids", "route_labels"):
@@ -632,30 +663,40 @@ class Target:
                 raise ValueError("invalid target input")
             value[key] = value[key].encode("utf-8")
         result = cls(**value)
-        if result.to_bytes(settings) != data:
+        # ``canonical`` is the encoding of exactly the decoded value. Every field
+        # that passed the schema and __post_init__ checks round-trips through
+        # _canonical_bytes to that same JSON value (tuples as lists, the two byte
+        # fields as their UTF-8 text), so it IS ``to_bytes``'s output and need
+        # not be encoded a second time.
+        result._check_bounds(settings)
+        if canonical != data:
             raise ValueError("noncanonical target")
+        # target_id hashes the same canonical serialization: these exact bytes.
+        result.__dict__["target_id"] = sha256(data)
         return result
 
-    @property
+    # Targets are frozen and every field is immutable, so derived identities are
+    # computed at most once per object (dataclass equality/hash use fields only).
+    @cached_property
     def prefix_sha256(self):
-        return sha256(encode_json(list(self.event_ids), 16 * 1024 * 1024))
+        return sha256(_encode_digest_list(self.event_ids, 16 * 1024 * 1024))
 
-    @property
+    @cached_property
     def readable_input_digest(self):
         return sha256(self.readable_input)
 
-    @property
+    @cached_property
     def request_digest(self):
         return sha256(self.request_bytes)
 
-    @property
+    @cached_property
     def target_id(self):
         # Identity is the canonical serialization only. Campaign bounds were
         # enforced when the target was admitted (create/freeze/from_bytes);
         # reapplying default bounds here rejected legitimately configured targets.
         return sha256(self._canonical_bytes(2**31 - 1))
 
-    @property
+    @cached_property
     def job_id(self):
         return sha256(
             encode_json([self.target_id, POLICY_ID, PROMPT_VERSION, self.request_digest], 1024)
@@ -756,6 +797,35 @@ def generation_bytes(
     )
 
 
+def _generation_matches(view, target, summary_text):
+    """``generation_bytes(target, summary_text, sequence=view.sequence) == snapshot``.
+
+    ``view`` must be a RollingView that validate_generation just produced, so its
+    snapshot is exactly the canonical encoding of its fields plus the fixed
+    headers, with str/None/exact-int/tuple-of-str values and the same key set
+    generation_bytes writes. Canonical encoding is injective on such values, so
+    the bytes are equal exactly when every field is; this compares the fields
+    instead of re-encoding the whole prefix. ``summary_text`` must already equal
+    ``view.summary_text`` (so generation_bytes' own text bound cannot fail).
+    """
+    return (
+        view.session_id == target.session_id
+        and view.settings_digest == target.settings_digest
+        and view.parent_generation == target.parent_generation
+        and view.parent_summary_sha256 == target.parent_summary_sha256
+        and view.event_ids == target.event_ids
+        and view.message_uids == target.message_uids
+        and view.frontier_count == len(target.event_ids)
+        and view.prefix_sha256 == target.prefix_sha256
+        and view.delta_start == target.delta_start
+        and view.delta_stop == target.delta_stop
+        and view.summary_text == summary_text
+        and view.summary_sha256 == sha256(summary_text.encode("utf-8"))
+        and view.summary_input_sha256 == target.readable_input_digest
+        and view.job_id == target.job_id
+    )
+
+
 class _ValidationMemo:
     """Request-local validation memo; never shared across journal opens.
 
@@ -783,6 +853,10 @@ class _ValidationMemo:
     def __init__(self, store, session_id, policy):
         self.store, self.session_id, self.policy = store, session_id, policy
         self.rows, self.accepted = {}, {}
+        # sha256(exact target payload bytes) -> Target parsed from those bytes in
+        # this open. The payload is still reread and hashed on every use; only the
+        # decode/canonical/identity work on bytes already verified is reused.
+        self.targets = {}
         self.settings_digest: str | None = None
         # generation_id -> (view, _PrefixState) recorded only by a completed
         # validation of that exact view object; see validate_generation.
@@ -939,7 +1013,7 @@ def validate_generation(
             return accepted
         # An accepted view this memo cannot tie to a validated prefix state (it
         # was not produced here) is not trusted as a parent: validate it in full.
-    value = decode_json(snapshot_bytes, settings.max_checkpoint_bytes)
+    value, canonical = _decode_json(snapshot_bytes, settings.max_checkpoint_bytes)
     keys = {f.name for f in fields(RollingView)} - {"snapshot_bytes", "generation_id"}
     headers = {"format", "version", "policy_id", "readable_projection_id", "prompt_version"}
     if type(value) is not dict or set(value) != keys | headers:
@@ -982,7 +1056,7 @@ def validate_generation(
     bounded_text(value["summary_text"], settings.max_summary_bytes)
     if sha256(value["summary_text"].encode("utf-8")) != value["summary_sha256"]:
         raise ValueError("summary hash mismatch")
-    if sha256(encode_json(events, settings.max_checkpoint_bytes)) != value["prefix_sha256"]:
+    if sha256(_encode_digest_list(events, settings.max_checkpoint_bytes)) != value["prefix_sha256"]:
         raise ValueError("prefix hash mismatch")
     parent, parent_state = None, _memo.empty_prefix()
     if value["parent_generation"] is not None:
@@ -1051,11 +1125,20 @@ def validate_generation(
         != value["summary_input_sha256"]
     ):
         raise ValueError("summary input hash mismatch")
-    if encode_json(value, settings.max_checkpoint_bytes) != snapshot_bytes:
+    # ``canonical`` is encode_json of ``value`` exactly as decoded; nothing above
+    # mutates ``value``, so this is the same check as encoding it again here.
+    if canonical != snapshot_bytes:
         raise ValueError("noncanonical generation bytes")
     for key in headers:
         del value[key]
-    value["event_ids"], value["message_uids"] = tuple(events), tuple(uids)
+    if parent is None:
+        value["event_ids"], value["message_uids"] = tuple(events), tuple(uids)
+    else:
+        # Equal to tuple(events)/tuple(uids) (the lineage check above compared the
+        # prefix with the parent's), but shares the parent's validated strings, so
+        # a chain retains each source identity once rather than once per generation.
+        value["event_ids"] = parent.event_ids + tuple(events[start:])
+        value["message_uids"] = parent.message_uids + tuple(uids[start:])
     view = RollingView(snapshot_bytes, generation_id, **value)
     # Validation is complete: record this delta's identities under this
     # generation, and its state as its parent's lineage plus itself.
