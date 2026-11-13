@@ -11,6 +11,7 @@ import json
 import sqlite3
 from collections import Counter
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from test_rolling_journal_validation import chain
@@ -371,6 +372,28 @@ def test_bounds_evict_least_recently_used_without_changing_results(tmp_path, mon
         assert observe(tmp_path, store, settings, cache) == expected
 
 
+def test_eviction_drops_the_least_recently_used_entry():
+    scope = ("archive", "s", "0" * 64, type(None), None)
+
+    def entries(cache):
+        return [digest for _, digest in cache._entries]
+
+    cache = RollingVerificationCache(max_entries=3)
+    cache.put_all(scope, [("generation", name, name, 1) for name in "abc"])
+    assert cache.get(scope, "generation", "a") == "a"  # a is now most recent
+    cache.put_all(scope, [("generation", "d", "d", 1)])
+    assert entries(cache) == ["c", "a", "d"]  # b, the least recently used, went
+    assert cache.get(scope, "generation", "b") is None
+
+    cache = RollingVerificationCache(max_source_ids=10)
+    cache.put_all(scope, [("generation", "a", "a", 4), ("generation", "b", "b", 4)])
+    assert cache.get(scope, "generation", "a") == "a"
+    cache.put_all(scope, [("generation", "c", "c", 4)])
+    assert entries(cache) == ["a", "c"] and cache.stats()["source_ids"] == 8
+    cache.put_all(scope, [("generation", "e", "e", 11)])  # heavier than the bound
+    assert cache.get(scope, "generation", "e") is None and entries(cache) == ["a", "c"]
+
+
 def test_put_all_never_downgrades_a_validated_target():
     cache = RollingVerificationCache()
     scope = ("archive", "s", "0" * 64, type(None), None)
@@ -410,14 +433,16 @@ def test_engine_requests_reuse_its_cache(tmp_path, monkeypatch):
     assert engine._published.sequence == 3
     db.rows += exchange("E", complete=False)[:1]
     assert select(engine, db, "E") is not None
+    published = engine._published
+    # Every generation artifact of the published chain, named by its id.
+    chain_ids = {path.stem for path in Path(engine._home).rglob("generations/*.json")}
+    assert published.generation_id in chain_ids and len(chain_ids) == published.sequence
     decodes = spy_decodes(monkeypatch)
     canonicalized = spy(monkeypatch, rolling, "_canonical_rows")
     assert select(engine, db, "E") is not None
-    published = engine._published
-    # A repeated request decodes no generation and canonicalizes no archive row
-    # (selection still validates the current host rows themselves).
-    assert published.generation_id not in decodes
-    chain_ids = {published.generation_id}
+    assert engine._published == published
+    # A repeated request decodes no generation of the chain and canonicalizes no
+    # archive row (selection still validates the current host rows themselves).
     assert not chain_ids & set(decodes)
     assert canonicalized["_canonical_rows"] <= 2
     assert engine.clone_for_agent()._verification is not engine._verification
