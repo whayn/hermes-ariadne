@@ -156,6 +156,8 @@ def exchange(tag):
 
 
 def build(directory, events, generations):
+    if type(generations) is not int or generations <= 0:
+        raise SystemExit("--generations must be a positive integer")
     if events % ROWS_PER_EXCHANGE or events < ROWS_PER_EXCHANGE * generations:
         raise SystemExit("--events must be a multiple of 4 and at least 4 per generation")
     directory = Path(directory)
@@ -236,6 +238,12 @@ def retained_mib(cache):
     return round(size / 2**20, 1)
 
 
+def maxrss_mib():
+    """Peak RSS in MiB: ``ru_maxrss`` is KiB on Linux but bytes on macOS."""
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return round(peak / (2**20 if sys.platform == "darwin" else 2**10), 1)
+
+
 def measure(directory, profile, in_place=False, cache=False):
     config = settings()
     # --cache: one RollingVerificationCache shared by every open below, as an
@@ -309,7 +317,7 @@ def measure(directory, profile, in_place=False, cache=False):
             "open_encode_json_calls": open_encoded["calls"],
             "open_encode_json_mib": round(open_encoded["bytes"] / 2**20, 2),
             "load_view_s": round(load_s, 3),
-            "maxrss_mib": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1),
+            "maxrss_mib": maxrss_mib(),
         }
         if cache:
             result.update(
