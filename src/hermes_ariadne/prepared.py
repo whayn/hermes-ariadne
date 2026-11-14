@@ -468,7 +468,10 @@ def _encrypted_codex_reasoning(message, policy, *, durable=False):
     return items
 
 
-def _provider(message, *, wire=False, durable=False, reasoning_policy=None):
+def _provider(message, *, wire=False, durable=False, reasoning_policy=None, delivery_ids=False):
+    """``delivery_ids`` (rolling only): accept the gateway's ``platform_message_id`` on an
+    assembled user message. It is delivery bookkeeping that Hermes strips before the
+    provider call; it never enters the compared payload."""
     if type(message) is not dict:
         raise ValueError("message must be a mapping")
     # At select_context this is assembled, not final HTTP: Hermes strips the
@@ -477,6 +480,7 @@ def _provider(message, *, wire=False, durable=False, reasoning_policy=None):
         _WIRE
         | {"_db_persisted", "tool_name", "effect_disposition", "codex_message_items"}
         | ({"codex_reasoning_items"} if reasoning_policy is not None else set())
+        | ({"platform_message_id"} if delivery_ids else set())
         if wire
         else _WIRE | _METADATA | _CARRIERS | _IDENTITIES
     )
@@ -484,6 +488,14 @@ def _provider(message, *, wire=False, durable=False, reasoning_policy=None):
         raise ValueError("invalid persistence marker")
     if set(message) - allowed:
         raise ValueError("unknown message shape")
+    if wire and delivery_ids and "platform_message_id" in message:
+        delivery = message["platform_message_id"]
+        if (
+            message.get("role") != "user"
+            or type(delivery) not in (str, int)
+            or isinstance(delivery, bool)
+        ):
+            raise ValueError("invalid delivery identifier")
     role, content = message["role"], message["content"]
     if role not in {"system", "developer", "user", "assistant", "tool"}:
         raise ValueError("unsupported role")
@@ -535,7 +547,7 @@ def _provider(message, *, wire=False, durable=False, reasoning_policy=None):
     return result
 
 
-def _comparison(message, *, wire=False, durable=False, reasoning_policy=None):
+def _comparison(message, *, wire=False, durable=False, reasoning_policy=None, delivery_ids=False):
     """Audited pretransport comparison only; never returned as request/source.
 
     _assistant_tool_call_dict adds these two Responses sidecars, then
@@ -543,7 +555,13 @@ def _comparison(message, *, wire=False, durable=False, reasoning_policy=None):
     deterministic sidecars remain a projection, but an independently assigned
     native item ID is comparison identity and must agree across all views.
     """
-    result = _provider(message, wire=wire, durable=durable, reasoning_policy=reasoning_policy)
+    result = _provider(
+        message,
+        wire=wire,
+        durable=durable,
+        reasoning_policy=reasoning_policy,
+        delivery_ids=delivery_ids,
+    )
     # make_tool_result_message writes name + tool_name; SessionDB restores only
     # tool_name. Reconcile this alias ONLY for tool results, never speakers.
     for key in ("tool_name", "effect_disposition"):
@@ -755,12 +773,18 @@ def _reasoning_permissions(history, active, request, count, policy, *, retiremen
     return permissions
 
 
-def _comparison_payloads(messages, policies, *, wire=False, durable=False):
+def _comparison_payloads(messages, policies, *, wire=False, durable=False, delivery_ids=False):
     """Use a separate request-local reasoning ID set for each compared view."""
     payloads = []
     reasoning_ids = set()
     for index, message in enumerate(messages):
-        payload = _comparison(message, wire=wire, durable=durable, reasoning_policy=policies[index])
+        payload = _comparison(
+            message,
+            wire=wire,
+            durable=durable,
+            reasoning_policy=policies[index],
+            delivery_ids=delivery_ids,
+        )
         items = payload.get("codex_reasoning_items")
         if items:
             for item in items:
@@ -772,7 +796,7 @@ def _comparison_payloads(messages, policies, *, wire=False, durable=False):
     return payloads
 
 
-def _exact_payloads(history, active, policies, *, assembled=None):
+def _exact_payloads(history, active, policies, *, assembled=None, delivery_ids=False):
     """Shared audited canonical/restored comparison; assembled is real or absent.
 
     Callers establish UID coverage separately. A callback has no assembled view;
@@ -802,7 +826,7 @@ def _exact_payloads(history, active, policies, *, assembled=None):
             continue
         raise ValueError("active/conversation payload mismatch")
     if assembled is not None and canonical_json(
-        _comparison_payloads(assembled, policies, wire=True)
+        _comparison_payloads(assembled, policies, wire=True, delivery_ids=delivery_ids)
     ) != canonical_json(raw_payload):
         raise ValueError("request must be an exact one-to-one mapping")
     return raw_payload

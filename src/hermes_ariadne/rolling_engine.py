@@ -650,7 +650,9 @@ class RollingAriadneEngine(AriadneEngine):
         policies = _reasoning_permissions(
             history, active, request[split:], 0, scope.policy, retirement_policy=POLICY_ID
         )
-        payloads = _exact_payloads(history, active, policies, assembled=request[split:])
+        payloads = _exact_payloads(
+            history, active, policies, assembled=request[split:], delivery_ids=True
+        )
         _exact_occurrences(history, active, policies)
         completed_exchange_starts(payloads, allow_current=True)
         if payloads[-1]["role"] not in {"user", "tool"}:

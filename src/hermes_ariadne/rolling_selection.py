@@ -115,7 +115,9 @@ def validate_rolling_alignment(
         reasoning_policy,
         retirement_policy=retirement_policy,
     )
-    payloads = _exact_payloads(history, active, policies, assembled=request[split:])
+    payloads = _exact_payloads(
+        history, active, policies, assembled=request[split:], delivery_ids=True
+    )
     anchor = incoming_anchor(history, incoming)
     starts = completed_exchange_starts(payloads, allow_current=True)
     if (

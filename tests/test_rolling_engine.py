@@ -1217,9 +1217,7 @@ def test_completion_gate_backout_is_logged_without_content(
     assert not any("PRIVACY-SENTINEL" in m for m in lines)
 
 
-def test_unavailable_and_decline_are_logged_with_exception_type_only(
-    tmp_path, monkeypatch, caplog
-):
+def test_unavailable_and_decline_are_logged_with_exception_type_only(tmp_path, monkeypatch, caplog):
     caplog.set_level("DEBUG", logger="hermes_ariadne.rolling_engine")
     engine, db, _ = setup_engine(tmp_path, monkeypatch)
     db.rows = exchange("PRIVACY-SENTINEL-A") + exchange("PRIVACY-SENTINEL-B")
@@ -1250,3 +1248,57 @@ def test_repeated_identical_backout_is_logged_once(tmp_path, monkeypatch, caplog
     complete(engine, db, "B", usage=None)
     complete(engine, db, "B", usage=None)
     assert sum("gate=usage_missing" in m for m in engine_records(caplog)) == 1
+
+
+def gateway_request(db, tag, platform_id="1699999999.000100"):
+    """Gateway-assembled request: user messages also carry delivery bookkeeping."""
+    history = restored(db.rows)
+    incoming = next(m for m in history if m["message_uid"] == tag + "u")
+    request = assembled(history)
+    for message in request:
+        if message["role"] == "user":
+            message["platform_message_id"] = platform_id
+    return request, history, incoming
+
+
+def test_gateway_delivery_id_on_assembled_user_messages_still_selects(tmp_path, monkeypatch):
+    engine, db, facade = setup_engine(tmp_path, monkeypatch)
+    db.rows = exchange("A") + exchange("B")
+    complete(engine, db, "B")
+    assert len(facade.calls) == 1
+    db.rows += exchange("C", complete=False)[:1]
+    request, history, incoming = gateway_request(db, "C")
+    before = copy.deepcopy(request)
+    result = engine.select_context(
+        request, conversation_messages=history, incoming_message=incoming, budget_tokens=100000
+    )
+    assert request == before
+    assert result is not None
+    assert result[-1] == request[-1] and result[-1]["platform_message_id"]
+    assert engine._pinned is not None
+
+
+@pytest.mark.parametrize("bad", [{"x": 1}, ["a"], True, 1.5])
+def test_gateway_delivery_id_must_be_text_or_integer(tmp_path, monkeypatch, bad):
+    engine, db, facade = setup_engine(tmp_path, monkeypatch)
+    db.rows = exchange("A") + exchange("B")
+    complete(engine, db, "B")
+    db.rows += exchange("C", complete=False)[:1]
+    request, history, incoming = gateway_request(db, "C", platform_id=bad)
+    assert (
+        engine.select_context(
+            request, conversation_messages=history, incoming_message=incoming, budget_tokens=100000
+        )
+        is None
+    )
+
+
+def test_delivery_id_stays_refused_by_shared_prepared_validation():
+    from hermes_ariadne.prepared import _comparison_payloads
+
+    message = {"role": "user", "content": "x", "platform_message_id": "7"}
+    with pytest.raises(ValueError, match="unknown message shape"):
+        _comparison_payloads([message], [None], wire=True)
+    assert _comparison_payloads([message], [None], wire=True, delivery_ids=True) == [
+        {"role": "user", "content": "x"}
+    ]
