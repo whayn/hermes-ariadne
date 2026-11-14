@@ -5,14 +5,16 @@ Selection declines preserve the host's original-request fallback.
 """
 
 import copy
+import functools
 import json
 import logging
 import math
+import re
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 from typing import Any
 
 from .engine import AriadneEngine
@@ -53,6 +55,21 @@ from .rolling_state import RollingJournal, _path_check
 from .store import EventStore, canonical_json
 
 logger = logging.getLogger(__name__)
+_NOTE_TOKEN = re.compile(r"[^A-Za-z0-9_.=-]")
+_MAX_PENDING_NOTES = 64
+
+
+def _flushing(method):
+    """Emit queued diagnostics once the public entry point has left the engine lock."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._flush_notes()
+
+    return wrapper
 
 
 def _archive_path(home, *, store=None):
@@ -148,6 +165,8 @@ class RollingAriadneEngine(AriadneEngine):
         self._pin_revision = 0
         self._seen = set()
         self._maintenance = None
+        self._notes = []
+        self._notes_lock = Lock()
         self._last_note = None
         self._rolling = {
             "status": "not_initialized",
@@ -209,27 +228,40 @@ class RollingAriadneEngine(AriadneEngine):
     _bound_reasoning_policy = staticmethod(PreparedAriadneEngine._bound_reasoning_policy)
 
     def _note(self, level, event, **fields):
-        """Log a back-out once per change; names and exception types only.
+        """Queue a back-out diagnostic; names and exception types only.
 
-        Never include messages, payloads or paths: histories are private. The
-        engine is otherwise silent, so this is the only trace of why a host
-        turn prepared or selected nothing.
+        Never include messages, payloads or paths: histories are private. Values are
+        reduced to a fixed-token alphabet so caller-supplied text cannot reach a log
+        line or forge one. The record is only queued: handlers may block, so it is
+        emitted by ``_flush_notes`` after the public entry point has released the
+        engine lock. The engine is otherwise silent, so this is the only trace of why
+        a host turn prepared or selected nothing.
         """
         exc = sys.exc_info()[0]
         if exc is not None:
             fields["error"] = exc.__name__
-        text = " ".join(f"{k}={v}" for k, v in fields.items())
-        key = (event, text)
-        with self._lock:
-            if key == self._last_note:
-                return
-            self._last_note = key
-        logger.log(level, "Ariadne rolling %s%s", event, f" ({text})" if text else "")
+        text = " ".join(f"{k}={_NOTE_TOKEN.sub('?', str(v))[:64]}" for k, v in fields.items())
+        with self._notes_lock:
+            if len(self._notes) >= _MAX_PENDING_NOTES:
+                del self._notes[0]
+            self._notes.append((level, event, text))
+
+    def _flush_notes(self):
+        with self._notes_lock:
+            pending, self._notes = self._notes, []
+            emit = []
+            for level, event, text in pending:
+                key = (event, text)
+                if key != self._last_note:
+                    self._last_note = key
+                    emit.append((level, event, text))
+        for level, event, text in emit:  # Outside every engine lock.
+            logger.log(level, "Ariadne rolling %s%s", event, f" ({text})" if text else "")
 
     def _decline(self, reason, scope):
-        self._note(logging.INFO, "declined", reason=reason)
         with self._lock:
             if self._current(scope):
+                self._note(logging.INFO, "declined", reason=reason)
                 self._selection = {
                     "status": "declined",
                     "reason": reason,
@@ -252,6 +284,7 @@ class RollingAriadneEngine(AriadneEngine):
         }
         self._rolling = {**self._rolling, "status": "not_initialized"}
 
+    @_flushing
     def bind_session_state(self, session_db=None, session_id=None):
         with self._lock:
             if (
@@ -268,6 +301,7 @@ class RollingAriadneEngine(AriadneEngine):
             scope = self._capture()
         self._initialize(scope)
 
+    @_flushing
     def on_session_start(self, session_id, **kwargs):
         # Explicit initial home only: never resolve an ambient/live profile here.
         with self._lock:
@@ -304,9 +338,9 @@ class RollingAriadneEngine(AriadneEngine):
                 raise
 
     def _refuse_archive(self, scope):
-        self._note(logging.WARNING, "archive refused; engine detached")
         with self._lock:
             if self._current(scope):
+                self._note(logging.WARNING, "archive refused; engine detached")
                 # Revoke captured writers as well as the current attachment. This
                 # changes no journal records, reservations, or durable charges.
                 self._detach()
@@ -376,9 +410,9 @@ class RollingAriadneEngine(AriadneEngine):
             self._refuse_archive(scope)
 
     def _unavailable(self, scope):
-        self._note(logging.WARNING, "unavailable; no further preparation this attempt")
         with self._lock:
             if self._current(scope):
+                self._note(logging.WARNING, "unavailable; no further preparation this attempt")
                 self._rolling = {**self._rolling, "status": "unavailable"}
 
     def _count_trigger_bytes(self, scope, active, start, stops) -> int:
@@ -461,6 +495,7 @@ class RollingAriadneEngine(AriadneEngine):
                 break  # Earliest contiguous bounded delta, never skip an exchange.
         return best
 
+    @_flushing
     def on_turn_complete(self, messages, usage=None, **kwargs):
         turn_id = kwargs.get("turn_id")
         if usage is None:
@@ -476,10 +511,7 @@ class RollingAriadneEngine(AriadneEngine):
         else:
             gate = None
         if gate:
-            detail = {}
-            if gate == "turn_exit_reason":
-                detail["value"] = str(kwargs.get("turn_exit_reason"))[:80]
-            self._note(logging.INFO, "completion skipped", gate=gate, **detail)
+            self._note(logging.INFO, "completion skipped", gate=gate)
             return
         with self._lock:
             scope = self._capture()
@@ -563,6 +595,7 @@ class RollingAriadneEngine(AriadneEngine):
                         purpose="ariadne-rolling-preparation",
                     )
                 except Exception:
+                    self._note(logging.WARNING, "preparation uncertain", reason="facade_error")
                     journal.record_failed_or_uncertain(
                         target.job_id, "facade_error", uncertain=True
                     )
@@ -573,6 +606,7 @@ class RollingAriadneEngine(AriadneEngine):
                     text = validate_summary(response.text.encode("utf-8"), target, self._settings)
                     attribution = {"provider": response.provider, "model": response.model}
                 except Exception:
+                    self._note(logging.WARNING, "preparation failed", reason="invalid_output")
                     journal.record_failed_or_uncertain(target.job_id, "invalid_output")
                     self._report(scope, journal, "failed")
                     return
@@ -583,6 +617,7 @@ class RollingAriadneEngine(AriadneEngine):
                         target, active, settings=self._settings, policy=scope.policy
                     )
                 except ValueError:
+                    self._note(logging.WARNING, "preparation failed", reason="source_changed")
                     journal.record_failed_or_uncertain(target.job_id, "source_changed")
                     self._report(scope, journal, "failed")
                     return
@@ -665,6 +700,7 @@ class RollingAriadneEngine(AriadneEngine):
 
         return estimate_request_tokens_rough(messages)
 
+    @_flushing
     def select_context(
         self,
         request_messages,
@@ -746,6 +782,12 @@ class RollingAriadneEngine(AriadneEngine):
                 with self._lock:
                     self._guard(scope, pin)
                     self._selection = {"status": decision.status, **decision.diagnostics}
+                    if decision.status == "declined":
+                        self._note(
+                            logging.INFO,
+                            "declined",
+                            reason=decision.diagnostics.get("reason", "unspecified"),
+                        )
                     return decision.messages
         except Exception:
             return self._decline("selection_unavailable", scope)
@@ -753,6 +795,7 @@ class RollingAriadneEngine(AriadneEngine):
     def get_tool_schemas(self):
         return tool_schemas()
 
+    @_flushing
     def handle_tool_call(self, name, args, **kwargs):
         scope = self._capture()
         with self._lock:
