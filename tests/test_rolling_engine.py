@@ -1189,3 +1189,64 @@ def test_safe_existing_archive_and_private_missing_home_admitted(tmp_path, monke
     for row in archived:
         assert archive.get_event(rolling.sha256(canonical_json(row)), session_id="foreign") == row
     assert not facade.calls
+
+
+def engine_records(caplog):
+    return [r.getMessage() for r in caplog.records if r.name == "hermes_ariadne.rolling_engine"]
+
+
+@pytest.mark.parametrize(
+    "metadata, gate",
+    [
+        ({"usage": None}, "usage_missing"),
+        ({"interrupted": True}, "interrupted"),
+        ({"failed": None}, "failed"),
+        ({"turn_id": ""}, "turn_id"),
+        ({"turn_exit_reason": "text_response(finish_reason=length)"}, "turn_exit_reason"),
+    ],
+)
+def test_completion_gate_backout_is_logged_without_content(
+    tmp_path, monkeypatch, caplog, metadata, gate
+):
+    caplog.set_level("DEBUG", logger="hermes_ariadne.rolling_engine")
+    engine, db, _ = setup_engine(tmp_path, monkeypatch)
+    db.rows = exchange("PRIVACY-SENTINEL-A") + exchange("PRIVACY-SENTINEL-B")
+    complete(engine, db, "B", **metadata)
+    lines = engine_records(caplog)
+    assert any("completion skipped" in m and f"gate={gate}" in m for m in lines), lines
+    assert not any("PRIVACY-SENTINEL" in m for m in lines)
+
+
+def test_unavailable_and_decline_are_logged_with_exception_type_only(
+    tmp_path, monkeypatch, caplog
+):
+    caplog.set_level("DEBUG", logger="hermes_ariadne.rolling_engine")
+    engine, db, _ = setup_engine(tmp_path, monkeypatch)
+    db.rows = exchange("PRIVACY-SENTINEL-A") + exchange("PRIVACY-SENTINEL-B")
+
+    def boom(include_inactive):
+        raise RuntimeError("PRIVACY-SENTINEL leak")
+
+    db.read_hook = boom
+    complete(engine, db, "B")
+    assert select(engine, db, "PRIVACY-SENTINEL-B") is None
+    lines = engine_records(caplog)
+    assert any("unavailable" in m and "RuntimeError" in m for m in lines), lines
+    assert any("declined" in m and "selection_unavailable" in m for m in lines), lines
+    assert not any("PRIVACY-SENTINEL" in m for m in lines)
+
+
+def test_refused_archive_is_logged(tmp_path, monkeypatch, caplog):
+    caplog.set_level("DEBUG", logger="hermes_ariadne.rolling_engine")
+    home, _ = unsafe_archive_fixture(tmp_path, "archive-symlink")
+    setup_engine(home, monkeypatch)
+    assert any("archive refused" in m for m in engine_records(caplog))
+
+
+def test_repeated_identical_backout_is_logged_once(tmp_path, monkeypatch, caplog):
+    caplog.set_level("DEBUG", logger="hermes_ariadne.rolling_engine")
+    engine, db, _ = setup_engine(tmp_path, monkeypatch)
+    db.rows = exchange("A") + exchange("B")
+    complete(engine, db, "B", usage=None)
+    complete(engine, db, "B", usage=None)
+    assert sum("gate=usage_missing" in m for m in engine_records(caplog)) == 1

@@ -6,7 +6,9 @@ Selection declines preserve the host's original-request fallback.
 
 import copy
 import json
+import logging
 import math
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
@@ -49,6 +51,8 @@ from .rolling_selection import (
 )
 from .rolling_state import RollingJournal, _path_check
 from .store import EventStore, canonical_json
+
+logger = logging.getLogger(__name__)
 
 
 def _archive_path(home, *, store=None):
@@ -144,6 +148,7 @@ class RollingAriadneEngine(AriadneEngine):
         self._pin_revision = 0
         self._seen = set()
         self._maintenance = None
+        self._last_note = None
         self._rolling = {
             "status": "not_initialized",
             "logical_reservations": 0,
@@ -203,7 +208,26 @@ class RollingAriadneEngine(AriadneEngine):
 
     _bound_reasoning_policy = staticmethod(PreparedAriadneEngine._bound_reasoning_policy)
 
+    def _note(self, level, event, **fields):
+        """Log a back-out once per change; names and exception types only.
+
+        Never include messages, payloads or paths: histories are private. The
+        engine is otherwise silent, so this is the only trace of why a host
+        turn prepared or selected nothing.
+        """
+        exc = sys.exc_info()[0]
+        if exc is not None:
+            fields["error"] = exc.__name__
+        text = " ".join(f"{k}={v}" for k, v in fields.items())
+        key = (event, text)
+        with self._lock:
+            if key == self._last_note:
+                return
+            self._last_note = key
+        logger.log(level, "Ariadne rolling %s%s", event, f" ({text})" if text else "")
+
     def _decline(self, reason, scope):
+        self._note(logging.INFO, "declined", reason=reason)
         with self._lock:
             if self._current(scope):
                 self._selection = {
@@ -280,6 +304,7 @@ class RollingAriadneEngine(AriadneEngine):
                 raise
 
     def _refuse_archive(self, scope):
+        self._note(logging.WARNING, "archive refused; engine detached")
         with self._lock:
             if self._current(scope):
                 # Revoke captured writers as well as the current attachment. This
@@ -351,6 +376,7 @@ class RollingAriadneEngine(AriadneEngine):
             self._refuse_archive(scope)
 
     def _unavailable(self, scope):
+        self._note(logging.WARNING, "unavailable; no further preparation this attempt")
         with self._lock:
             if self._current(scope):
                 self._rolling = {**self._rolling, "status": "unavailable"}
@@ -437,18 +463,34 @@ class RollingAriadneEngine(AriadneEngine):
 
     def on_turn_complete(self, messages, usage=None, **kwargs):
         turn_id = kwargs.get("turn_id")
-        if (
-            usage is None
-            or kwargs.get("interrupted") is not False
-            or kwargs.get("failed") is not False
-            or type(turn_id) is not str
-            or not turn_id
-            or kwargs.get("turn_exit_reason") != "text_response(finish_reason=stop)"
-        ):
+        if usage is None:
+            gate = "usage_missing"
+        elif kwargs.get("interrupted") is not False:
+            gate = "interrupted"
+        elif kwargs.get("failed") is not False:
+            gate = "failed"
+        elif type(turn_id) is not str or not turn_id:
+            gate = "turn_id"
+        elif kwargs.get("turn_exit_reason") != "text_response(finish_reason=stop)":
+            gate = "turn_exit_reason"
+        else:
+            gate = None
+        if gate:
+            detail = {}
+            if gate == "turn_exit_reason":
+                detail["value"] = str(kwargs.get("turn_exit_reason"))[:80]
+            self._note(logging.INFO, "completion skipped", gate=gate, **detail)
             return
         with self._lock:
             scope = self._capture()
-            if scope.store is None or turn_id in self._seen or self._maintenance is not None:
+            if scope.store is None:
+                gate = "no_archive"
+            elif turn_id in self._seen:
+                gate = "turn_seen"
+            elif self._maintenance is not None:
+                gate = "maintenance_busy"
+            if gate:
+                self._note(logging.INFO, "completion skipped", gate=gate)
                 return
             token = self._maintenance = object()
         target = None
@@ -472,6 +514,7 @@ class RollingAriadneEngine(AriadneEngine):
                 self._seen.add(turn_id)
             with self._journal(scope) as journal:
                 if turn_id in journal.charged_callback_ids():
+                    self._note(logging.INFO, "completion skipped", gate="already_charged")
                     return
                 target = journal.pending_target()
                 parent = journal.load_view()
@@ -482,9 +525,11 @@ class RollingAriadneEngine(AriadneEngine):
                             self._pinned is None
                             or self._pinned.generation_id != parent.generation_id
                         ):
+                            self._note(logging.INFO, "completion skipped", gate="awaiting_adoption")
                             return  # Publication waits for next incoming adoption.
                     target = self._new_target(scope, active, parent, turn_id=turn_id)
                     if target is None:
+                        self._note(logging.INFO, "completion skipped", gate="no_target")
                         return
                     journal.freeze_target(target)
                 active = self._read(scope, False)
@@ -504,6 +549,7 @@ class RollingAriadneEngine(AriadneEngine):
                     lambda: self._guard(scope),
                     charging_callback_id=turn_id,
                 ):
+                    self._note(logging.INFO, "completion skipped", gate="reserve_refused")
                     return
                 self._report(scope, journal, "reserved")
                 try:
@@ -627,6 +673,7 @@ class RollingAriadneEngine(AriadneEngine):
     ):
         scope = self._capture()
         if scope.store is None:
+            self._note(logging.INFO, "declined", reason="no_archive")
             return None
         try:
             self._observe_scope(scope)
