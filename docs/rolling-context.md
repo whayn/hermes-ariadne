@@ -8,11 +8,12 @@ unchanged host instructions. It can prepare a first view and advance that view
 as more completed exchanges accumulate. Ordinary `ariadne` remains passive;
 `ariadne-prepared` still requires operator-prepared artifacts.
 
-This slice supplies packaging, registration and pure contract tests. **Actual
-installed-host rolling runtime proof follows separately.** Fake-context and
-AST-extracted-host tests are not native discovery, provider compatibility,
-long-horizon recall, daily-use readiness or live activation evidence. Do not
-activate this on an important/live profile.
+This slice supplies packaging, registration and pure contract tests. Fake-context
+and AST-extracted-host tests are not native discovery, provider compatibility,
+long-horizon recall, daily-use readiness or live activation evidence. One
+installed-host pilot on one Hermes build and one provider is recorded under
+[Installed-host pilot](#installed-host-pilot-17); it is not daily-use readiness.
+Do not activate this on an important/live profile.
 
 ## What is retained, and what leaves future requests
 
@@ -115,6 +116,12 @@ platform uses an explicit enabled toolset list, retain desired existing toolsets
 and include `context_engine`; an empty list exposes no navigation tools. Native
 routing/authentication stays Hermes-owned; there is no separate provider/client,
 credential copying, replacement harness or core fork.
+
+On gateway-client Hermes builds (for example v0.23.1), `hermes chat` does not run
+the turn in its own process: it submits it to the gateway that owns the profile,
+which can be a shared multiplexer that also serves live profiles. Enabling the
+plugin there also notified the running dashboard backend to reload plugins. Such a
+gateway is not a disposable development process; see the pilot below.
 
 ## Limits and accounting
 
@@ -301,6 +308,68 @@ format to hold only deltas.
 If a session exceeds `max_prefix_events` before the trigger threshold is reached,
 or the logical-job budget is exhausted, rolling status reports `unavailable` while
 any retained view keeps being served; the label is coarser than the cause.
+
+## Installed-host pilot (#17)
+
+`scripts/rolling_host_pilot.py` drives a long synthetic conversation through real
+Hermes in one explicitly chosen development home, in three processes (turns 1-8,
+9-14 and 15-17): native general-plugin discovery, `AIAgent`, `SessionDB`, the normal
+finalizer and `ctx.llm`. Its wrappers only observe engine calls; it never calls a
+hook, publishes, or replaces the facade. Its docstring lists the setup.
+
+One run on 2026-11-14: Ariadne `4cbd202`, plugin installed with `ariadne-install
+--rolling` from a wheel built from that tree, Hermes v0.23.1 (upstream `3b421578`,
+not the CI pin), Anthropic `claude-sonnet-5-5` as both the conversation and the
+`ctx.llm` route, reasoning disabled, settings `max_logical_jobs=8`,
+`trigger_bytes=1024`, `max_delta_exchanges=2`, `max_tokens=1024`, `timeout=180`,
+other limits default. S = selected, D = declined (one letter per model request).
+
+| Turn | Requests | Published view after turn | Jobs | Status | Tools |
+| ---: | --- | --- | ---: | --- | --- |
+| 1-2 | D, D | none | 0 | ready | |
+| 3 | D | G1, frontier 4 | 1 | ready | |
+| 4-8 | S each | G2 f8 (turn 5), G3 f12 (turn 7) | 3 | ready | |
+| 9-10 (new process) | S each | G4 f16 | 4 | ready | |
+| 11 | SS | G5 f20 | 5 | ready | find ok |
+| 12 | SS | G6 f24 | 6 | ready | rolling_page ok |
+| 13 | SSS | G6 f24 (job 7 `invalid_output`) | 7 | failed | find ok, zoom ok |
+| 14 | S | G6 f24 | 7 | unavailable | |
+| 15-17 (new process) | SS, SSS, S | G6 f24 | 7 | unavailable | old ref `generation_expired`; find, zoom ok |
+
+Observed in this run (`summarize` output, receipts and request dumps):
+
+- The first view was prepared and published automatically and advanced five more
+  times; each publication was adopted at the next incoming user turn, and every
+  request of a multi-request tool turn carried the same summary (request-dump
+  hashes). Canonical rows never changed and every row was archived exactly. Every
+  selected request was the host system message, one assistant-role summary message
+  and the original request's remaining messages unchanged; on this provider the
+  transport then prepended a placeholder user message to the summary. The outbound
+  system blocks were byte-identical in all 24 dumped requests across the three
+  processes.
+- Both restarts loaded the published view, reservation count and cumulative bytes
+  from disk; later jobs covered only new deltas, with no repeated job.
+- `ariadne_find`, `ariadne_rolling_page` and `ariadne_zoom` returned exact archived
+  events from the summarized prefix; a reference to a superseded view returned
+  `generation_expired`.
+- One of seven summaries was rejected (`invalid_output`). As designed, the session
+  then stopped advancing (no automatic retry) and kept serving G6. The rejected
+  text is not persisted, so its cause is unknown.
+
+A second, otherwise similar run reached `max_logical_jobs` (8 of 8 published) and
+then reported `unavailable` while still serving its last view. With Anthropic
+reasoning enabled, two runs stopped selecting the first time an assistant tool-call
+row carried `reasoning_details`: the in-turn tool request was declined (so the host
+sent the full original history mid-turn), completion marked the engine unavailable,
+and every later request in that session was declined. Through `hermes chat` on this
+build (turns run by the gateway), five completed turns prepared nothing; the cause
+was not diagnosed because the shared gateway was not instrumented. Observed summary
+calls reported up to 1,476 output tokens with `max_tokens=1024` forwarded; the host's
+Anthropic thinking path can raise `max_tokens`, but this was not confirmed.
+
+This is single-host, single-provider, synthetic evidence. It is not model recall
+evidence (answers are single samples), not a cost or latency measurement, and not
+coverage of Codex reasoning replay, other providers, gateway execution or daily use.
 
 ## Durable state, rollback and evidence
 
