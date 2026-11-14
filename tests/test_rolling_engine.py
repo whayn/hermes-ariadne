@@ -1189,3 +1189,254 @@ def test_safe_existing_archive_and_private_missing_home_admitted(tmp_path, monke
     for row in archived:
         assert archive.get_event(rolling.sha256(canonical_json(row)), session_id="foreign") == row
     assert not facade.calls
+
+
+def engine_records(caplog):
+    records = [r for r in caplog.records if r.name == "hermes_ariadne.rolling_engine"]
+    # A traceback or exc_text would carry exception text past getMessage().
+    assert all(r.exc_info is None and r.exc_text is None for r in records)
+    return [r.getMessage() for r in records]
+
+
+@pytest.mark.parametrize(
+    "metadata, gate",
+    [
+        ({"usage": None}, "usage_missing"),
+        ({"interrupted": True}, "interrupted"),
+        ({"failed": None}, "failed"),
+        ({"turn_id": ""}, "turn_id"),
+        ({"turn_exit_reason": "text_response(finish_reason=length)"}, "turn_exit_reason"),
+    ],
+)
+def test_completion_gate_backout_is_logged_without_content(
+    tmp_path, monkeypatch, caplog, metadata, gate
+):
+    caplog.set_level("DEBUG", logger="hermes_ariadne.rolling_engine")
+    engine, db, _ = setup_engine(tmp_path, monkeypatch)
+    db.rows = exchange("PRIVACY-SENTINEL-A") + exchange("PRIVACY-SENTINEL-B")
+    complete(engine, db, "B", **metadata)
+    lines = engine_records(caplog)
+    assert any("completion skipped" in m and f"gate={gate}" in m for m in lines), lines
+    assert not any("PRIVACY-SENTINEL" in m for m in lines)
+    assert "PRIVACY-SENTINEL" not in caplog.text
+
+
+def test_unavailable_and_decline_are_logged_with_exception_type_only(tmp_path, monkeypatch, caplog):
+    caplog.set_level("DEBUG", logger="hermes_ariadne.rolling_engine")
+    engine, db, _ = setup_engine(tmp_path, monkeypatch)
+    db.rows = exchange("PRIVACY-SENTINEL-A") + exchange("PRIVACY-SENTINEL-B")
+
+    def boom(include_inactive):
+        raise RuntimeError("PRIVACY-SENTINEL leak")
+
+    db.read_hook = boom
+    complete(engine, db, "B")
+    assert select(engine, db, "PRIVACY-SENTINEL-B") is None
+    lines = engine_records(caplog)
+    assert any("unavailable" in m and "RuntimeError" in m for m in lines), lines
+    assert any("declined" in m and "selection_unavailable" in m for m in lines), lines
+    assert not any("PRIVACY-SENTINEL" in m for m in lines)
+    assert "PRIVACY-SENTINEL" not in caplog.text and "Traceback" not in caplog.text
+
+
+def test_refused_archive_is_logged(tmp_path, monkeypatch, caplog):
+    caplog.set_level("DEBUG", logger="hermes_ariadne.rolling_engine")
+    home, _ = unsafe_archive_fixture(tmp_path, "archive-symlink")
+    setup_engine(home, monkeypatch)
+    assert any("archive refused" in m for m in engine_records(caplog))
+
+
+def test_repeated_identical_backout_is_logged_once(tmp_path, monkeypatch, caplog):
+    caplog.set_level("DEBUG", logger="hermes_ariadne.rolling_engine")
+    engine, db, _ = setup_engine(tmp_path, monkeypatch)
+    db.rows = exchange("A") + exchange("B")
+    complete(engine, db, "B", usage=None)
+    complete(engine, db, "B", usage=None)
+    assert sum("gate=usage_missing" in m for m in engine_records(caplog)) == 1
+
+
+def gateway_request(db, tag, platform_id="1699999999.000100"):
+    """Gateway-assembled request: user messages also carry delivery bookkeeping."""
+    history = restored(db.rows)
+    incoming = next(m for m in history if m["message_uid"] == tag + "u")
+    request = assembled(history)
+    for message in request:
+        if message["role"] == "user":
+            message["platform_message_id"] = platform_id
+    return request, history, incoming
+
+
+def test_gateway_delivery_id_on_assembled_user_messages_still_selects(tmp_path, monkeypatch):
+    engine, db, facade = setup_engine(tmp_path, monkeypatch)
+    db.rows = exchange("A") + exchange("B")
+    complete(engine, db, "B")
+    assert len(facade.calls) == 1
+    db.rows += exchange("C", complete=False)[:1]
+    request, history, incoming = gateway_request(db, "C")
+    before = copy.deepcopy(request)
+    result = engine.select_context(
+        request, conversation_messages=history, incoming_message=incoming, budget_tokens=100000
+    )
+    assert request == before
+    assert result is not None
+    assert result[-1] == request[-1] and result[-1]["platform_message_id"]
+    assert engine._pinned is not None
+
+
+@pytest.mark.parametrize("bad", [{"x": 1}, ["a"], True, 1.5])
+def test_gateway_delivery_id_must_be_text_or_integer(tmp_path, monkeypatch, bad):
+    engine, db, facade = setup_engine(tmp_path, monkeypatch)
+    db.rows = exchange("A") + exchange("B")
+    complete(engine, db, "B")
+    db.rows += exchange("C", complete=False)[:1]
+    request, history, incoming = gateway_request(db, "C", platform_id=bad)
+    assert (
+        engine.select_context(
+            request, conversation_messages=history, incoming_message=incoming, budget_tokens=100000
+        )
+        is None
+    )
+
+
+def test_delivery_id_stays_refused_by_shared_prepared_validation():
+    from hermes_ariadne.prepared import _comparison_payloads
+
+    message = {"role": "user", "content": "x", "platform_message_id": "7"}
+    with pytest.raises(ValueError, match="unknown message shape"):
+        _comparison_payloads([message], [None], wire=True)
+    assert _comparison_payloads([message], [None], wire=True, delivery_ids=True) == [
+        {"role": "user", "content": "x"}
+    ]
+
+
+def test_rejected_exit_reason_value_and_control_characters_never_reach_logs(
+    tmp_path, monkeypatch, caplog
+):
+    caplog.set_level("DEBUG", logger="hermes_ariadne.rolling_engine")
+    engine, db, _ = setup_engine(tmp_path, monkeypatch)
+    db.rows = exchange("A") + exchange("B")
+    complete(engine, db, "B", turn_exit_reason="PRIVACY-SENTINEL\nINFO forged line")
+    lines = engine_records(caplog)
+    assert any("gate=turn_exit_reason" in m for m in lines), lines
+    assert "PRIVACY-SENTINEL" not in caplog.text and "forged" not in caplog.text
+
+
+def test_stale_scope_failure_is_not_logged_as_unavailable(tmp_path, monkeypatch, caplog):
+    caplog.set_level("DEBUG", logger="hermes_ariadne.rolling_engine")
+    engine, db, _ = setup_engine(tmp_path, monkeypatch)
+    stale = engine._capture()
+    engine.update_model("gpt-test", 100000, "https://other.test", "", "fixture", "fixture")
+    assert not engine._current(stale)
+    engine._unavailable(stale)
+    engine._refuse_archive(stale)
+    engine._decline("selection_unavailable", stale)
+    engine._flush_notes()
+    assert engine_records(caplog) == []
+    assert engine.get_status()["rolling"]["status"] != "unavailable"
+
+
+def test_facade_failure_and_invalid_output_are_logged_with_type_only(tmp_path, monkeypatch, caplog):
+    caplog.set_level("DEBUG", logger="hermes_ariadne.rolling_engine")
+    facade = Facade()
+
+    def boom():
+        raise ConnectionError("PRIVACY-SENTINEL provider down")
+
+    facade.hook = boom
+    engine, db, _ = setup_engine(tmp_path, monkeypatch, facade=facade)
+    db.rows = exchange("A") + exchange("B")
+    complete(engine, db, "B")
+    lines = engine_records(caplog)
+    assert any("preparation uncertain" in m and "reason=facade_error" in m for m in lines), lines
+    assert any("ConnectionError" in m for m in lines)
+    assert "PRIVACY-SENTINEL" not in caplog.text
+    assert engine.get_status()["rolling"]["status"] == "uncertain"
+
+
+def test_decline_returned_by_selection_decision_is_logged(tmp_path, monkeypatch, caplog):
+    caplog.set_level("DEBUG", logger="hermes_ariadne.rolling_engine")
+    engine, db, _ = setup_engine(tmp_path, monkeypatch)
+    db.rows = exchange("A") + exchange("B")
+    complete(engine, db, "B")
+    db.rows += exchange("C", complete=False)[:1]
+    history = restored(db.rows)
+    result = engine.select_context(
+        assembled(history),
+        conversation_messages=history,
+        incoming_message=history[-1],
+        budget_tokens=1,
+    )
+    assert result is None
+    reason = engine.get_status()["selection"]["reason"]
+    assert any("declined" in m and f"reason={reason}" in m for m in engine_records(caplog))
+
+
+@pytest.mark.parametrize("scenario", ["gate", "decline", "refused-archive", "facade-failure"])
+def test_diagnostics_are_emitted_outside_the_engine_lock(tmp_path, monkeypatch, scenario):
+    import logging
+    import threading
+
+    outcomes = []
+    engines = []
+    cls = engine_class()
+    original_init = cls.__init__
+
+    def registering_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        engines.append(self)
+
+    monkeypatch.setattr(cls, "__init__", registering_init)
+
+    class Probe(logging.Handler):
+        def emit(self, record):
+            def attempt():
+                got = engines[-1]._lock.acquire(timeout=2)
+                outcomes.append(got)
+                if got:
+                    engines[-1]._lock.release()
+
+            thread = threading.Thread(target=attempt)
+            thread.start()
+            thread.join()
+
+    handler = Probe(level=logging.DEBUG)
+    target = logging.getLogger("hermes_ariadne.rolling_engine")
+    previous = target.level
+    target.setLevel(logging.DEBUG)
+    target.addHandler(handler)
+    try:
+        facade = Facade()
+        if scenario == "facade-failure":
+
+            def boom():
+                raise ConnectionError("down")
+
+            facade.hook = boom
+        if scenario == "refused-archive":
+            home, _ = unsafe_archive_fixture(tmp_path, "archive-symlink")
+            engine, db, _ = setup_engine(home, monkeypatch, facade=facade)
+        else:
+            engine, db, _ = setup_engine(tmp_path, monkeypatch, facade=facade)
+        if scenario == "refused-archive":
+            engine.bind_session_state(None, "t")
+            engine.bind_session_state(db, "s")
+            engine.on_session_start("s", hermes_home=home)
+        db.rows = exchange("A") + exchange("B")
+        if scenario == "gate":
+            complete(engine, db, "B", usage=None)
+        elif scenario == "decline":
+            complete(engine, db, "B")
+            db.rows += exchange("C", complete=False)[:1]
+            history = restored(db.rows)
+            engine.select_context(
+                assembled(history),
+                conversation_messages=history,
+                incoming_message=history[-1],
+                budget_tokens=1,
+            )
+        elif scenario == "facade-failure":
+            complete(engine, db, "B")
+    finally:
+        target.removeHandler(handler)
+        target.setLevel(previous)
+    assert outcomes and all(outcomes), outcomes
