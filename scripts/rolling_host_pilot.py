@@ -18,14 +18,22 @@ in that home's config, e.g.::
     hermes -p DEV config set plugins.entries.ariadne-rolling-plugin.settings.rolling.trigger_bytes 1024
     hermes -p DEV config set plugins.entries.ariadne-rolling-plugin.settings.rolling.max_delta_exchanges 2
 
-Run with Hermes's interpreter and source on PYTHONPATH (no packages are installed)::
+Mark the development home as disposable (``touch $DEV_HOME/.ariadne-rolling-pilot``);
+the pilot refuses homes without it, the default Hermes root, and a ``HOME`` that is the
+account home or contains either Hermes home. Hermes still resolves provider
+authentication through its own mechanisms. Run with Hermes's interpreter and source on
+PYTHONPATH (no packages are installed) and a dedicated ``HOME``::
 
-    PYTHONPATH=$HERMES_SOURCE:$HERMES_SITE HERMES_HOME=$DEV_HOME \\
+    HOME=$SCRATCH_HOME PYTHONPATH=$HERMES_SOURCE:$HERMES_SITE HERMES_HOME=$DEV_HOME \\
       $HERMES_PYTHON scripts/rolling_host_pilot.py plan OUT --provider P --model M
     ... rolling_host_pilot.py advance OUT/plan.json      # turns 1-8
     ... rolling_host_pilot.py restart OUT/plan.json      # turns 9-14, new process
     ... rolling_host_pilot.py restart2 OUT/plan.json     # turns 15-17, new process
     python3 scripts/rolling_host_pilot.py summarize OUT
+
+Phases must run in order, once each, against an unchanged session (checked against
+the earlier receipts); a failed turn stops its phase, and an interrupted plan is
+abandoned rather than resumed. One process per plan at a time (file lock).
 
 ``hermes chat`` is deliberately not used: on gateway-client Hermes builds its turns run
 inside the gateway owner process, which may be a shared live gateway. Receipts hold
@@ -35,9 +43,12 @@ single samples, not recall evidence; the pilot is not a provider-cost measuremen
 
 import copy
 import dataclasses
+import fcntl
 import hashlib
 import json
 import os
+import pwd
+import secrets
 import sys
 import time
 import traceback
@@ -110,7 +121,7 @@ def make_plan(out, provider, model, reasoning):
     out.mkdir(parents=True, exist_ok=False)
     plan = {
         "home": str(Path(os.environ["HERMES_HOME"]).resolve()),
-        "session": "ariadne-pilot-" + time.strftime("%Y%m%dT%H%M%S"),
+        "session": f"ariadne-pilot-{time.strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(6)}",
         "provider": provider,
         "model": model,
         "reasoning": reasoning,
@@ -120,31 +131,128 @@ def make_plan(out, provider, model, reasoning):
     print(plan["session"])
 
 
+MARKER = ".ariadne-rolling-pilot"
+
+
+def refuse(condition, message):
+    """Explicit pilot safety check: unlike ``assert`` it survives ``python -O``."""
+    if not condition:
+        raise SystemExit(f"rolling_host_pilot: {message}")
+
+
+def _within(parent, child):
+    return child == parent or child.is_relative_to(parent)
+
+
+def admit_homes(plan):
+    """Check HERMES_HOME and HOME BEFORE importing any stateful Hermes module."""
+    home = Path(os.environ["HERMES_HOME"]).resolve()
+    refuse(str(home) == plan["home"], "HERMES_HOME differs from the plan")
+    refuse((home / MARKER).is_file(), f"HERMES_HOME lacks the disposable-home marker {MARKER}")
+    user_home = Path(os.environ.get("HOME", "")).resolve()
+    account_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    from hermes_constants import get_default_hermes_root  # path helper, no state
+
+    root = Path(get_default_hermes_root()).resolve()
+    refuse(not _within(home, root) and home != root, "refusing the default Hermes root")
+    refuse(
+        os.environ.get("HOME")
+        and user_home != account_home
+        and not _within(user_home, root)
+        and not _within(user_home, home),
+        "HOME must be a dedicated directory: not the account home, the default Hermes root, "
+        "HERMES_HOME or an ancestor of either",
+    )
+    return home
+
+
+def phase_cursor(mode, plan, plan_path, rows):
+    """Durable progress check: the session must hold exactly the earlier phases' turns."""
+    order = list(PHASES)
+    earlier = order[: order.index(mode)]
+    expected = []
+    for phase in earlier:
+        path = plan_path.parent / f"receipt-{phase}.json"
+        refuse(path.is_file(), f"run phase {phase!r} first")
+        done = json.loads(path.read_bytes())
+        planned = [t["n"] for t in plan["phases"][phase]]
+        refuse(
+            [t["turn"] for t in done["turns"]] == planned
+            and not any(t["failed"] for t in done["turns"]),
+            f"phase {phase!r} is incomplete or has a failed turn",
+        )
+        expected += [t["text"] for t in done["turns"]]
+    users = [r["content"] for r in rows if r["role"] == "user"]
+    refuse(users == expected, "session history does not match the completed pilot phases")
+    refuse(
+        not (plan_path.parent / f"receipt-{mode}.json").exists(),
+        f"phase {mode!r} already has a receipt; start a new plan instead of repeating turns",
+    )
+
+
 def run_phase(mode, plan_path):
     plan = json.loads(plan_path.read_bytes())
-    home = Path(os.environ["HERMES_HOME"]).resolve()
-    assert str(home) == plan["home"], "HERMES_HOME differs from the plan"
-    plugin = home / "plugins" / "ariadne-rolling-plugin"
-    assert (plugin / "plugin.yaml").is_file(), "install the plugin from a wheel first"
-    assert not (home / "plugins" / "ariadne-rolling").exists(), "directory-loader name collision"
     session = plan["session"]
+    refuse(session.startswith("ariadne-pilot-"), "not a pilot session id")
+    lock = (plan_path.parent / ".lock").open("w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit("rolling_host_pilot: another process is running this plan") from None
+    home = admit_homes(plan)
+    plugin = home / "plugins" / "ariadne-rolling-plugin"
+    refuse((plugin / "plugin.yaml").is_file(), "install the plugin from a wheel first")
+    refuse(not (home / "plugins" / "ariadne-rolling").exists(), "directory-loader name collision")
 
     # isort: off
     from agent.plugin_llm import PluginLlm
     from hermes_cli.plugins import get_plugin_context_engine
     from hermes_cli.runtime_provider import resolve_runtime_provider
-    from hermes_constants import get_default_hermes_root, parse_reasoning_effort
+    from hermes_constants import parse_reasoning_effort
     from hermes_state import SessionDB
     from run_agent import AIAgent
     # isort: on
 
-    assert home != Path(get_default_hermes_root()).resolve(), "refusing the default Hermes root"
     db = SessionDB(db_path=home / "state.db")
+    rows = db.get_messages(session)
     if mode == "advance":
-        assert db.get_messages(session) == [], "advance needs a brand-new session"
+        refuse(rows == [], "advance needs a brand-new session")
+    phase_cursor(mode, plan, plan_path, rows)
+
+    # Observe failures on the CLASS before AIAgent construction, so an archive refusal
+    # during initialization keeps its cause (clones share the class).
+    manager_engine = get_plugin_context_engine()
+    refuse(
+        manager_engine is not None and manager_engine.name == "ariadne-rolling",
+        "context.engine is not ariadne-rolling",
+    )
+    engine_class = type(manager_engine)
+    init_exceptions = []
+    active = None
+
+    def observe_failure(name):
+        method = getattr(engine_class, name)
+
+        def wrapper(self, *args, **kwargs):
+            etype, exc, tb = sys.exc_info()
+            record = {"via": name}
+            if exc is not None:
+                frames = [
+                    f"{Path(f.filename).name}:{f.lineno}:{f.name}"
+                    for f in traceback.extract_tb(tb)
+                    if str(plugin) in f.filename
+                ]
+                record.update(type=etype.__name__, message=str(exc)[:300], frames=frames[-8:])
+            (active["engine_exceptions"] if active is not None else init_exceptions).append(record)
+            return method(self, *args, **kwargs)
+
+        setattr(engine_class, name, wrapper)
+
+    for name in ("_decline", "_unavailable", "_refuse_archive"):
+        observe_failure(name)
+
+    if mode == "advance":
         db.create_session(session, source="cli", model=plan["model"])
-    else:
-        assert db.get_messages(session), "restart requires prior canonical history"
     runtime = resolve_runtime_provider(requested=plan["provider"], target_model=plan["model"])
     agent = AIAgent(
         api_key=runtime.get("api_key"),
@@ -165,11 +273,14 @@ def run_phase(mode, plan_path):
         reasoning_config=parse_reasoning_effort(plan.get("reasoning")),
     )
     engine = agent.context_compressor
-    assert engine.name == "ariadne-rolling", "context.engine is not ariadne-rolling"
+    refuse(engine.name == "ariadne-rolling", "context.engine is not ariadne-rolling")
     origin = Path(sys.modules[type(engine).__module__].__file__).resolve()
-    assert origin.parent == plugin.resolve(), "engine not loaded from the installed plugin"
-    assert get_plugin_context_engine() is not engine, "manager must clone the engine per agent"
-    assert isinstance(engine._llm, PluginLlm) and engine._llm._sync_caller is None
+    refuse(origin.parent == plugin.resolve(), "engine not loaded from the installed plugin")
+    refuse(get_plugin_context_engine() is not engine, "manager must clone the engine per agent")
+    refuse(
+        isinstance(engine._llm, PluginLlm) and engine._llm._sync_caller is None,
+        "engine is not bound to the host ctx.llm facade",
+    )
     store_py = (plugin / "store.py").resolve()
     canonical_json = next(
         m.canonical_json
@@ -183,9 +294,9 @@ def run_phase(mode, plan_path):
             return None
         generation = json.loads((view_dir / "manifest.json").read_bytes())["generation_id"]
         content = (view_dir / "generations" / f"{generation}.json").read_bytes()
-        assert hashlib.sha256(content).hexdigest() == generation
+        refuse(hashlib.sha256(content).hexdigest() == generation, "generation hash mismatch")
         view = json.loads(content)
-        assert view["session_id"] == session
+        refuse(view["session_id"] == session, "published view belongs to another session")
         return {
             "generation_id": generation,
             "parent_generation": view.get("parent_generation"),
@@ -210,9 +321,9 @@ def run_phase(mode, plan_path):
         "initial": status(),
         "initial_view": durable_view(),
         "initial_rows": len(db.get_messages(session)),
+        "init_exceptions": init_exceptions,
         "turns": [],
     }
-    active = None
     native = {
         n: getattr(engine, n) for n in ("select_context", "handle_tool_call", "on_turn_complete")
     }
@@ -220,7 +331,9 @@ def run_phase(mode, plan_path):
     def observe_select(request_messages, **kwargs):
         before = copy.deepcopy((request_messages, kwargs))
         result = native["select_context"](request_messages, **kwargs)
-        assert (request_messages, kwargs) == before, "selection mutated host input"
+        active["input_mutated"] = (
+            active.get("input_mutated") or (request_messages, kwargs) != before
+        )
         entry = {
             "selected": result is not None,
             "request_messages": len(request_messages),
@@ -259,30 +372,9 @@ def run_phase(mode, plan_path):
         finally:
             active["completion_seconds"] = round(time.time() - started, 2)
 
-    def observe_failure(name):
-        method = getattr(engine, name)
-
-        def wrapper(*args, **kwargs):
-            etype, exc, tb = sys.exc_info()
-            record = {"via": name}
-            if exc is not None:
-                frames = [
-                    f"{Path(f.filename).name}:{f.lineno}:{f.name}"
-                    for f in traceback.extract_tb(tb)
-                    if str(plugin) in f.filename
-                ]
-                record.update(type=etype.__name__, message=str(exc)[:300], frames=frames[-8:])
-            if active is not None:
-                active["engine_exceptions"].append(record)
-            return method(*args, **kwargs)
-
-        setattr(engine, name, wrapper)
-
     engine.select_context = observe_select
     engine.handle_tool_call = observe_tool
     engine.on_turn_complete = observe_complete
-    for name in ("_decline", "_unavailable", "_refuse_archive"):
-        observe_failure(name)
 
     previous = copy.deepcopy(db.get_messages(session))
     for turn in plan["phases"][mode]:
@@ -296,14 +388,19 @@ def run_phase(mode, plan_path):
         text = turn["text"]
         if "{prev_rolling_ref}" in text:
             earlier = json.loads((plan_path.parent / "receipt-restart.json").read_bytes())
-            refs = [
-                t["args"].get("ref")
-                for x in earlier["turns"]
-                for t in x["tools"]
-                if t["name"] == "ariadne_rolling_page"
-            ]
-            assert refs, "restart phase recorded no rolling_page reference"
+            refs = []
+            for x in earlier["turns"]:
+                for t in x["tools"]:
+                    try:
+                        ok = json.loads(t["result"]).get("ok") is True
+                    except (TypeError, ValueError):
+                        ok = False
+                    ref = t["args"].get("ref") if isinstance(t["args"], dict) else None
+                    if t["name"] == "ariadne_rolling_page" and ok and isinstance(ref, str):
+                        refs.append(ref)
+            refuse(refs, "restart phase recorded no successful ariadne_rolling_page reference")
             text = text.replace("{prev_rolling_ref}", refs[0])
+        active["text"] = text
         history = db.get_messages_as_conversation(session, repair_alternation=True)
         started = time.time()
         result = agent.run_conversation(text, conversation_history=history)
@@ -333,6 +430,7 @@ def run_phase(mode, plan_path):
             json.dumps(
                 {
                     "turn": turn["n"],
+                    "failed": active["failed"],
                     "selected": [s["selected"] for s in active["selections"]],
                     "tools": [t["name"] for t in active["tools"]],
                     "frontier": (active["view"] or {}).get("frontier_count"),
@@ -341,6 +439,9 @@ def run_phase(mode, plan_path):
             ),
             flush=True,
         )
+        # Later turns would continue from incomplete history: stop, never treat them as evidence.
+        refuse(not active["failed"], f"turn {turn['n']} failed; phase stopped")
+        refuse(not active.get("input_mutated"), f"turn {turn['n']}: selection mutated host input")
         previous = copy.deepcopy(rows)
     agent.close()
     db.close()
@@ -354,6 +455,8 @@ def summarize(out):
             continue
         r = json.loads(path.read_bytes())
         init = r["initial"]["rolling"] or {}
+        for e in r.get("init_exceptions", []):
+            rows.append(f"init {e['via']}: {e.get('type', '')} {e.get('message', '')}")
         rows.append(
             f"## {mode}: pid {r['pid']}, initial view "
             f"{(r['initial_view'] or {}).get('generation_id', '-')[:12]}, reservations "
@@ -372,7 +475,8 @@ def summarize(out):
                 if e.get("message")
             )
             rows.append(
-                f"| {t['turn']} | {''.join('S' if s['selected'] else 'D' for s in t['selections'])} | "
+                f"| {t['turn']}{' FAILED' if t.get('failed') else ''} | "
+                f"{''.join('S' if s['selected'] else 'D' for s in t['selections'])} | "
                 f"{view.get('generation_id', '-')[:8]} f{view.get('frontier_count')} | "
                 f"{roll.get('logical_reservations')} | {roll.get('status')} | "
                 f"{t['canonical_prefix_unchanged']}/{t['archived_exact_mismatches']} | {tools or '-'} | {excs or '-'} |"

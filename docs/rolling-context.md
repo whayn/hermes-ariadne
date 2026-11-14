@@ -315,7 +315,9 @@ any retained view keeps being served; the label is coarser than the cause.
 Hermes in one explicitly chosen development home, in three processes (turns 1-8,
 9-14 and 15-17): native general-plugin discovery, `AIAgent`, `SessionDB`, the normal
 finalizer and `ctx.llm`. Its wrappers only observe engine calls; it never calls a
-hook, publishes, or replaces the facade. Its docstring lists the setup.
+hook, publishes, or replaces the facade. It refuses unmarked homes, the default
+Hermes root, a shared `HOME`, out-of-order or repeated phases and concurrent runs,
+and stops a phase at a failed turn. Its docstring lists the setup.
 
 One run on 2026-11-14: Ariadne `4cbd202`, plugin installed with `ariadne-install
 --rolling` from a wheel built from that tree, Hermes v0.23.1 (upstream `3b421578`,
@@ -354,7 +356,9 @@ Observed in this run (`summarize` output, receipts and request dumps):
   `generation_expired`.
 - One of seven summaries was rejected (`invalid_output`). As designed, the session
   then stopped advancing (no automatic retry) and kept serving G6. The rejected
-  text is not persisted, so its cause is unknown.
+  text is not persisted, so its cause is unknown. A rerun of the script after its
+  safety checks were tightened (dedicated `HOME`) published G1-G7, then the eighth
+  job was also rejected as `invalid_output` (2 of 15 jobs in these two runs).
 
 A second, otherwise similar run reached `max_logical_jobs` (8 of 8 published) and
 then reported `unavailable` while still serving its last view. With Anthropic
