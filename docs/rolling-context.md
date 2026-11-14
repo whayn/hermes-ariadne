@@ -356,9 +356,10 @@ Observed in this run (`summarize` output, receipts and request dumps):
   `generation_expired`.
 - One of seven summaries was rejected (`invalid_output`). As designed, the session
   then stopped advancing (no automatic retry) and kept serving G6. The rejected
-  text is not persisted, so its cause is unknown. A rerun of the script after its
-  safety checks were tightened (dedicated `HOME`) published G1-G7, then the eighth
-  job was also rejected as `invalid_output` (2 of 15 jobs in these two runs).
+  text is not persisted, so its cause is unknown. Two reruns of the script after
+  its safety checks were tightened (dedicated `HOME`) each also ended in one
+  `invalid_output` job (after G7 and after G6): 3 of 22 jobs across the three runs
+  of this script, versus 0 of 20 in the earlier scratch-driver runs.
 
 A second, otherwise similar run reached `max_logical_jobs` (8 of 8 published) and
 then reported `unavailable` while still serving its last view. With Anthropic

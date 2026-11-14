@@ -166,6 +166,11 @@ def admit_homes(plan):
     return home
 
 
+def rows_digest(rows):
+    """Fingerprint of the complete persisted session rows (every field, every role)."""
+    return hashlib.sha256(json.dumps(rows, sort_keys=True, default=str).encode()).hexdigest()
+
+
 def phase_cursor(mode, plan, plan_path, rows):
     """Durable progress check: the session must hold exactly the earlier phases' turns."""
     order = list(PHASES)
@@ -177,13 +182,15 @@ def phase_cursor(mode, plan, plan_path, rows):
         done = json.loads(path.read_bytes())
         planned = [t["n"] for t in plan["phases"][phase]]
         refuse(
-            [t["turn"] for t in done["turns"]] == planned
-            and not any(t["failed"] for t in done["turns"]),
-            f"phase {phase!r} is incomplete or has a failed turn",
+            done.get("phase_complete") is True and [t["turn"] for t in done["turns"]] == planned,
+            f"phase {phase!r} did not complete every check",
         )
+        last_digest = done["turns"][-1]["rows_sha256"]
         expected += [t["text"] for t in done["turns"]]
     users = [r["content"] for r in rows if r["role"] == "user"]
     refuse(users == expected, "session history does not match the completed pilot phases")
+    if earlier:
+        refuse(rows_digest(rows) == last_digest, "session rows changed since the previous phase")
     refuse(
         not (plan_path.parent / f"receipt-{mode}.json").exists(),
         f"phase {mode!r} already has a receipt; start a new plan instead of repeating turns",
@@ -419,6 +426,7 @@ def run_phase(mode, plan_path):
                 != row
                 for row in rows
             ),
+            rows_sha256=rows_digest(rows),
             status=status(),
             view=durable_view(),
         )
@@ -443,6 +451,11 @@ def run_phase(mode, plan_path):
         refuse(not active["failed"], f"turn {turn['n']} failed; phase stopped")
         refuse(not active.get("input_mutated"), f"turn {turn['n']}: selection mutated host input")
         previous = copy.deepcopy(rows)
+    # Set only after every turn passed every check: later phases require it.
+    receipt["phase_complete"] = True
+    (plan_path.parent / f"receipt-{mode}.json").write_text(
+        json.dumps(receipt, indent=1, default=str)
+    )
     agent.close()
     db.close()
 
