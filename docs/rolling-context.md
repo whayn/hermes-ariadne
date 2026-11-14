@@ -123,6 +123,20 @@ which can be a shared multiplexer that also serves live profiles. Enabling the
 plugin there also notified the running dashboard backend to reload plugins. Such a
 gateway is not a disposable development process; see the pilot below.
 
+To exercise gateway execution, run a separate gateway whose own `HERMES_HOME` is a
+scratch root (not a profile served by the live multiplexer), started with
+`gateway run --no-supervise` under an allowlisted environment (`env -i`) that also
+redirects `HOME`, `HERMES_GATEWAY_LOCK_DIR`, `XDG_RUNTIME_DIR` and `XDG_STATE_HOME`.
+The host rendezvous record and control socket are per OS user, so without those
+overrides `hermes chat` or `--replace` can reach the live gateway. Use a loopback
+provider. The engine refuses a `HERMES_HOME` that is group- or world-accessible
+(`rolling path must be private`, logged as `archive refused`): `chmod 700` it.
+
+The engine logs why it backs out (`hermes_ariadne.rolling_engine`, INFO for
+declines and skipped completions, WARNING for unavailable/refused archive). Lines
+carry the gate or reason and the exception type only, never message content, and
+identical consecutive lines are suppressed.
+
 ## Limits and accounting
 
 Settings live under
@@ -367,8 +381,15 @@ reasoning enabled, two runs stopped selecting the first time an assistant tool-c
 row carried `reasoning_details`: the in-turn tool request was declined (so the host
 sent the full original history mid-turn), completion marked the engine unavailable,
 and every later request in that session was declined. Through `hermes chat` on this
-build (turns run by the gateway), five completed turns prepared nothing; the cause
-was not diagnosed because the shared gateway was not instrumented. Observed summary
+build (turns run by the gateway), five completed turns prepared nothing. A disposable
+gateway with a loopback provider (#28) reproduced it: gateway-assembled user messages
+carry `platform_message_id`, which the strict assembled-request shape check refused
+(`unknown message shape`, logged as `selection_unavailable`), so no view was ever
+adopted and completions never created a target. The rolling engine now accepts that
+delivery id (string or integer, user messages only; Hermes strips it before the
+provider call and it never enters the compared payload); the passive and prepared
+engines still refuse it. In the same disposable setup five turns then published two
+generations. This is one loopback run, not provider, restart or daily-use evidence. Observed summary
 calls reported up to 1,476 output tokens with `max_tokens=1024` forwarded; the host's
 Anthropic thinking path can raise `max_tokens`, but this was not confirmed.
 
