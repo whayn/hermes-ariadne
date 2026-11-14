@@ -10,7 +10,8 @@ engine can select an operator-prepared frozen prefix and expose bounded find/zoo
 tools. Neither of those modes automatically compacts growing chats. A third,
 separate opt-in [`ariadne-rolling`](docs/rolling-context.md) development mode adds
 automatic rolling preparation through Hermes's LLM facade. Its packaging and pure
-contracts are tested; installed-host rolling proof follows separately. All three
+contracts are tested; one synthetic installed-host pilot (one Hermes build, one
+provider) is recorded in its docs, with the failure modes it hit. All three
 displace the built-in compressor; long chats or selection fallback can hit
 provider limits. This is not yet a production long-horizon memory engine.
 
