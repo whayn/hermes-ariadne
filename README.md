@@ -220,7 +220,8 @@ main DB while WAL writes are active). No backup/export/migration CLI is shipped.
   retains versions but does not infer an edit sequence from timestamps.
 - The tested path is the in-process directory loader and local chat-completions
   transport. Plugin-host isolation, remote worker/store variants, every provider,
-  gateway/desktop UI lifecycle, power-loss hardware guarantees and multiprocess
+  desktop UI lifecycle, gateway use beyond the rolling engine's documented
+  loopback pilot (`docs/rolling-context.md`), power-loss hardware guarantees and multiprocess
   long-running production loads are not certified by this milestone.
 
 ## Offline selection simulator (development only)

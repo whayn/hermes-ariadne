@@ -414,7 +414,11 @@ Anthropic thinking path can raise `max_tokens`, but this was not confirmed.
 
 This is single-host, single-provider, synthetic evidence. It is not model recall
 evidence (answers are single samples), not a cost or latency measurement, and not
-coverage of Codex reasoning replay, other providers, gateway execution or daily use.
+coverage of Codex reasoning replay, other providers or daily use. Gateway execution is
+supported only within the scope stated under "Explicit configuration" (a single
+disposable gateway and loopback provider, in-process isolation); gateway load, other
+platform adapters, multiplexed secondary profiles and real-provider gateway runs are
+not covered.
 
 ## Durable state, rollback and evidence
 
