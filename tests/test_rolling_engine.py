@@ -1798,3 +1798,23 @@ def test_tool_call_reasoning_signatures_name_their_carrier(call, error, key):
         _occurrences(messages)
     assert type(caught.value) is ValueError and str(caught.value) == error
     assert caught.value.carrier == key
+
+
+def test_every_decline_path_reports_the_sticky_carrier(tmp_path, monkeypatch):
+    engine, db, _ = setup_engine(tmp_path, monkeypatch)
+    db.rows = exchange("A") + exchange("B")
+    complete(engine, db, "B")
+    db.rows += exchange("C", complete=False)[:1]
+    reads = []
+
+    def refuse_then_fail(include_inactive):
+        reads.append(include_inactive)
+        if len(reads) == 2:  # Past the initial sticky check: another request refuses...
+            engine._unsupported_carrier(engine._capture(), "reasoning_details")
+            raise RuntimeError("...then this request's host read fails")
+
+    db.read_hook = refuse_then_fail
+    assert select(engine, db, "C") is None
+    selection = engine.get_status()["selection"]
+    assert selection["reason"] == "unsupported_carrier"
+    assert selection["carrier"] == "reasoning_details"

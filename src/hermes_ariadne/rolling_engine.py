@@ -290,6 +290,10 @@ class RollingAriadneEngine(AriadneEngine):
     def _decline(self, reason, scope, *, incoming=None, carrier=None):
         with self._lock:
             if self._current(scope):
+                if self._carrier is not None:
+                    # Sticky, whichever path declined (e.g. a concurrent refusal followed
+                    # by a host-read failure): report what actually disables rolling.
+                    reason, carrier = "unsupported_carrier", self._carrier
                 # A decline after this turn already selected makes the host switch the
                 # in-flight tool loop back to the full original history.
                 mid_turn = self._mid_turn(incoming)
