@@ -23,6 +23,7 @@ from .prepared import (
     _occurrences,
     _reasoning_resource_preflight,
     _require_reasoning_policy,
+    _tag_policy_refusal,
     _uids,
 )
 from .retrieval import _require_supported_data_use
@@ -246,7 +247,11 @@ def _canonical_rows(rows, *, policy, settings):
         _require_supported_data_use(row)
         has_reasoning = row.get("codex_reasoning_items") not in (None, "", False, [], {})
         if has_reasoning:
-            _require_reasoning_policy(policy)
+            try:
+                _require_reasoning_policy(policy)
+            except ValueError as error:
+                _tag_policy_refusal(error, "codex_reasoning_items")
+                raise
             for key in ("reasoning", "reasoning_content"):
                 if key not in row or (row[key] is not None and type(row[key]) is not str):
                     raise ValueError("invalid canonical reasoning companion")
