@@ -70,6 +70,16 @@ def _carrier_error(message, key):
     return error
 
 
+def _tag_policy_refusal(error, key):
+    """Name the carrier on the policy refusal itself; any other error is left untouched.
+
+    Re-raised unchanged by the caller, so its exact type (e.g. a UnicodeError from label
+    validation) and message stay what every engine already sees.
+    """
+    if type(error) is ValueError and str(error) == "unsupported reasoning replay policy":
+        error.carrier = key
+
+
 def _require_reasoning_policy(policy):
     if (
         type(policy) is not ReasoningReplayPolicy
@@ -483,7 +493,8 @@ def _encrypted_codex_reasoning(message, policy, *, durable=False):
     try:
         _require_reasoning_policy(policy)
     except ValueError as error:
-        raise _carrier_error(str(error), "codex_reasoning_items") from None
+        _tag_policy_refusal(error, "codex_reasoning_items")
+        raise
     items = message["codex_reasoning_items"]
     if durable and type(items) is str:
         _reasoning_resource_preflight(message)

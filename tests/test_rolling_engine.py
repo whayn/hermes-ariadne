@@ -1666,3 +1666,15 @@ def test_carrier_found_during_an_inflight_completion_stays_reported(tmp_path, mo
     assert len(facade.calls) == 1
     status = engine.get_status()["rolling"]
     assert status["status"] == "unsupported_carrier" and status["carrier"] == "reasoning_details"
+
+
+def test_responses_reasoning_without_a_codex_route_names_its_carrier():
+    """Responses items on a route with no bound policy (xAI, OpenAI API host, router)."""
+    rows = exchange("A")
+    with pytest.raises(ValueError) as caught:
+        rolling.validate_completed_turn(
+            rows, restored(rows), reasoning_policy=None, settings=rolling.RollingSettings()
+        )
+    assert type(caught.value) is ValueError
+    assert str(caught.value) == "unsupported reasoning replay policy"
+    assert caught.value.carrier == "codex_reasoning_items"
