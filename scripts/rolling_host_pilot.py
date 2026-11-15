@@ -97,6 +97,46 @@ PROBES = {
     17: RECALL,
 }
 PHASES = {"advance": range(1, 9), "restart": range(9, 15), "restart2": range(15, 18)}
+# Provider reasoning/replay keys whose PRESENCE the receipts record (names and counts only,
+# never values). Mirrors hermes_ariadne.store.REASONING_CARRIERS.
+CARRIER_KEYS = (
+    "reasoning",
+    "reasoning_content",
+    "reasoning_details",
+    "codex_reasoning_items",
+    "codex_message_items",
+    "anthropic_content_blocks",
+    "_anthropic_content_blocks",
+    "bedrock_content_blocks",
+    "thinking",
+    "extra_content",
+    "thought_signature",
+)
+
+
+def json_units(messages):
+    """Compact ASCII-JSON bytes of a message list: Ariadne's request unit, not provider tokens."""
+    return len(
+        json.dumps(
+            messages, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str
+        ).encode("ascii")
+    )
+
+
+def carrier_shape(messages):
+    """Content-free carrier census: ``{key: messages carrying a non-empty value}``."""
+    found = {}
+    for message in messages:
+        keys = {k for k in CARRIER_KEYS if message.get(k) not in (None, "", [], {})}
+        for call in message.get("tool_calls") or ():
+            if isinstance(call, dict) and call.get("extra_content"):
+                keys.add("tool_calls[].extra_content")
+            function = call.get("function") if isinstance(call, dict) else None
+            if isinstance(function, dict) and function.get("thought_signature"):
+                keys.add("tool_calls[].function.thought_signature")
+        for key in keys:
+            found[key] = found.get(key, 0) + 1
+    return dict(sorted(found.items()))
 
 
 def turn_text(n):
@@ -344,6 +384,8 @@ def run_phase(mode, plan_path):
         entry = {
             "selected": result is not None,
             "request_messages": len(request_messages),
+            "request_bytes": json_units(request_messages),
+            "request_carriers": carrier_shape(request_messages),
             "status": engine.get_status()["selection"],
         }
         if result is not None:
@@ -353,6 +395,8 @@ def run_phase(mode, plan_path):
                     break
                 suffix = k
             entry.update(
+                selected_bytes=json_units(result),
+                selected_carriers=carrier_shape(result),
                 selected_messages=len(result),
                 unchanged_suffix=suffix,
                 selected_roles=[m.get("role") for m in result],
@@ -413,6 +457,7 @@ def run_phase(mode, plan_path):
         result = agent.run_conversation(text, conversation_history=history)
         rows = db.get_messages(session)
         active.update(
+            canonical_carriers=carrier_shape(rows),
             seconds=round(time.time() - started, 1),
             failed=bool(result.get("failed")),
             final_response=result.get("final_response"),
@@ -495,6 +540,24 @@ def summarize(out):
                 f"{t['canonical_prefix_unchanged']}/{t['archived_exact_mismatches']} | {tools or '-'} | {excs or '-'} |"
             )
     print("\n".join(rows))
+    print("\n## request sizes (compact ASCII-JSON bytes of the message list; not tokens)")
+    print("| Turn | Request | Outcome | Original bytes | Selected bytes | Carriers sent |")
+    print("| ---: | ---: | --- | ---: | ---: | --- |")
+    for mode in PHASES:
+        path = out / f"receipt-{mode}.json"
+        if not path.exists():
+            continue
+        for t in json.loads(path.read_bytes())["turns"]:
+            for i, s in enumerate(t["selections"], 1):
+                status = s.get("status") or {}
+                outcome = "S" if s["selected"] else "D " + str(status.get("reason"))
+                if status.get("carrier"):
+                    outcome += " carrier=" + status["carrier"]
+                sent = s.get("selected_carriers") if s["selected"] else s.get("request_carriers")
+                print(
+                    f"| {t['turn']} | {i} | {outcome} | {s.get('request_bytes')} | "
+                    f"{s.get('selected_bytes', '-')} | {sent or '-'} |"
+                )
 
 
 if __name__ == "__main__":

@@ -116,7 +116,7 @@ def validate_rolling_alignment(
         retirement_policy=retirement_policy,
     )
     payloads = _exact_payloads(
-        history, active, policies, assembled=request[split:], delivery_ids=True
+        history, active, policies, assembled=request[split:], delivery_ids=True, carriers=True
     )
     anchor = incoming_anchor(history, incoming)
     starts = completed_exchange_starts(payloads, allow_current=True)
@@ -129,7 +129,7 @@ def validate_rolling_alignment(
         or count > starts[-2]
     ):
         raise ValueError("retain previous exchange and complete current tool groups")
-    _exact_occurrences(history, active, policies)
+    _exact_occurrences(history, active, policies, carriers=True)
     _tool_sequence(payloads[count:])
     return Alignment(split, count, *anchor)
 
