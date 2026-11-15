@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from hermes_ariadne.retrieval import tool_schemas
+from hermes_ariadne.store import canonical_json, carrier_free
 
 
 @pytest.fixture
@@ -156,7 +157,7 @@ def prepared_worker(tmp_path):
             assert evidence["kind"] == "source"
             page = evidence["page"]
             assert page["event_ref"] == trace["event_ref"]
-            assert page["encoding"] == "canonical-json:utf-8-surrogatepass:base64"
+            assert page["encoding"] == "carrier-free-canonical-json:utf-8-surrogatepass:base64"
             assert page["offset"] == len(trace["source"])
             trace["source"] += base64.b64decode(page["data_base64"], validate=True)
             trace["pages"] += 1
@@ -311,10 +312,11 @@ def assert_selected(report):
 def assert_reassembled(report, trace):
     assert trace["complete"], trace
     expected = base64.b64decode(report["exact_source_base64"])
-    assert trace["source"] == expected
+    # Zoom pages the carrier-free projection of the exact archived row (#29).
+    original = json.loads(expected.decode("utf-8", "surrogatepass"))
+    assert trace["source"] == canonical_json(carrier_free(original)[0])
     assert trace["event_ref"] == report["exact_event_ref"]
-    assert "event:" + hashlib.sha256(trace["source"]).hexdigest() == trace["event_ref"]
-    original = json.loads(trace["source"].decode("utf-8", "surrogatepass"))
+    assert "event:" + hashlib.sha256(expected).hexdigest() == trace["event_ref"]
     assert original["content"].endswith("  ")
     assert original["message_uid"] == "synthetic-message-0"
     assert trace["pages"] > 1

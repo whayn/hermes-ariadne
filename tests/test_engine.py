@@ -5,6 +5,7 @@ from pathlib import Path
 from agent.context_engine import ContextEngine
 
 from hermes_ariadne.engine import AriadneEngine
+from hermes_ariadne.store import REASONING_CARRIERS, carrier_free
 
 
 def test_bound_store_reconciles_authoritative_rows_on_start_turn_and_end(tmp_path):
@@ -23,7 +24,9 @@ def test_bound_store_reconciles_authoritative_rows_on_start_turn_and_end(tmp_pat
         engine.on_session_start("s", hermes_home=str(home))
         rows = db.get_messages("s", include_inactive=True)
         result = json.loads(engine.handle_tool_call("ariadne_search", {"query": "café"}))
-        assert [r["message"] for r in result["results"]] == rows
+        # SessionDB rows carry (empty) reasoning columns: search returns the row without them.
+        assert [r["message"] for r in result["results"]] == [carrier_free(r)[0] for r in rows]
+        assert result["results"][0]["omitted_keys"] == sorted(rows[0].keys() & REASONING_CARRIERS)
         uid = rows[0]["message_uid"]
         # The live context can differ from what the user typed: durable wins.
         engine.on_turn_complete([{"message_uid": uid, "content": "injected context"}])
@@ -131,3 +134,28 @@ def test_passive_engine_archives_and_exposes_exact_search(tmp_path):
     assert engine.compression_count == 0
     assert Path(tmp_path / "home" / "ariadne" / "events.sqlite3").exists()
     assert engine.get_tool_schemas()[0]["name"] == "ariadne_search"
+
+
+def test_passive_search_returns_carrier_free_messages_with_omitted_key_names(tmp_path):
+    # #29 maintainer decision 4: no tool returns reasoning carriers; the archive keeps them.
+    from test_retrieval import ALL_OMITTED, SENTINEL, carrier_free, carrier_message
+
+    engine = AriadneEngine()
+    engine.on_session_start("s", hermes_home=str(tmp_path / "home"))
+    plain = {"message_uid": "plain", "role": "user", "content": "needle plain"}
+    message = carrier_message()
+    original = copy.deepcopy([plain, message])
+    engine.on_turn_complete([plain, message])
+    raw = engine.handle_tool_call("ariadne_search", {"query": "needle"})
+    assert SENTINEL not in raw
+    result = json.loads(raw)
+    assert result["count"] == 2
+    by_uid = {r["message_uid"]: r for r in result["results"]}
+    assert by_uid["plain"]["message"] == original[0]
+    assert by_uid["plain"]["omitted_keys"] == []
+    assert by_uid["carrier"]["message"] == carrier_free(original[1])
+    assert by_uid["carrier"]["omitted_keys"] == ALL_OMITTED
+    assert json.loads(engine.handle_tool_call("ariadne_search", {"query": SENTINEL}))["count"] == 0
+    stored = engine._store.search("needle", session_id="s")
+    assert [r["message"] for r in stored] == original  # Archive rows stay exact.
+    assert "omitted" in engine.get_tool_schemas()[0]["description"]

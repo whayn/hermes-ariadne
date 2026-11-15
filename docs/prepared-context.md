@@ -354,8 +354,12 @@ attached generation. All returned node/child/leaf descriptors retain the same
 checkpoint digest. Legacy `node:<projection_id>:<start>+<count>` handles are
 refused, never rebound.
 
-Nodes expand into bounded child descriptors; source leaves return exact
-whole-record canonical-JSON byte pages. Sources remain session-scoped. A
+Nodes expand into bounded child descriptors; source leaves return whole-record
+canonical-JSON byte pages of the record **without its reasoning/replay carriers**
+(encoding `carrier-free-canonical-json:utf-8-surrogatepass:base64`; offsets and
+`total_bytes` count the projection's bytes). Each page lists the dropped key names
+in `omitted_keys`; for a carrier-free record the bytes are the exact canonical record.
+No argument returns carrier values; the archive keeps them (#29). Sources remain session-scoped. A
 republished checkpoint changes node handles even for the same source event IDs
 and identical summary text when checkpoint settings differ. Loaded views stay
 frozen until explicit lifecycle reload; unchanged checkpoint handles survive

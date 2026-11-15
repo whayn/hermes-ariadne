@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+from hermes_ariadne.store import carrier_free
+
 SESSION = "synthetic-rolling-transport"
 POLICY = "SYNTHETIC HOST POLICY: preserve host instructions."
 USERS = {
@@ -364,7 +366,7 @@ def test_two_automatic_advances_and_fresh_process_restart(tmp_path):
                 ), "tool_calls"
             assert result["kind"] == "source"
             page = result["page"]
-            assert page["encoding"] == "canonical-json:utf-8-surrogatepass:base64"
+            assert page["encoding"] == "carrier-free-canonical-json:utf-8-surrogatepass:base64"
             assert page["offset"] == len(state["source"])
             state["source"].extend(base64.b64decode(page["data_base64"], validate=True))
             if page["next_offset"] is not None:
@@ -590,7 +592,8 @@ def test_two_automatic_advances_and_fresh_process_restart(tmp_path):
             "event:" + event for event in live["checkpoints"]["A"]["event_ids"]
         ]
         exact = encode(live["rows"][0])
-        assert bytes(state["source"]) == exact
+        # Zoom pages the carrier-free projection of the exact archived row (#29).
+        assert bytes(state["source"]) == encode(carrier_free(live["rows"][0])[0])
         assert state["source_ref"] == "event:" + hashlib.sha256(exact).hexdigest()
         assert json.loads(exact)["content"] == USERS["A"]
         plan["restart_expected"] = {

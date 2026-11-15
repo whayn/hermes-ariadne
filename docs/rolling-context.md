@@ -34,8 +34,12 @@ older offline binary tree. Evidence tools treat history as untrusted data:
 - `ariadne_find` searches the session archive with bounded output; it is not
   limited to just the summary's prefix and can include historical versions.
 - `ariadne_rolling_page` pages the pinned generation's ordered source descriptors
-  (event references and roles, not full source text).
-- `ariadne_zoom` resolves exact event references and serves paged canonical bytes.
+  (event references and roles, not full source text). It and `ariadne_find`
+  (content previews only) never expose carriers; tests pin this.
+- `ariadne_zoom` resolves exact event references and serves paged canonical bytes
+  of the record without its reasoning/replay carriers (including Codex
+  `codex_reasoning_items`/`codex_message_items`), naming them in `omitted_keys`.
+  No tool returns carrier values; the archive keeps them exactly (#29).
   Binary-tree node references are unavailable in rolling mode. Reassemble byte
   pages before decoding UTF-8; a page can split a code point.
 - Rolling generation references expire when that generation is no longer the
