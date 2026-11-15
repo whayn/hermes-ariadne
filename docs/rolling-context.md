@@ -123,6 +123,18 @@ which can be a shared multiplexer that also serves live profiles. Enabling the
 plugin there also notified the running dashboard backend to reload plugins. Such a
 gateway is not a disposable development process; see the pilot below.
 
+**Gateway execution is supported** for the rolling engine in `in_process` isolation:
+the engine runs inside whichever gateway process owns the turn. The only gateway
+specific input found so far is `platform_message_id` on assembled user messages
+(accepted by the rolling validation only; see the pilot section). The support claim
+is limited to what was exercised: a single disposable gateway with a loopback
+provider, nine turns, four published generations, later requests shortened by the
+adopted view, and one gateway restart mid-session with no repeated preparation. It
+does not cover real providers, multiplexed secondary profiles under load, platform
+adapters other than the local chat client, or any live home. A different assembled
+key, or any other shape the strict check refuses, still declines the request and the
+host sends the original (the engine logs why).
+
 To exercise gateway execution, run a separate gateway whose own `HERMES_HOME` is a
 scratch root (not a profile served by the live multiplexer), started with
 `gateway run --no-supervise` under an allowlisted environment (`env -i`) that also
@@ -389,8 +401,15 @@ adopted and completions never created a target. The rolling engine now accepts t
 delivery id (string or integer, user messages only; Hermes strips it before the
 provider call and it never enters the compared payload); the passive and prepared
 engines still refuse it. In the same disposable setup five turns then published two
-generations. This is one loopback run, not provider, restart or daily-use evidence. Observed summary
-calls reported up to 1,476 output tokens with `max_tokens=1024` forwarded; the host's
+generations. A later run from merged `main` (scratch gateway, loopback provider,
+`trigger_bytes=1024`, `max_delta_exchanges=2`) completed nine turns of one session:
+generations were published after turns 3 and 5, outgoing requests shrank from 8 to 5
+and from 12 to 5 messages once a generation was adopted, and after stopping and
+restarting the gateway the session restored its view (turn 7 sent 7 messages), made two
+further preparations (after turns 7 and 9; 4 published jobs and 4 generations in
+total, none repeated). This is loopback evidence only: not provider, load or
+daily-use evidence, and the sizes are message counts, not provider tokens. Observed
+summary calls reported up to 1,476 output tokens with `max_tokens=1024` forwarded; the host's
 Anthropic thinking path can raise `max_tokens`, but this was not confirmed.
 
 This is single-host, single-provider, synthetic evidence. It is not model recall
