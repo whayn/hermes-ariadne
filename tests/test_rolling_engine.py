@@ -1487,7 +1487,8 @@ def test_canonical_reasoning_carrier_marks_session_unsupported(
     assert status["status"] == "unsupported_carrier" and status["carrier"] == key
     assert len(facade.calls) == 1
     lines = engine_records(caplog)
-    assert any("unsupported carrier" in m and f"carrier={key}" in m for m in lines), lines
+    warnings = [m for m in lines if "unsupported carrier" in m]
+    assert len(warnings) == 1 and f"carrier={key}" in warnings[0], lines
     # Every later request declines with the same explicit reason, not a generic one.
     db.rows += exchange("D", complete=False)[:1]
     assert select(engine, db, "D") is None
@@ -1501,22 +1502,6 @@ def test_canonical_reasoning_carrier_marks_session_unsupported(
     assert engine.get_status()["rolling"]["status"] == "unsupported_carrier"
     assert any("gate=unsupported_carrier" in m for m in engine_records(caplog))
     assert "PRIVACY-SENTINEL" not in caplog.text
-
-
-def test_foreign_issuer_responses_reasoning_is_an_unsupported_carrier(tmp_path, monkeypatch):
-    engine, db, facade = setup_engine(tmp_path, monkeypatch)
-    db.rows = exchange("A") + exchange("B")
-    complete(engine, db, "B")
-    foreign = exchange("C")
-    items = json.loads(foreign[1]["codex_reasoning_items"])
-    items[0]["_issuer_model"] = "another-issuer-model"
-    foreign[1]["codex_reasoning_items"] = json.dumps(items)
-    db.rows += foreign
-    complete(engine, db, "C")
-    status = engine.get_status()["rolling"]
-    assert status["status"] == "unsupported_carrier"
-    assert status["carrier"] == "codex_reasoning_items"
-    assert len(facade.calls) == 1
 
 
 def _in_turn_request(db, tag, carrier=None):
@@ -1603,13 +1588,31 @@ def test_unknown_non_carrier_key_stays_a_generic_decline(tmp_path, monkeypatch):
 
 
 def test_new_session_binding_clears_the_unsupported_carrier_state(tmp_path, monkeypatch):
-    engine, db, _ = setup_engine(tmp_path, monkeypatch)
+    engine, db, facade = setup_engine(tmp_path, monkeypatch)
     db.rows = exchange("A") + plain_exchange("B", reasoning=SENTINEL_REASONING)
     complete(engine, db, "B")
     assert engine.get_status()["rolling"]["status"] == "unsupported_carrier"
     engine.bind_session_state(db, "other")
     assert engine.get_status()["rolling"]["status"] != "unsupported_carrier"
     assert "carrier" not in engine.get_status()["rolling"]
+    # The new binding prepares and selects again; the old latch must not block it.
+    engine.on_session_start("other", hermes_home=tmp_path)
+    rows = [
+        {**row, "session_id": "other"}
+        for row in exchange("P") + exchange("Q") + exchange("R", complete=False)[:1]
+    ]
+    db.rows = rows[:-1]
+    engine.on_turn_complete(
+        restored(db.rows),
+        usage={},
+        turn_id="Q",
+        interrupted=False,
+        failed=False,
+        turn_exit_reason="text_response(finish_reason=stop)",
+    )
+    assert len(facade.calls) == 1
+    db.rows = rows
+    assert select(engine, db, "R") is not None
 
 
 @pytest.mark.parametrize(
@@ -1664,6 +1667,8 @@ def test_carrier_found_during_an_inflight_completion_stays_reported(tmp_path, mo
     facade.hook = concurrent_request
     complete(engine, db, "B")
     assert len(facade.calls) == 1
+    if ending == "publication":
+        assert engine._published is not None, "the completion must have reached publication"
     status = engine.get_status()["rolling"]
     assert status["status"] == "unsupported_carrier" and status["carrier"] == "reasoning_details"
 
@@ -1678,3 +1683,118 @@ def test_responses_reasoning_without_a_codex_route_names_its_carrier():
     assert type(caught.value) is ValueError
     assert str(caught.value) == "unsupported reasoning replay policy"
     assert caught.value.carrier == "codex_reasoning_items"
+
+
+def test_selection_commit_rechecks_a_carrier_recorded_concurrently(tmp_path, monkeypatch):
+    engine, db, _ = setup_engine(tmp_path, monkeypatch)
+    db.rows = exchange("A") + exchange("B")
+    complete(engine, db, "B")
+    db.rows += exchange("C", complete=False)[:1]
+    module = importlib.import_module("hermes_ariadne.rolling_engine")
+    original = module.select_rolling
+
+    def racing(*args, **kwargs):
+        decision = original(*args, **kwargs)
+        assert decision.messages is not None
+        # Another request of this binding refused meanwhile.
+        engine._unsupported_carrier(engine._capture(), "reasoning")
+        return decision
+
+    monkeypatch.setattr(module, "select_rolling", racing)
+    assert select(engine, db, "C") is None
+    assert engine.get_status()["selection"]["reason"] == "unsupported_carrier"
+
+
+def test_carrier_recorded_before_reservation_prevents_spending(tmp_path, monkeypatch):
+    engine, db, facade = setup_engine(tmp_path, monkeypatch)
+    db.rows = exchange("A") + exchange("B")
+
+    def concurrent_refusal(include_inactive):
+        # Another request of this binding refuses after the completion gate, before reserve.
+        engine._unsupported_carrier(engine._capture(), "reasoning_details")
+
+    db.read_hook = concurrent_refusal
+    complete(engine, db, "B")
+    assert facade.calls == []
+    status = engine.get_status()["rolling"]
+    assert status["logical_reservations"] == 0
+    assert status["status"] == "unsupported_carrier"
+
+
+def test_carrier_added_during_preparation_is_recorded_not_just_source_changed(
+    tmp_path, monkeypatch, caplog
+):
+    caplog.set_level("DEBUG", logger="hermes_ariadne.rolling_engine")
+    engine, db, facade = setup_engine(tmp_path, monkeypatch)
+    db.rows = exchange("A") + plain_exchange("B")
+
+    def add_carrier():
+        db.rows[-1]["reasoning_content"] = SENTINEL_REASONING
+
+    facade.hook = add_carrier
+    complete(engine, db, "B")
+    assert len(facade.calls) == 1
+    status = engine.get_status()["rolling"]
+    assert status["status"] == "unsupported_carrier"
+    assert status["carrier"] == "reasoning_content"
+    assert any("reason=source_changed" in m for m in engine_records(caplog))
+    assert "PRIVACY-SENTINEL" not in caplog.text
+
+
+@pytest.mark.parametrize("field", ["_issuer_kind", "_issuer_model"])
+def test_foreign_responses_issuer_is_named_under_a_codex_policy(tmp_path, monkeypatch, field):
+    """A route switch to another Responses issuer (xAI, OpenAI API host, router)."""
+    engine, db, facade = setup_engine(tmp_path, monkeypatch)
+    db.rows = exchange("A") + exchange("B")
+    complete(engine, db, "B")
+    foreign = exchange("C")
+    for row in foreign:
+        if row["codex_reasoning_items"]:
+            items = json.loads(row["codex_reasoning_items"])
+            for item in items:
+                item[field] = "xai_responses" if field == "_issuer_kind" else "grok-test"
+            row["codex_reasoning_items"] = json.dumps(items)
+    db.rows += foreign
+    complete(engine, db, "C")
+    status = engine.get_status()["rolling"]
+    assert status["status"] == "unsupported_carrier"
+    assert status["carrier"] == "codex_reasoning_items"
+    assert len(facade.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "call, error, key",
+    [
+        (
+            {
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "f", "arguments": "{}"},
+                "extra_content": {"google": {"thought_signature": "x"}},
+            },
+            "unsupported tool call",
+            "extra_content",
+        ),
+        (
+            {
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "f", "arguments": "{}", "thought_signature": "x"},
+            },
+            "unsupported function payload",
+            "thought_signature",
+        ),
+    ],
+)
+def test_tool_call_reasoning_signatures_name_their_carrier(call, error, key):
+    from hermes_ariadne.prepared import _occurrences
+
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": None, "tool_calls": [call]},
+        {"role": "tool", "content": "r", "tool_call_id": "c1"},
+    ]
+    with pytest.raises(ValueError) as caught:
+        _occurrences(messages)
+    assert type(caught.value) is ValueError and str(caught.value) == error
+    assert caught.value.carrier == key

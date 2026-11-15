@@ -225,6 +225,13 @@ class RollingAriadneEngine(AriadneEngine):
             if not self._current(scope) or (pin is not None and pin != self._pin_revision):
                 raise ValueError("rolling capture changed")
 
+    def _guard_enabled(self, scope):
+        """Reservation guard: also refuse once a carrier disabled rolling for this binding."""
+        with self._lock:
+            self._guard(scope)
+            if self._carrier is not None:
+                raise ValueError("rolling disabled for this session binding")
+
     def update_model(
         self, model, context_length, base_url="", api_key="", provider="", api_mode=""
     ):
@@ -633,8 +640,8 @@ class RollingAriadneEngine(AriadneEngine):
                 if not journal.reserve(
                     target.job_id,
                     target.request_bytes,
-                    lambda: self._guard(scope),
-                    lambda: self._guard(scope),
+                    lambda: self._guard_enabled(scope),
+                    lambda: self._guard_enabled(scope),
                     charging_callback_id=turn_id,
                 ):
                     self._note(logging.INFO, "completion skipped", gate="reserve_refused")
@@ -672,7 +679,9 @@ class RollingAriadneEngine(AriadneEngine):
                     validate_target_prefix(
                         target, active, settings=self._settings, policy=scope.policy
                     )
-                except ValueError:
+                except ValueError as error:
+                    if carrier := _refused_carrier(error):
+                        self._unsupported_carrier(scope, carrier)
                     self._note(logging.WARNING, "preparation failed", reason="source_changed")
                     journal.record_failed_or_uncertain(target.job_id, "source_changed")
                     self._report(scope, journal, "failed")
@@ -847,6 +856,13 @@ class RollingAriadneEngine(AriadneEngine):
                 )
                 with self._lock:
                     self._guard(scope, pin)
+                    if self._carrier is not None:  # Set by a concurrent request meanwhile.
+                        return self._decline(
+                            "unsupported_carrier",
+                            scope,
+                            incoming=incoming_message,
+                            carrier=self._carrier,
+                        )
                     self._selection = {"status": decision.status, **decision.diagnostics}
                     if decision.status == "declined":
                         mid_turn = self._mid_turn(incoming_message)

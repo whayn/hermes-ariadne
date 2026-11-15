@@ -59,6 +59,7 @@ _REASONING_CARRIERS = frozenset(
         "bedrock_content_blocks",
         "thinking",
         "extra_content",
+        "thought_signature",
     }
 )
 
@@ -416,6 +417,9 @@ def _reasoning_list_bytes(items):
             }
         ):
             raise ValueError("unsupported encrypted reasoning fields")
+        if type(item["_issuer_kind"]) is str and item["_issuer_kind"] != "codex_backend":
+            # Another issuer's Responses reasoning: same refusal, named for the rolling engine.
+            raise _carrier_error("unsupported encrypted reasoning item", "codex_reasoning_items")
         if (
             item["type"] != "reasoning"
             or type(item["encrypted_content"]) is not str
@@ -638,6 +642,8 @@ def _comparison(message, *, wire=False, durable=False, reasoning_policy=None, de
                 "call_id",
                 "response_item_id",
             }:
+                if type(call) is dict and "extra_content" in call:
+                    raise _carrier_error("unsupported tool call", "extra_content")
                 raise ValueError("unsupported tool call")
             native_item = False
             if {"call_id", "response_item_id"} & call.keys():
@@ -759,6 +765,8 @@ def _occurrences(messages, *, durable=False, reasoning_policies=None):
                     or not function["name"]
                     or not isinstance(function["arguments"], str)
                 ):
+                    if type(function) is dict and "thought_signature" in function:
+                        raise _carrier_error("unsupported function payload", "thought_signature")
                     raise ValueError("unsupported function payload")
                 uid = mapping[call["id"]] if mapping is not None else None
                 if uid is not None:
