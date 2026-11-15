@@ -149,6 +149,26 @@ declines and skipped completions, WARNING for unavailable/refused archive). Line
 carry the gate or reason and the exception type only, never message content, and
 identical consecutive lines are suppressed.
 
+**Unsupported reasoning carriers (#29).** Only source-bound Codex-backend reasoning is
+a supported replay carrier. Hermes stores other providers' reasoning on assistant rows
+(`reasoning`, `reasoning_content`, `reasoning_details`, including `<think>` text it
+extracts, the must-echo `reasoning_content` pad and Gemini signature records), and
+on some routes adds it to every assembled request (DeepSeek-family routes do so even
+with reasoning off). Responses API reasoning from another issuer (for example xAI or
+the OpenAI API host) is also unsupported. The first refusal of such a key sets
+`get_status()["rolling"]["status"]` to `unsupported_carrier` with `carrier` naming the
+key (never its value), logs one WARNING, and from then on, for the rest of that session
+binding, every request declines with reason `unsupported_carrier` and completed turns
+skip all preparation (`gate=unsupported_carrier`), since the carrier stays in history
+and would only be refused again. A new session binding clears it. The host sends the
+original request on every such decline. A decline after a request of the same user turn
+was already selected is flagged `mid_turn` (status and log): the host then sends the
+full original history in the middle of that tool loop. In practice rolling therefore
+works only with reasoning-free responses or on Codex: Anthropic thinking, OpenRouter
+reasoning models, DeepSeek/Kimi/Qwen/GLM-style `reasoning_content`, `<think>`-tag
+models, Gemini and Bedrock reasoning disable it at their first reasoning-bearing turn.
+Retiring those carriers at a summary boundary is tracked in #29.
+
 ## Limits and accounting
 
 Settings live under
@@ -392,7 +412,8 @@ then reported `unavailable` while still serving its last view. With Anthropic
 reasoning enabled, two runs stopped selecting the first time an assistant tool-call
 row carried `reasoning_details`: the in-turn tool request was declined (so the host
 sent the full original history mid-turn), completion marked the engine unavailable,
-and every later request in that session was declined. Through `hermes chat` on this
+and every later request in that session was declined (this code now reports that as
+`unsupported_carrier`; see above). Through `hermes chat` on this
 build (turns run by the gateway), five completed turns prepared nothing. A disposable
 gateway with a loopback provider (#28) reproduced it: gateway-assembled user messages
 carry `platform_message_id`, which the strict assembled-request shape check refused

@@ -20,6 +20,7 @@ from typing import Any
 from .engine import AriadneEngine
 from .live_engine import PreparedAriadneEngine
 from .prepared import (
+    _REASONING_CARRIERS,
     _comparison,
     _exact_occurrences,
     _exact_payloads,
@@ -57,6 +58,18 @@ from .store import EventStore, canonical_json
 logger = logging.getLogger(__name__)
 _NOTE_TOKEN = re.compile(r"[^A-Za-z0-9_.=-]")
 _MAX_PENDING_NOTES = 64
+
+
+def _refused_carrier(error):
+    """The reasoning carrier key a validation refusal named, if any (cause chain, bounded)."""
+    for _ in range(8):
+        if error is None:
+            return None
+        carrier = getattr(error, "carrier", None)
+        if carrier in _REASONING_CARRIERS:
+            return carrier  # A fixed key name: safe for status and logs.
+        error = error.__cause__ or error.__context__
+    return None
 
 
 def _flushing(method):
@@ -165,6 +178,10 @@ class RollingAriadneEngine(AriadneEngine):
         self._pin_revision = 0
         self._seen = set()
         self._maintenance = None
+        # Sticky per session binding: a refused reasoning carrier stays in canonical history
+        # (or is re-added to every assembled request), so retrying would only refuse again.
+        self._carrier = None
+        self._selected_incoming = None  # uid of the user turn whose request was last selected
         self._notes = []
         self._notes_lock = Lock()
         self._last_note = None
@@ -258,17 +275,48 @@ class RollingAriadneEngine(AriadneEngine):
         for level, event, text in emit:  # Outside every engine lock.
             logger.log(level, "Ariadne rolling %s%s", event, f" ({text})" if text else "")
 
-    def _decline(self, reason, scope):
+    def _mid_turn(self, incoming):
+        """Whether this user turn already had a selected request (caller holds the lock)."""
+        uid = incoming.get("message_uid") if type(incoming) is dict else None
+        return uid is not None and uid == self._selected_incoming
+
+    def _decline(self, reason, scope, *, incoming=None, carrier=None):
         with self._lock:
             if self._current(scope):
-                self._note(logging.INFO, "declined", reason=reason)
+                # A decline after this turn already selected makes the host switch the
+                # in-flight tool loop back to the full original history.
+                mid_turn = self._mid_turn(incoming)
+                fields = {"reason": reason}
+                if carrier:
+                    fields["carrier"] = carrier
+                if mid_turn:
+                    fields["mid_turn"] = 1
+                self._note(logging.INFO, "declined", **fields)
                 self._selection = {
                     "status": "declined",
                     "reason": reason,
+                    **({"carrier": carrier} if carrier else {}),
+                    "mid_turn": mid_turn,
                     "provider_fit_verified": False,
                     "host_fallback": "original_request_on_decline",
                 }
         return None
+
+    def _unsupported_carrier(self, scope, carrier):
+        with self._lock:
+            if self._current(scope):
+                if self._carrier is None:
+                    self._note(
+                        logging.WARNING,
+                        "unsupported carrier; rolling disabled for this session",
+                        carrier=carrier,
+                    )
+                self._carrier = self._carrier or carrier
+                self._rolling = {
+                    **self._rolling,
+                    "status": "unsupported_carrier",
+                    "carrier": self._carrier,
+                }
 
     def _detach(self):
         self._generation += 1
@@ -277,12 +325,16 @@ class RollingAriadneEngine(AriadneEngine):
         self._pin_revision += 1
         self._seen = set()
         self._maintenance = None
+        self._carrier = self._selected_incoming = None
         self._selection = {
             "status": "not_initialized",
             "provider_fit_verified": False,
             "host_fallback": "original_request_on_decline",
         }
-        self._rolling = {**self._rolling, "status": "not_initialized"}
+        self._rolling = {
+            **{k: v for k, v in self._rolling.items() if k != "carrier"},
+            "status": "not_initialized",
+        }
 
     @_flushing
     def bind_session_state(self, session_db=None, session_id=None):
@@ -384,6 +436,8 @@ class RollingAriadneEngine(AriadneEngine):
         report = journal.report()
         with self._lock:
             self._guard(scope)
+            if self._carrier is not None:
+                status = "unsupported_carrier"  # Never reported ready again this binding.
             self._rolling = {**self._rolling, **report, "status": status}
 
     def _initialize(self, scope):
@@ -411,7 +465,7 @@ class RollingAriadneEngine(AriadneEngine):
 
     def _unavailable(self, scope):
         with self._lock:
-            if self._current(scope):
+            if self._current(scope) and self._carrier is None:
                 self._note(logging.WARNING, "unavailable; no further preparation this attempt")
                 self._rolling = {**self._rolling, "status": "unavailable"}
 
@@ -517,6 +571,8 @@ class RollingAriadneEngine(AriadneEngine):
             scope = self._capture()
             if scope.store is None:
                 gate = "no_archive"
+            elif self._carrier is not None:
+                gate = "unsupported_carrier"
             elif turn_id in self._seen:
                 gate = "turn_seen"
             elif self._maintenance is not None:
@@ -626,10 +682,14 @@ class RollingAriadneEngine(AriadneEngine):
                     target.job_id, text, attribution, _observed_usage(response.usage)
                 )
                 self._publish(scope, journal, target, text, observed, coverage)
-        except Exception:
+        except Exception as error:
             # A stale reservation remains charged; reopening reconciles it uncertain.
             # No automatic replay of failed/uncertain jobs and no replacement view.
-            self._unavailable(scope)
+            carrier = _refused_carrier(error)
+            if carrier:
+                self._unsupported_carrier(scope, carrier)
+            else:
+                self._unavailable(scope)
         finally:
             with self._lock:
                 if self._maintenance is token:
@@ -713,6 +773,12 @@ class RollingAriadneEngine(AriadneEngine):
         if scope.store is None:
             self._note(logging.INFO, "declined", reason="no_archive")
             return None
+        with self._lock:
+            carrier = self._carrier
+        if carrier is not None:  # Sticky: the same carrier would only be refused again.
+            return self._decline(
+                "unsupported_carrier", scope, incoming=incoming_message, carrier=carrier
+            )
         try:
             self._observe_scope(scope)
             active = self._read(scope, False)
@@ -761,7 +827,7 @@ class RollingAriadneEngine(AriadneEngine):
                         self._pin_revision += 1
                     pin = self._pin_revision
                 if view is None:
-                    return self._decline("rolling_unavailable", scope)
+                    return self._decline("rolling_unavailable", scope, incoming=incoming_message)
                 decision = select_rolling(
                     view,
                     request_messages,
@@ -783,14 +849,25 @@ class RollingAriadneEngine(AriadneEngine):
                     self._guard(scope, pin)
                     self._selection = {"status": decision.status, **decision.diagnostics}
                     if decision.status == "declined":
+                        mid_turn = self._mid_turn(incoming_message)
+                        self._selection["mid_turn"] = mid_turn
                         self._note(
                             logging.INFO,
                             "declined",
                             reason=decision.diagnostics.get("reason", "unspecified"),
+                            **({"mid_turn": 1} if mid_turn else {}),
                         )
+                    elif decision.messages is not None:
+                        self._selected_incoming = (incoming_message or {}).get("message_uid")
                     return decision.messages
-        except Exception:
-            return self._decline("selection_unavailable", scope)
+        except Exception as error:
+            carrier = _refused_carrier(error)
+            if carrier:
+                self._unsupported_carrier(scope, carrier)
+                return self._decline(
+                    "unsupported_carrier", scope, incoming=incoming_message, carrier=carrier
+                )
+            return self._decline("selection_unavailable", scope, incoming=incoming_message)
 
     def get_tool_schemas(self):
         return tool_schemas()

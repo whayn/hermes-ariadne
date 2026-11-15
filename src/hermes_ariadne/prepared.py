@@ -45,6 +45,31 @@ class ReasoningReplayPolicy:
     issuer_model: str
 
 
+# Provider reasoning/replay state that only an explicit policy may admit. Keys only:
+# a refusal names the key so the rolling engine can report it, never its value.
+_REASONING_CARRIERS = frozenset(
+    {
+        "reasoning",
+        "reasoning_content",
+        "reasoning_details",
+        "codex_reasoning_items",
+        "codex_message_items",
+        "anthropic_content_blocks",
+        "_anthropic_content_blocks",
+        "bedrock_content_blocks",
+        "thinking",
+        "extra_content",
+    }
+)
+
+
+def _carrier_error(message, key):
+    """A plain ``ValueError`` (same type and text for every engine) naming the carrier key."""
+    error = ValueError(message)
+    error.carrier = key
+    return error
+
+
 def _require_reasoning_policy(policy):
     if (
         type(policy) is not ReasoningReplayPolicy
@@ -455,7 +480,10 @@ def _reasoning_resource_preflight(message):
 
 def _encrypted_codex_reasoning(message, policy, *, durable=False):
     """Validate an opaque replay envelope, without interpreting its ciphertext."""
-    _require_reasoning_policy(policy)
+    try:
+        _require_reasoning_policy(policy)
+    except ValueError as error:
+        raise _carrier_error(str(error), "codex_reasoning_items") from None
     items = message["codex_reasoning_items"]
     if durable and type(items) is str:
         _reasoning_resource_preflight(message)
@@ -464,7 +492,7 @@ def _encrypted_codex_reasoning(message, policy, *, durable=False):
     if message["role"] != "assistant":
         raise ValueError("unsupported encrypted reasoning envelope")
     if any(item["_issuer_model"] != policy.issuer_model for item in items):
-        raise ValueError("unsupported encrypted reasoning item")
+        raise _carrier_error("unsupported encrypted reasoning item", "codex_reasoning_items")
     return items
 
 
@@ -487,6 +515,9 @@ def _provider(message, *, wire=False, durable=False, reasoning_policy=None, deli
     if "_db_persisted" in message and message["_db_persisted"] is not True:
         raise ValueError("invalid persistence marker")
     if set(message) - allowed:
+        carriers = sorted((set(message) - allowed) & _REASONING_CARRIERS)
+        if carriers:
+            raise _carrier_error("unknown message shape", carriers[0])
         raise ValueError("unknown message shape")
     if wire and delivery_ids and "platform_message_id" in message:
         delivery = message["platform_message_id"]
@@ -507,7 +538,7 @@ def _provider(message, *, wire=False, durable=False, reasoning_policy=None, deli
     if message.get("codex_reasoning_items") not in (None, "", False, [], {}):
         reasoning_items = _encrypted_codex_reasoning(message, reasoning_policy, durable=durable)
     codex_items = None
-    for key in _CARRIERS & message.keys():
+    for key in sorted(_CARRIERS & message.keys()):  # Deterministic: names the reported carrier.
         value = message[key]
         if reasoning_items is not None and key in {
             "codex_reasoning_items",
@@ -521,6 +552,8 @@ def _provider(message, *, wire=False, durable=False, reasoning_policy=None, deli
             if key == "codex_message_items":
                 codex_items = _ordinary_codex_message(message, wire=wire, durable=durable)
                 continue
+            if key in _REASONING_CARRIERS:
+                raise _carrier_error("unsupported replay carrier", key)
             raise ValueError("unsupported replay carrier")
     for key in ("_absorbed_message_uids", "absorbed_message_uids"):
         if message.get(key) not in (None, [], "[]", ""):
@@ -758,7 +791,7 @@ def _reasoning_permissions(history, active, request, count, policy, *, retiremen
             if type(value) is str:
                 value.encode("utf-8")
             if assembled is not None and key in assembled:
-                raise ValueError("readable reasoning in assembled request")
+                raise _carrier_error("readable reasoning in assembled request", key)
             if value is None:
                 if restored.get(key) is not None:
                     raise ValueError("NULL reasoning companion mismatch")

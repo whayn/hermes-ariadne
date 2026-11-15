@@ -18,6 +18,7 @@ from functools import cached_property
 
 from .prepared import (
     ReasoningReplayPolicy,
+    _carrier_error,
     _comparison_payloads,
     _identity_value,
     _occurrences,
@@ -246,7 +247,10 @@ def _canonical_rows(rows, *, policy, settings):
         _require_supported_data_use(row)
         has_reasoning = row.get("codex_reasoning_items") not in (None, "", False, [], {})
         if has_reasoning:
-            _require_reasoning_policy(policy)
+            try:
+                _require_reasoning_policy(policy)
+            except ValueError as error:
+                raise _carrier_error(str(error), "codex_reasoning_items") from None
             for key in ("reasoning", "reasoning_content"):
                 if key not in row or (row[key] is not None and type(row[key]) is not str):
                     raise ValueError("invalid canonical reasoning companion")
