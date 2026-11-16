@@ -137,6 +137,7 @@ def _immutable_metadata(path, value):
     if path.exists() or path.is_symlink():
         if s._read(path, 8192) != data:
             raise ValueError("conflicting immutable migration metadata")
+        _sync(path.parent)
     else:
         s._atomic(path, data)
 
@@ -540,6 +541,42 @@ def migrate(home, session_id, settings, *, store, policy=None):
         return _finish(root, session_id, settings, store, policy)
 
 
+@contextmanager
+def _prepared_restore(source, directory, expected_digest):
+    """Hash and fsync a private streamed copy BEFORE removing the selector."""
+    import hashlib
+    import stat
+    import tempfile
+
+    s._path_check(source, regular=True)
+    source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    name = None
+    try:
+        info = os.fstat(source_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o077:
+            raise ValueError("invalid rollback database")
+        fd, name = tempfile.mkstemp(prefix=".rollback-", dir=directory)
+        digest = hashlib.sha256()
+        with os.fdopen(source_fd, "rb", closefd=False) as inp, os.fdopen(fd, "wb") as out:
+            remaining = info.st_size
+            while remaining:
+                chunk = inp.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise ValueError("rollback database changed")
+                remaining -= len(chunk)
+                digest.update(chunk)
+                out.write(chunk)
+            if inp.read(1) or digest.hexdigest() != expected_digest:
+                raise ValueError("rollback database changed")
+            out.flush()
+            os.fsync(out.fileno())
+        yield Path(name)
+    finally:
+        os.close(source_fd)
+        if name is not None and os.path.exists(name):
+            os.unlink(name)
+
+
 def rollback(home, session_id, settings, *, store, policy=None):
     """Remove selector/publish completion metadata BEFORE final legacy admission."""
     with _owned(home, session_id, settings, store) as (root_home, root):
@@ -578,18 +615,22 @@ def rollback(home, session_id, settings, *, store, policy=None):
         }
         if r.sha256(r.encode_json(current, 2**31 - 1)) != receipt["source_fingerprint"]:
             raise ValueError("legacy ledger diverged; rollback refused")
-        _immutable_metadata(
-            root / "rollback-intent.json", _intent(session_id, settings, digest, "rollback")
-        )
-        selector = root / "storage.json"
-        if selector.exists():
-            selector.unlink()
+        with _prepared_restore(
+            snapshot / "journal.sqlite3", root, receipt["source_files"]["journal.sqlite3"]
+        ) as prepared:
+            _immutable_metadata(
+                root / "rollback-intent.json", _intent(session_id, settings, digest, "rollback")
+            )
+            selector = root / "storage.json"
+            if selector.exists():
+                selector.unlink()
+                _sync(root)
+            _immutable_metadata(
+                root / "rollback.json", _rollback_marker(session_id, settings, digest)
+            )
+            # Old binaries ignore metadata: schema 2 is the LAST publication.
+            os.replace(prepared, root / "journal.sqlite3")
             _sync(root)
-        _immutable_metadata(root / "rollback.json", _rollback_marker(session_id, settings, digest))
-        # Old binaries ignore metadata: restoring schema 2 is the LAST publication
-        # point, after every other durable file already describes a complete rollback.
-        limit = settings.max_checkpoint_bytes * settings.max_logical_jobs + 16 * 1024 * 1024
-        s._atomic(root / "journal.sqlite3", s._read(snapshot / "journal.sqlite3", limit))
         if fingerprint(root) != receipt["source_fingerprint"]:
             raise ValueError("restored legacy ledger mismatch")
         _sync(root)

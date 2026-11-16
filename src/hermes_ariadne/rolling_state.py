@@ -10,7 +10,7 @@ import os
 import sqlite3
 import stat
 import tempfile
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 try:
@@ -197,7 +197,7 @@ class RollingJournal:
                 if companion.exists() and not existed:
                     raise ValueError("orphaned rolling journal companion")
             if existed:
-                with sqlite3.connect(self.path, timeout=0) as probe:
+                with closing(sqlite3.connect(self.path, timeout=0)) as probe:
                     found_version = probe.execute("PRAGMA user_version").fetchone()[0]
                 if found_version not in (2, 3):
                     raise ValueError("unsupported rolling journal schema")
@@ -427,6 +427,13 @@ class RollingJournal:
         )
         if digest != row["payload_sha256"] or target.target_id != target_id:
             raise ValueError("frozen target hash mismatch")
+        if self.schema_version == 3 and known is None:
+            parent = (
+                None
+                if target.parent_generation is None
+                else self._view(self._parent_bytes(target.parent_generation))
+            )
+            target.bind(parent, self.settings)
         if self._memo is not None:
             self._memo.targets[digest] = target
         return target

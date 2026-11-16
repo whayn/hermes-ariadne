@@ -252,14 +252,18 @@ def test_rollback_process_death_is_resumable_without_reset(tmp_path, point):
     pid = os.fork()
     if pid == 0:
         try:
-            atomic, sync = rolling_state._atomic, module._sync
+            atomic, sync, replace = rolling_state._atomic, module._sync, os.replace
 
             def at_write(path, data):
                 atomic(path, data)
                 if (point, path.name) in {
-                    ("database", "journal.sqlite3"),
                     ("marker", "rollback.json"),
                 }:
+                    os._exit(73)
+
+            def at_replace(source, destination):
+                replace(source, destination)
+                if point == "database" and destination == directory / "journal.sqlite3":
                     os._exit(73)
 
             def at_sync(path):
@@ -278,6 +282,7 @@ def test_rollback_process_death_is_resumable_without_reset(tmp_path, point):
                     os._exit(73)
 
             rolling_state._atomic, module._sync = at_write, at_sync
+            os.replace = at_replace
             module.rollback(tmp_path, "s", settings, store=store)
             os._exit(0)
         except BaseException:
@@ -300,10 +305,11 @@ def test_rollback_restores_schema_only_after_all_metadata_is_complete(tmp_path, 
     module = migrator()
     module.migrate(tmp_path, "s", settings, store=store)
     upgrade_intent = (directory / "migration-intent.json").read_bytes()
-    atomic = rolling_state._atomic
+    replace, observed = module.os.replace, []
 
-    def guarded_restore(path, data):
+    def guarded_restore(source, path):
         if path == directory / "journal.sqlite3":
+            observed.append(path)
             assert not (directory / "storage.json").exists(), (
                 "old admission before selector removal"
             )
@@ -312,10 +318,11 @@ def test_rollback_restores_schema_only_after_all_metadata_is_complete(tmp_path, 
             )
             assert (directory / "rollback-intent.json").is_file()
             assert (directory / "migration-intent.json").read_bytes() == upgrade_intent
-        return atomic(path, data)
+        return replace(source, path)
 
-    monkeypatch.setattr(rolling_state, "_atomic", guarded_restore)
+    monkeypatch.setattr(module.os, "replace", guarded_restore)
     module.rollback(tmp_path, "s", settings, store=store)
+    assert observed == [directory / "journal.sqlite3"]
 
 
 def test_receipt_source_file_schema_cannot_be_rehashed_away(tmp_path):
