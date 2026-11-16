@@ -759,9 +759,9 @@ class RollingAriadneEngine(AriadneEngine):
             history, active, request[split:], 0, scope.policy, retirement_policy=POLICY_ID
         )
         payloads = _exact_payloads(
-            history, active, policies, assembled=request[split:], delivery_ids=True
+            history, active, policies, assembled=request[split:], delivery_ids=True, carriers=True
         )
-        _exact_occurrences(history, active, policies)
+        _exact_occurrences(history, active, policies, carriers=True)
         completed_exchange_starts(payloads, allow_current=True)
         if payloads[-1]["role"] not in {"user", "tool"}:
             raise ValueError("not an incoming request")

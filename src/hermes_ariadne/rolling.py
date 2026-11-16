@@ -18,9 +18,11 @@ from functools import cached_property
 
 from .prepared import (
     ReasoningReplayPolicy,
+    _admit_opaque_carriers,
     _comparison_payloads,
     _identity_value,
     _occurrences,
+    _opaque,
     _reasoning_resource_preflight,
     _require_reasoning_policy,
     _tag_policy_refusal,
@@ -238,6 +240,8 @@ def _canonical_rows(rows, *, policy, settings):
             raise ValueError("canonical row must be a mapping")
         # Carrier-specific resource admission precedes ANY generic serializer.
         _reasoning_resource_preflight(row)
+        if _opaque(row, True):  # Keyed admission first, so a refusal names its carrier.
+            _admit_opaque_carriers(row)
         data = encode_json(row, settings.max_checkpoint_bytes)
         metadata = row.get("display_metadata")
         for _ in range(2):
@@ -262,12 +266,12 @@ def _canonical_rows(rows, *, policy, settings):
             bounded_text(row["name"], settings.max_checkpoint_bytes)
         event_ids.append(sha256(data))
     _uids(rows)
-    payloads = _comparison_payloads(rows, policies, durable=True)
+    payloads = _comparison_payloads(rows, policies, durable=True, carriers=True)
     for row, payload in zip(rows, payloads):
         items = payload.get("codex_message_items")
         if items and items[0]["content"][0]["text"] != row["content"]:
             raise ValueError("Codex replay requires exact canonical source text")
-    _occurrences(rows, durable=True, reasoning_policies=policies)
+    _occurrences(rows, durable=True, reasoning_policies=policies, carriers=True)
     if rows[0]["role"] != "user" or rows[-1]["role"] != "assistant" or rows[-1].get("tool_calls"):
         raise ValueError("whole completed exchanges required")
     return tuple(event_ids), tuple(row["message_uid"] for row in rows), payloads
@@ -1518,6 +1522,8 @@ def validate_completed_turn(active_rows, observed_messages, *, reasoning_policy,
     for message in observed_messages:
         _require_supported_data_use(message)
         _reasoning_resource_preflight(message)
+        if _opaque(message, True):
+            _admit_opaque_carriers(message)
         encode_json(message, settings.max_checkpoint_bytes)
     policies = _reasoning_permissions(
         observed_messages,
@@ -1527,7 +1533,7 @@ def validate_completed_turn(active_rows, observed_messages, *, reasoning_policy,
         reasoning_policy,
         retirement_policy=POLICY_ID,
     )
-    payloads = _exact_payloads(observed_messages, active_rows, policies)
-    _exact_occurrences(observed_messages, active_rows, policies)
+    payloads = _exact_payloads(observed_messages, active_rows, policies, carriers=True)
+    _exact_occurrences(observed_messages, active_rows, policies, carriers=True)
     starts = completed_exchange_starts(payloads)
     return Coverage(events, uids, uids[-1], len(starts))

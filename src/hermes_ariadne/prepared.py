@@ -50,6 +50,27 @@ class ReasoningReplayPolicy:
 _REASONING_CARRIERS = REASONING_CARRIERS
 
 
+# Rolling only (#29): other providers' reasoning, admitted as OPAQUE values. Never compared,
+# read, summarized, logged or shown; it leaves requests with its retired exchange. Codex
+# items keep their audited codec; bedrock_content_blocks (and any other key) stays refused.
+_OPAQUE_CARRIERS = frozenset(
+    {
+        "reasoning",
+        "reasoning_content",
+        "reasoning_details",
+        "thinking",
+        "anthropic_content_blocks",
+        "_anthropic_content_blocks",
+        "extra_content",
+        "thought_signature",
+    }
+)
+_MAX_CARRIER_MESSAGE_BYTES = 1_048_576
+_MAX_CARRIER_REQUEST_BYTES = 8 * 1_048_576
+_MUST_ECHO_PAD = " "  # Hermes pads reasoning_content on must-echo routes (DeepSeek/Kimi/MiMo).
+_ABSENT = (None, "", False, [], {})  # The provider codec's legacy empty-as-absent values.
+
+
 def _carrier_error(message, key):
     """A plain ``ValueError`` (same type and text for every engine) naming the carrier key."""
     error = ValueError(message)
@@ -497,12 +518,139 @@ def _encrypted_codex_reasoning(message, policy, *, durable=False):
     return items
 
 
-def _provider(message, *, wire=False, durable=False, reasoning_policy=None, delivery_ids=False):
+def _opaque(message, carriers):
+    """Whether the rolling-only opaque admission applies: never to a Codex reasoning row."""
+    return carriers and message.get("codex_reasoning_items") in _ABSENT
+
+
+def _carrier_absent(value):
+    """Type-aware absence: None or an EMPTY string/list/object. Unlike the legacy codec's
+    ``_ABSENT`` equality, False/0/0.0 are present (and then refused as non-JSON)."""
+    return value is None or (type(value) in (str, list, dict) and not value)
+
+
+def _carrier_values(message):
+    """``(key, value)`` of every present non-empty opaque carrier, tool-call ones included."""
+    found = [
+        (key, message[key])
+        for key in sorted(_OPAQUE_CARRIERS & message.keys())
+        if not _carrier_absent(message[key])
+    ]
+    calls = message.get("tool_calls")
+    for call in calls if type(calls) is list else ():
+        if type(call) is not dict:
+            continue
+        if not _carrier_absent(call.get("extra_content")):
+            found.append(("extra_content", call["extra_content"]))
+        function = call.get("function")
+        if type(function) is dict and not _carrier_absent(function.get("thought_signature")):
+            found.append(("thought_signature", function["thought_signature"]))
+    return found
+
+
+class _OverBound(ValueError):
+    """Internal: a bounded measurement passed its limit."""
+
+
+def _bounded_json_units(value, limit):
+    """``ascii_json_units(value)`` without serializing past ``limit``.
+
+    Same byte unit (compact, sorted, ASCII-escaped JSON), computed by an iterative walk
+    that raises ``_OverBound`` as soon as the running total exceeds ``limit``: a string
+    is only escaped once its raw length (a lower bound of its escaped length) fits, and a
+    container's framing is counted before its items are queued, so cycles and huge
+    fan-out stop at the bound too. Non-JSON values raise ``ValueError``.
+    """
+    size, stack = 0, [value]
+    while stack:
+        item = stack.pop()
+        if type(item) is str:
+            if size + len(item) + 2 > limit:
+                raise _OverBound()
+            size += len(json.dumps(item, ensure_ascii=True))
+        elif type(item) is dict:
+            size += 1 + 2 * len(item) if item else 2  # Braces, colons and commas.
+            if size > limit:
+                raise _OverBound()
+            for key, member in item.items():
+                if type(key) is not str:
+                    raise ValueError("non-string JSON key")
+                stack.extend((key, member))
+        elif type(item) is list:
+            size += 1 + len(item) if item else 2  # Brackets and commas.
+            if size > limit:
+                raise _OverBound()
+            stack.extend(item)
+        elif item is None or type(item) is bool:
+            size += 4 if item is None or item is True else 5
+        elif type(item) is int:
+            size += len(repr(item))
+        elif type(item) is float:
+            if item != item or item in (float("inf"), float("-inf")):
+                raise ValueError("nonfinite JSON number")
+            size += len(repr(item))
+        else:
+            raise ValueError("non-JSON value")
+        if size > limit:
+            raise _OverBound()
+    return size
+
+
+def _admit_opaque_carriers(message):
+    """Structural admission of one message's opaque carriers; returns their JSON bytes.
+
+    Assistant rows only; a JSON string, list or object; at most
+    ``_MAX_CARRIER_MESSAGE_BYTES`` for all of one message's carriers together, measured
+    without serializing past the bound. Values are measured, never interpreted. Every
+    refusal names the key, never the value.
+    """
+    size = 0
+    for key, value in _carrier_values(message):
+        if message.get("role") != "assistant":
+            raise _carrier_error("reasoning carrier on a non-assistant message", key)
+        if type(value) not in (str, list, dict):
+            raise _carrier_error("non-JSON reasoning carrier", key)
+        try:
+            size += _bounded_json_units(value, _MAX_CARRIER_MESSAGE_BYTES - size)
+        except _OverBound:
+            raise _carrier_error("reasoning carrier exceeds its admission bound", key) from None
+        except (ValueError, TypeError, RecursionError, OverflowError):
+            raise _carrier_error("non-JSON reasoning carrier", key) from None
+    return size
+
+
+def _carrier_bytes(message):
+    """Admitted opaque carrier bytes of one message (0 for a Codex reasoning row)."""
+    return _admit_opaque_carriers(message) if _opaque(message, True) else 0
+
+
+def _require_carrier_origin(message, reference):
+    """An opaque carrier may appear only where ``reference`` (canonical) has one.
+
+    Exception: the host's must-echo pad alone. Presence only: the host projects carriers
+    per route (copies, promotes, strips), so values are deliberately not compared.
+    """
+    if not _opaque(message, True):
+        return
+    found = _carrier_values(message)
+    if not found or all(k == "reasoning_content" and v == _MUST_ECHO_PAD for k, v in found):
+        return
+    if reference is None or not _opaque(reference, True) or not _carrier_values(reference):
+        raise _carrier_error("reasoning carrier without a canonical counterpart", found[0][0])
+
+
+def _provider(
+    message, *, wire=False, durable=False, reasoning_policy=None, delivery_ids=False, carriers=False
+):
     """``delivery_ids`` (rolling only): accept the gateway's ``platform_message_id`` on an
     assembled user message. It is delivery bookkeeping that Hermes strips before the
-    provider call; it never enters the compared payload."""
+    provider call; it never enters the compared payload.
+
+    ``carriers`` (rolling only, #29): admit ``_OPAQUE_CARRIERS`` structurally on rows
+    without Codex reasoning and leave them out of the compared payload."""
     if type(message) is not dict:
         raise ValueError("message must be a mapping")
+    opaque = _opaque(message, carriers)
     # At select_context this is assembled, not final HTTP: Hermes strips the
     # born-durable marker only in the later chat-completions transport.
     allowed = (
@@ -512,7 +660,7 @@ def _provider(message, *, wire=False, durable=False, reasoning_policy=None, deli
         | ({"platform_message_id"} if delivery_ids else set())
         if wire
         else _WIRE | _METADATA | _CARRIERS | _IDENTITIES
-    )
+    ) | (_OPAQUE_CARRIERS if opaque else set())
     if "_db_persisted" in message and message["_db_persisted"] is not True:
         raise ValueError("invalid persistence marker")
     if set(message) - allowed:
@@ -535,6 +683,8 @@ def _provider(message, *, wire=False, durable=False, reasoning_policy=None, deli
         role == "assistant" and content is None and message.get("tool_calls")
     ):
         raise ValueError("only text and assistant tool-call messages are supported")
+    if opaque:
+        _admit_opaque_carriers(message)
     reasoning_items = None
     if message.get("codex_reasoning_items") not in (None, "", False, [], {}):
         reasoning_items = _encrypted_codex_reasoning(message, reasoning_policy, durable=durable)
@@ -549,6 +699,8 @@ def _provider(message, *, wire=False, durable=False, reasoning_policy=None, deli
             continue  # Companions are checked independently before this projection.
         if key == "api_content" and value == content:
             continue  # An identical sidecar cannot change this supported wire mapping.
+        if opaque and key in _OPAQUE_CARRIERS:
+            continue  # Admitted above; opaque, so never part of the compared payload.
         if value not in (None, "", False, [], {}):
             if key == "codex_message_items":
                 codex_items = _ordinary_codex_message(message, wire=wire, durable=durable)
@@ -581,7 +733,9 @@ def _provider(message, *, wire=False, durable=False, reasoning_policy=None, deli
     return result
 
 
-def _comparison(message, *, wire=False, durable=False, reasoning_policy=None, delivery_ids=False):
+def _comparison(
+    message, *, wire=False, durable=False, reasoning_policy=None, delivery_ids=False, carriers=False
+):
     """Audited pretransport comparison only; never returned as request/source.
 
     _assistant_tool_call_dict adds these two Responses sidecars, then
@@ -595,7 +749,9 @@ def _comparison(message, *, wire=False, durable=False, reasoning_policy=None, de
         durable=durable,
         reasoning_policy=reasoning_policy,
         delivery_ids=delivery_ids,
+        carriers=carriers,
     )
+    opaque = _opaque(message, carriers)
     # make_tool_result_message writes name + tool_name; SessionDB restores only
     # tool_name. Reconcile this alias ONLY for tool results, never speakers.
     for key in ("tool_name", "effect_disposition"):
@@ -627,6 +783,7 @@ def _comparison(message, *, wire=False, durable=False, reasoning_policy=None, de
                 "function",
                 "call_id",
                 "response_item_id",
+                *(("extra_content",) if opaque else ()),
             }:
                 if type(call) is dict and "extra_content" in call:
                     raise _carrier_error("unsupported tool call", "extra_content")
@@ -668,13 +825,19 @@ def _comparison(message, *, wire=False, durable=False, reasoning_policy=None, de
                         raise ValueError("duplicate native response item")
                     native_item_ids.add(item_id)
                     native_item = True
-            projected.append(
-                {
-                    k: v
-                    for k, v in call.items()
-                    if k != "call_id" and (k != "response_item_id" or native_item)
+            call = {
+                k: v
+                for k, v in call.items()
+                if k != "call_id"
+                and (k != "response_item_id" or native_item)
+                and not (opaque and k == "extra_content")
+            }
+            if opaque and type(call["function"]) is dict:
+                # Admitted by _provider; opaque, so not part of the compared payload.
+                call["function"] = {
+                    k: v for k, v in call["function"].items() if k != "thought_signature"
                 }
-            )
+            projected.append(call)
         result["tool_calls"] = projected
     return result
 
@@ -709,7 +872,7 @@ def _identity_value(message, name):
     return values[0] if values else None
 
 
-def _occurrences(messages, *, durable=False, reasoning_policies=None):
+def _occurrences(messages, *, durable=False, reasoning_policies=None, carriers=False):
     _tool_sequence(messages)
     pending = {}
     seen = set()
@@ -719,6 +882,7 @@ def _occurrences(messages, *, durable=False, reasoning_policies=None):
             message,
             durable=durable,
             reasoning_policy=reasoning_policies[index] if reasoning_policies else None,
+            carriers=carriers,
         ).get("tool_calls")
         mapping = _identity_value(message, "tool_call_uids")
         result_uid = _identity_value(message, "tool_call_uid")
@@ -811,7 +975,9 @@ def _reasoning_permissions(history, active, request, count, policy, *, retiremen
     return permissions
 
 
-def _comparison_payloads(messages, policies, *, wire=False, durable=False, delivery_ids=False):
+def _comparison_payloads(
+    messages, policies, *, wire=False, durable=False, delivery_ids=False, carriers=False
+):
     """Use a separate request-local reasoning ID set for each compared view."""
     payloads = []
     reasoning_ids = set()
@@ -822,6 +988,7 @@ def _comparison_payloads(messages, policies, *, wire=False, durable=False, deliv
             durable=durable,
             reasoning_policy=policies[index],
             delivery_ids=delivery_ids,
+            carriers=carriers,
         )
         items = payload.get("codex_reasoning_items")
         if items:
@@ -834,16 +1001,21 @@ def _comparison_payloads(messages, policies, *, wire=False, durable=False, deliv
     return payloads
 
 
-def _exact_payloads(history, active, policies, *, assembled=None, delivery_ids=False):
+def _exact_payloads(
+    history, active, policies, *, assembled=None, delivery_ids=False, carriers=False
+):
     """Shared audited canonical/restored comparison; assembled is real or absent.
 
     Callers establish UID coverage separately. A callback has no assembled view;
     omitting it proves only the actual canonical/restored correspondence.
+    ``carriers`` (rolling only, #29): opaque carriers are excluded from the equality;
+    instead every restored/assembled carrier needs a canonical one at its position
+    (or is the must-echo pad), and the assembled request's carriers share one bound.
     """
-    raw_payload = _comparison_payloads(history, policies)
+    raw_payload = _comparison_payloads(history, policies, carriers=carriers)
     if any(m["role"] not in {"user", "assistant", "tool"} for m in raw_payload):
         raise ValueError("host role inside history")
-    active_payload = _comparison_payloads(active, policies, durable=True)
+    active_payload = _comparison_payloads(active, policies, durable=True, carriers=carriers)
     for index, replay in enumerate(raw_payload):
         items = replay.get("codex_message_items")
         if items:
@@ -864,16 +1036,35 @@ def _exact_payloads(history, active, policies, *, assembled=None, delivery_ids=F
             continue
         raise ValueError("active/conversation payload mismatch")
     if assembled is not None and canonical_json(
-        _comparison_payloads(assembled, policies, wire=True, delivery_ids=delivery_ids)
+        _comparison_payloads(
+            assembled, policies, wire=True, delivery_ids=delivery_ids, carriers=carriers
+        )
     ) != canonical_json(raw_payload):
         raise ValueError("request must be an exact one-to-one mapping")
+    if carriers:
+        # Past this point every view is aligned one-to-one with history.
+        for index, message in enumerate(history[: len(active)]):
+            _require_carrier_origin(message, active[index])
+        total = 0
+        for index, message in enumerate(assembled or ()):
+            # In-flight rows of the current turn are not durable yet: the host's own
+            # conversation message is then the origin of what it assembled.
+            _require_carrier_origin(
+                message, active[index] if index < len(active) else history[index]
+            )
+            total += _carrier_bytes(message)
+            if total > _MAX_CARRIER_REQUEST_BYTES:
+                raise _carrier_error(
+                    "reasoning carriers exceed the request admission bound",
+                    _carrier_values(message)[0][0],
+                )
     return raw_payload
 
 
-def _exact_occurrences(history, active, policies):
-    occurrences = _occurrences(history, reasoning_policies=policies)
+def _exact_occurrences(history, active, policies, *, carriers=False):
+    occurrences = _occurrences(history, reasoning_policies=policies, carriers=carriers)
     if canonical_json(
-        _occurrences(active, durable=True, reasoning_policies=policies)
+        _occurrences(active, durable=True, reasoning_policies=policies, carriers=carriers)
     ) != canonical_json(occurrences[: len(active)]):
         raise ValueError("active/conversation occurrence mismatch")
     return occurrences

@@ -87,7 +87,11 @@ def test_readable_carrier_omission_preserves_exact_archive(tmp_path):
         {"display_metadata": {"withheld_prompt": ""}},
         {"display_metadata": "[]"},
         {"api_content": "divergent"},
-        {"reasoning_details": ["unknown"]},
+        # #29: reasoning_details is admitted as an opaque carrier now (see
+        # test_rolling_carriers.py); a carrier outside the admitted set, or a non-JSON
+        # value, is still refused.
+        {"bedrock_content_blocks": ["unknown"]},
+        {"reasoning_details": 5},
         {"unknown": "carrier"},
         {"content": [{"type": "image"}]},
     ],

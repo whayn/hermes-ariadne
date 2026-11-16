@@ -6,10 +6,12 @@ from dataclasses import dataclass
 
 from .prepared import (
     SelectionDecision,
+    _admit_opaque_carriers,
     _comparison,
     _exact_occurrences,
     _exact_payloads,
     _leading,
+    _opaque,
     _reasoning_permissions,
     _reasoning_resource_preflight,
     _safe_json,
@@ -36,6 +38,8 @@ def _admit_messages(*groups):
         for message in messages:
             _require_supported_data_use(message)
             _reasoning_resource_preflight(message)
+            if _opaque(message, True):  # Name the carrier before generic serialization.
+                _admit_opaque_carriers(message)
         _safe_json(messages)
 
 
@@ -116,7 +120,7 @@ def validate_rolling_alignment(
         retirement_policy=retirement_policy,
     )
     payloads = _exact_payloads(
-        history, active, policies, assembled=request[split:], delivery_ids=True
+        history, active, policies, assembled=request[split:], delivery_ids=True, carriers=True
     )
     anchor = incoming_anchor(history, incoming)
     starts = completed_exchange_starts(payloads, allow_current=True)
@@ -129,7 +133,7 @@ def validate_rolling_alignment(
         or count > starts[-2]
     ):
         raise ValueError("retain previous exchange and complete current tool groups")
-    _exact_occurrences(history, active, policies)
+    _exact_occurrences(history, active, policies, carriers=True)
     _tool_sequence(payloads[count:])
     return Alignment(split, count, *anchor)
 

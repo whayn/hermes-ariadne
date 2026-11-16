@@ -18,13 +18,13 @@ Do not activate this on an important/live profile.
 ## What is retained, and what leaves future requests
 
 The host's session DB stays authoritative and is never rewritten. Exact archived
-JSON-value snapshots, including supported older opaque Codex continuation state,
-remain in `$HERMES_HOME/ariadne/events.sqlite3`. Once a complete summary boundary
-has passed structural/source validation, that older state may stop being sent in
-**future** requests with the summarized prefix. It is not converted into readable
-reasoning. Recent replay state and recent complete tool groups remain unchanged
-in the assembled request suffix. Archive availability is not a claim of identical
-provider continuation behavior.
+JSON-value snapshots, including supported older opaque Codex continuation state and
+other providers' reasoning, remain in `$HERMES_HOME/ariadne/events.sqlite3`. Once a
+complete summary boundary has passed structural/source validation, that older state
+may stop being sent in **future** requests with the summarized prefix. It is not
+converted into readable reasoning. Recent replay state and recent complete tool groups
+remain unchanged in the assembled request suffix. Archive availability is not a claim
+of identical provider continuation behavior.
 
 Summaries are lossy. Coverage hashes, exact source identities and complete
 exchange checks establish structural correspondence, **not semantic completeness
@@ -153,25 +153,52 @@ declines and skipped completions, WARNING for unavailable/refused archive). Line
 carry the gate or reason and the exception type only, never message content, and
 identical consecutive lines are suppressed.
 
-**Unsupported reasoning carriers (#29).** Only source-bound Codex-backend reasoning is
-a supported replay carrier. Hermes stores other providers' reasoning on assistant rows
-(`reasoning`, `reasoning_content`, `reasoning_details`, including `<think>` text it
-extracts, the must-echo `reasoning_content` pad and Gemini signature records), and
-on some routes adds it to every assembled request (DeepSeek-family routes do so even
-with reasoning off). Responses API reasoning from another issuer (for example xAI or
-the OpenAI API host) is also unsupported. The first refusal of such a key sets
+**Reasoning carriers (#29).** Reasoning has no value to Ariadne: it is ignored, passed
+through and never shown. Hermes stores other providers' reasoning on assistant rows
+(`reasoning`, `reasoning_content`, `reasoning_details`, `thinking`, Anthropic content
+blocks, Gemini `extra_content`/`thought_signature` on tool calls) and shapes it per
+route before selection: it copies text between keys, strips keys a route does not read,
+and on must-echo routes pads every assistant message with `reasoning_content: " "`. The
+rolling engine therefore admits these keys as **opaque values** instead of comparing
+them byte for byte:
+
+- They are left out of the canonical/restored/assembled comparison. Every other field
+  stays byte-exact, as before.
+- Admission is structural: assistant messages only; a JSON string, list or object;
+  at most 1 MiB for all carriers of one message and 8 MiB for all carriers of one
+  assembled request (compact ASCII JSON).
+- A carrier on the restored or assembled side is allowed only on a message whose
+  canonical row carries one, or as the exact must-echo pad. For rows of the current
+  turn that are not persisted yet, the host's own conversation message is the reference.
+- Ariadne never writes a carrier. The retained tail is the host's own assembled
+  messages, carriers included, unchanged; a retired exchange leaves future requests
+  together with its carriers. The inserted summary carries none.
+- Summary input (`readable_delta`) stays a whitelist of role, content, tool names and
+  arguments, so no carrier reaches `ctx.llm`; logs carry key names only; no tool returns
+  carrier values (see the retrieval bullets above). The archive keeps the exact rows.
+- The relaxed comparison is rolling only. The passive and prepared engines still refuse
+  these keys. Codex `codex_reasoning_items` keep their audited codec and retirement
+  policy; a Codex reasoning row admits no other carrier.
+
+Anything outside that set or failing admission still refuses: for example
+`bedrock_content_blocks`, a carrier on a user or tool message, a non-JSON value, an
+oversized carrier, an assembled carrier without a canonical one, and Responses API
+reasoning from another issuer (xAI, the OpenAI API host). The first such refusal sets
 `get_status()["rolling"]["status"]` to `unsupported_carrier` with `carrier` naming the
 key (never its value), logs one WARNING, and from then on, for the rest of that session
 binding, every request declines with reason `unsupported_carrier` and completed turns
-skip all preparation (`gate=unsupported_carrier`), since the carrier stays in history
-and would only be refused again. A new session binding clears it. The host sends the
-original request on every such decline. A decline after a request of the same user turn
-was already selected is flagged `mid_turn` (status and log): the host then sends the
-full original history in the middle of that tool loop. In practice rolling therefore
-works only with reasoning-free responses or on Codex: Anthropic thinking, OpenRouter
-reasoning models, DeepSeek/Kimi/Qwen/GLM-style `reasoning_content`, `<think>`-tag
-models, Gemini and Bedrock reasoning disable it at their first reasoning-bearing turn.
-Retiring those carriers at a summary boundary is tracked in #29.
+skip all preparation (`gate=unsupported_carrier`). A new session binding clears it. The
+host sends the original request on every such decline. A decline after a request of the
+same user turn was already selected is flagged `mid_turn` (status and log).
+
+What was exercised: synthetic engine tests with route-shaped fixtures (Anthropic thinking
+with live-only content blocks, `reasoning_content`, `reasoning`, OpenRouter text and
+encrypted details, Gemini signatures, the must-echo pad), and two installed-host runs on
+Anthropic with thinking (below). **Not verified:** first-party must-echo routes
+(DeepSeek, Kimi, MiMo; no tokens available), where the inserted summary is an assistant
+message without the pad; it is assumed safe until an issue reports otherwise. Other real
+providers (OpenRouter, Gemini, Bedrock) were not run. Inline `<think>` text that a route
+leaves in `content` is ordinary content and reaches the summarizer; that is unmeasured.
 
 ## Limits and accounting
 
@@ -413,11 +440,12 @@ Observed in this run (`summarize` output, receipts and request dumps):
 
 A second, otherwise similar run reached `max_logical_jobs` (8 of 8 published) and
 then reported `unavailable` while still serving its last view. With Anthropic
-reasoning enabled, two runs stopped selecting the first time an assistant tool-call
-row carried `reasoning_details`: the in-turn tool request was declined (so the host
-sent the full original history mid-turn), completion marked the engine unavailable,
-and every later request in that session was declined (this code now reports that as
-`unsupported_carrier`; see above). Through `hermes chat` on this
+reasoning enabled, two runs (before #29's carrier admission) stopped selecting the first
+time an assistant tool-call row carried `reasoning_details`: the in-turn tool request was
+declined (so the host sent the full original history mid-turn), completion marked the
+engine unavailable, and every later request in that session was declined. The rerun
+with admitted carriers is under [Anthropic with thinking](#anthropic-with-thinking-29).
+Through `hermes chat` on this
 build (turns run by the gateway), five completed turns prepared nothing. A disposable
 gateway with a loopback provider (#28) reproduced it: gateway-assembled user messages
 carry `platform_message_id`, which the strict assembled-request shape check refused
@@ -436,6 +464,57 @@ total, none repeated). This is loopback evidence only: not provider, load or
 daily-use evidence, and the sizes are message counts, not provider tokens. Observed
 summary calls reported up to 1,476 output tokens with `max_tokens=1024` forwarded; the host's
 Anthropic thinking path can raise `max_tokens`, but this was not confirmed.
+
+### Anthropic with thinking (#29)
+
+Two runs of the same script on 2026-11-15: plugin installed with `ariadne-install
+--rolling` from a wheel built from this branch at `e90acdc` (installed files
+hash-identical to the source; before the later retrieval fix for JSON-text tool calls,
+which does not touch selection), Hermes v0.23.1 source tree (not the CI pin), in-process `AIAgent` in the
+dedicated development profile (no gateway, no `hermes chat`; fallback providers
+disabled for the run, configuration restored byte-exact afterwards), Anthropic
+`claude-sonnet-5-5` for turns and `ctx.llm`, reasoning `high` (the host sent adaptive
+thinking), settings as above. The first assistant row with `reasoning_details` was the
+tool call of turn 13 in both runs; turns 14 and 16 (and 17 in run 2) also carried
+thinking.
+
+| | Run 1 | Run 2 |
+| --- | --- | --- |
+| Requests selected | all 21 from turn 4 on (turns 1-3: declined, no view yet) | same |
+| Tool turns | 11 `SS`, 12 `SS`, 13 `SSS`, 15 `SS`, 16 `SSS` | same |
+| `unsupported_carrier` / mid-turn declines | none | none |
+| Published views | 6 (frontier 24); job 7 after turn 13 `invalid_output` (logged `JSONDecodeError`) | 8 (frontier 34, covering turn 13); then `max_logical_jobs` reached |
+| Restarts (new process at turns 9 and 15) | view, reservations and bytes reloaded; no repeated job | same |
+| Canonical rows changed / archive mismatches | none / 0 | none / 0 |
+
+Request sizes (compact ASCII-JSON bytes of the message list as Ariadne measures it, not
+tokens; the selected value is the candidate counted against `max_candidate_bytes`):
+
+| Turn.request | Run 1 original → selected | Run 1 carriers sent | Run 2 original → selected | Run 2 carriers sent |
+| --- | ---: | --- | ---: | --- |
+| 4.1 | 7,829 → 7,619 | none | 7,829 → 7,669 | none |
+| 10.1 | 12,620 → 8,653 | none | 12,620 → 8,807 | none |
+| 13.3 | 25,348 → 17,812 | 1 details, 1 blocks | 23,613 → 15,978 | 1 details, 1 blocks |
+| 14.1 | 26,164 → 18,628 | 2 details | 24,171 → 14,791 | 2 details |
+| 15.1 | 28,546 → 21,010 | 3 details | 26,740 → 10,687 | 1 details |
+| 16.3 | 36,878 → 29,342 | 4 details, 1 blocks | 34,355 → 18,302 | 2 details, 1 blocks |
+| 17.1 | 35,856 → 28,320 | 4 details | 35,136 → 19,083 | 3 details |
+
+The largest candidate was 29,342 bytes; no request reached the 65,536-byte default, so
+there was no `request_bytes_exceeded` decline. Hermes' request dumps (one per request, 24 per run) put
+the HTTP bodies at 8,059-27,439 bytes (run 1) and 8,059-19,970 bytes (run 2), with up
+to 4 and 3 thinking blocks. The provider accepted every request, including those with
+signed thinking blocks after the inserted summary, inside tool loops and after restart.
+In run 2 the view published after turn 14 covered turn 13's thinking-bearing tool loop:
+from turn 15 on, its carriers left the request with the exchange (3 messages with
+`reasoning_details` in the original request, 1 in the selected one) and the provider
+accepted the result. `ariadne_find`/`ariadne_zoom`/`ariadne_rolling_page` worked in
+both runs; an expired view reference returned `generation_expired`.
+
+Not covered: other providers, must-echo routes, gateway execution with a real provider, and anything beyond two runs of one script.
+The `invalid_output` rejection recurred as in the earlier runs; its input contains no
+carrier (turn 13 was not yet in that job's delta), so it is not attributed to carriers,
+but its cause beyond the exception type is still unknown.
 
 This is single-host, single-provider, synthetic evidence. It is not model recall
 evidence (answers are single samples), not a cost or latency measurement, and not

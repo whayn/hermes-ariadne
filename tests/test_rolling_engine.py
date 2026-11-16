@@ -1462,13 +1462,16 @@ def plain_exchange(tag, **assistant):
     return [user, answer]
 
 
+# #29: reasoning/reasoning_content/reasoning_details are admitted as opaque carriers
+# (tests/test_rolling_carriers.py). What still fails admission: a carrier outside the
+# admitted set, and a value that is not JSON text, a list or an object.
 CANONICAL_CARRIERS = [
-    ("reasoning", SENTINEL_REASONING),
-    ("reasoning_content", SENTINEL_REASONING),
     (
-        "reasoning_details",
-        json.dumps([{"type": "reasoning.text", "text": SENTINEL_REASONING, "format": "unknown"}]),
+        "bedrock_content_blocks",
+        json.dumps([{"reasoningContent": {"reasoningText": {"text": SENTINEL_REASONING}}}]),
     ),
+    ("reasoning", 7),
+    ("reasoning_details", True),
 ]
 
 
@@ -1589,7 +1592,7 @@ def test_unknown_non_carrier_key_stays_a_generic_decline(tmp_path, monkeypatch):
 
 def test_new_session_binding_clears_the_unsupported_carrier_state(tmp_path, monkeypatch):
     engine, db, facade = setup_engine(tmp_path, monkeypatch)
-    db.rows = exchange("A") + plain_exchange("B", reasoning=SENTINEL_REASONING)
+    db.rows = exchange("A") + plain_exchange("B", bedrock_content_blocks=SENTINEL_REASONING)
     complete(engine, db, "B")
     assert engine.get_status()["rolling"]["status"] == "unsupported_carrier"
     engine.bind_session_state(db, "other")
@@ -1729,14 +1732,14 @@ def test_carrier_added_during_preparation_is_recorded_not_just_source_changed(
     db.rows = exchange("A") + plain_exchange("B")
 
     def add_carrier():
-        db.rows[-1]["reasoning_content"] = SENTINEL_REASONING
+        db.rows[-1]["bedrock_content_blocks"] = SENTINEL_REASONING  # Not an admitted carrier.
 
     facade.hook = add_carrier
     complete(engine, db, "B")
     assert len(facade.calls) == 1
     status = engine.get_status()["rolling"]
     assert status["status"] == "unsupported_carrier"
-    assert status["carrier"] == "reasoning_content"
+    assert status["carrier"] == "bedrock_content_blocks"
     assert any("reason=source_changed" in m for m in engine_records(caplog))
     assert "PRIVACY-SENTINEL" not in caplog.text
 
