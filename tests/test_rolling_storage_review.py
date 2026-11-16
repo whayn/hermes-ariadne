@@ -190,3 +190,44 @@ def test_orphan_cleanup_only_removes_confirmed_private_copies(tmp_path, action, 
         operation(tmp_path, "s", settings, store=store)
         assert not list(directory.glob(".rollback-*"))
     assert snapshot.read_bytes() == original
+
+
+@pytest.mark.parametrize("action", ["migrate", "rollback"])
+def test_idempotent_completion_resyncs_and_preserves_later_legacy_activity(
+    tmp_path, monkeypatch, action
+):
+    store, settings = setup(tmp_path)
+    with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
+        first = target(store, settings, 1)
+        ready(journal, first, "one")
+        journal.publish_ready(
+            first.job_id, rolling.generation_bytes(first, "one", sequence=1, settings=settings)
+        )
+        directory = journal.directory
+    (tmp_path / ".ariadne-offline-migration").touch(mode=0o600)
+    receipt = migration.migrate(tmp_path, "s", settings, store=store)
+    if action == "rollback":
+        migration.rollback(tmp_path, "s", settings, store=store)
+        with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
+            second = target(store, settings, 2, journal.load_view())
+            ready(journal, second, "two")
+            journal.publish_ready(
+                second.job_id,
+                rolling.generation_bytes(second, "two", sequence=2, settings=settings),
+            )
+    before = migration.fingerprint(directory)
+    operation = getattr(migration, action)
+
+    def denied(path):
+        assert path == directory
+        raise OSError("synthetic completion sync denied")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(migration, "_sync", denied)
+        with pytest.raises(OSError, match="completion sync denied"):
+            operation(tmp_path, "s", settings, store=store)
+    calls = []
+    monkeypatch.setattr(migration, "_sync", calls.append)
+    assert operation(tmp_path, "s", settings, store=store) == receipt
+    assert calls == [directory]
+    assert migration.fingerprint(directory) == before

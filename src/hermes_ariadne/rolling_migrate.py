@@ -500,6 +500,7 @@ def migrate(home, session_id, settings, *, store, policy=None):
             resolve_storage(root, session_id, settings)
             receipt = _receipt(root, session_id, settings)[0]
             _cleanup_rollback_copies(root, receipt)
+            _sync(root)
             return receipt
         if (root / "migration-intent.json").exists():
             return _finish(root, session_id, settings, store, policy)
@@ -619,6 +620,7 @@ def rollback(home, session_id, settings, *, store, policy=None):
             )
             if (root / "rollback.json").exists() and version == 2:
                 resolve_storage(root, session_id, settings)
+                _sync(root)
                 return receipt  # Already restored; never overwrite subsequent legacy activity.
         else:
             resolve_storage(root, session_id, settings)
