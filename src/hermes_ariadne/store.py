@@ -111,13 +111,43 @@ def _nested_carriers(calls):
     return found
 
 
+def _has_carrier_key(value):
+    """Whether any mapping anywhere inside a decoded JSON value has a carrier key."""
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if type(item) is dict:
+            if item.keys() & REASONING_CARRIERS:
+                return True
+            stack.extend(item.values())
+        elif type(item) is list:
+            stack.extend(item)
+    return False
+
+
+def _strict_json(text):
+    """Decode JSON text, refusing duplicate members a lossy decode would hide."""
+
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate JSON member")
+            result[key] = value
+        return result
+
+    return json.loads(text, object_pairs_hook=pairs)
+
+
 def carrier_free(message):
     """``(projection, omitted)``: a copy of a row without any reasoning carrier.
 
     Every present carrier key is dropped, empty or not, and named in ``omitted``
-    (sorted names only, never values). Tool calls lose their nested carriers; a
-    JSON-text ``tool_calls`` value that decodes to calls carrying one is dropped
-    whole (it cannot be re-encoded byte-exactly). Everything else is unchanged.
+    (sorted names only, never values). Tool calls lose their known nested carriers
+    (``extra_content`` and ``function.thought_signature``). ``tool_calls`` is dropped
+    whole, and named, when a carrier key remains anywhere inside it, or when it is JSON
+    text that cannot be strictly decoded (malformed, too deep, duplicate members):
+    uninspectable text is never treated as carrier-free. Everything else is unchanged.
     The input is not mutated and nothing is written: the archive stays exact.
     """
     projection = {key: value for key, value in message.items() if key not in REASONING_CARRIERS}
@@ -127,7 +157,7 @@ def carrier_free(message):
         nested = _nested_carriers(calls)
         if nested:
             omitted |= nested
-            projection["tool_calls"] = [
+            calls = projection["tool_calls"] = [
                 call
                 if type(call) is not dict
                 else {
@@ -141,12 +171,15 @@ def carrier_free(message):
                 }
                 for call in calls
             ]
+        if _has_carrier_key(calls):
+            del projection["tool_calls"]
+            omitted.add("tool_calls")
     elif type(calls) is str:
         try:
-            decoded = json.loads(calls)
+            unsafe = _has_carrier_key(_strict_json(calls))
         except (ValueError, RecursionError):
-            decoded = None
-        if _nested_carriers(decoded):
+            unsafe = True
+        if unsafe:
             del projection["tool_calls"]
             omitted.add("tool_calls")
     return projection, sorted(omitted)

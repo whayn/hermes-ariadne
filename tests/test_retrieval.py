@@ -1149,7 +1149,7 @@ def test_empty_carrier_keys_are_omitted_and_named_too(tmp_path, value):
     store.ingest("attached", [message], origin="fixture")
     data, pages = zoom_all(api, store, "event:" + identity(message), limit=2048)
     assert pages[0]["page"]["omitted_keys"] == ["reasoning"]
-    assert b"reasoning" not in data
+    assert data == canonical_json({"message_uid": "m", "role": "assistant", "content": "x"})
 
 
 def test_carrier_free_row_pages_its_unchanged_canonical_bytes(tmp_path):
@@ -1184,7 +1184,8 @@ def test_carrier_free_row_pages_its_unchanged_canonical_bytes(tmp_path):
             ["tool_calls"],
         ),
         (json.dumps([_tool_call()]), []),
-        ("not json " + "extra_content", []),
+        ("not json " + "extra_content", ["tool_calls"]),  # Uninspectable: never "clean".
+        ("not json", ["tool_calls"]),
     ],
 )
 def test_json_text_tool_calls_with_nested_carriers_are_omitted_whole(tmp_path, tool_calls, omitted):
@@ -1252,3 +1253,41 @@ def test_carrier_key_set_is_the_one_shared_with_the_provider_codec():
 
     assert prepared._REASONING_CARRIERS is store.REASONING_CARRIERS
     assert set(_TOP_CARRIERS) == store.REASONING_CARRIERS
+
+
+@pytest.mark.parametrize(
+    "tool_calls",
+    [
+        # Duplicate members: a lossy decoder keeps only the last, hiding the carrier.
+        '[{"id":"c","function":{"name":"f","thought_signature":"' + SENTINEL + '"},"function":{}}]',
+        '[{"id":"c","extra_content":"' + SENTINEL + '","extra_content":null}]',
+        # Undecodable text (4300-digit integer limit, malformed) must not count as clean.
+        '[{"extra_content":"' + SENTINEL + '","function":{"arguments":' + "1" * 4301 + "}}]",
+        '[{"extra_content":"' + SENTINEL + '"',
+        # Escaped key names and carriers outside the known call positions.
+        '[{"extra\\u005fcontent":"' + SENTINEL + '"}]',
+        '{"extra_content":"' + SENTINEL + '"}',
+        '[{"function":{"name":"f","args":{"reasoning_details":"' + SENTINEL + '"}}}]',
+    ],
+)
+def test_uninspectable_or_hidden_tool_call_carriers_drop_tool_calls_whole(tmp_path, tool_calls):
+    api = retrieval()
+    store = EventStore(tmp_path / "archive.sqlite3")
+    message = {"message_uid": "m", "role": "assistant", "content": "x", "tool_calls": tool_calls}
+    store.ingest("attached", [message], origin="fixture")
+    data, pages = zoom_all(api, store, "event:" + identity(message), limit=2048)
+    assert pages[0]["page"]["omitted_keys"] == ["tool_calls"]
+    assert data == canonical_json({"message_uid": "m", "role": "assistant", "content": "x"})
+    assert SENTINEL.encode() not in data
+
+
+def test_list_tool_calls_with_a_carrier_outside_known_positions_drop_whole(tmp_path):
+    api = retrieval()
+    store = EventStore(tmp_path / "archive.sqlite3")
+    call = _tool_call()
+    call["function"]["nested"] = {"reasoning": SENTINEL}
+    message = {"message_uid": "m", "role": "assistant", "content": "x", "tool_calls": [call]}
+    store.ingest("attached", [message], origin="fixture")
+    data, pages = zoom_all(api, store, "event:" + identity(message), limit=2048)
+    assert pages[0]["page"]["omitted_keys"] == ["tool_calls"]
+    assert SENTINEL.encode() not in data
