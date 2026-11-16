@@ -19,6 +19,21 @@ from pathlib import Path
 
 import pytest
 
+from hermes_ariadne.store import canonical_json, carrier_free
+
+
+def json_keys(value):
+    """Every mapping key in a decoded JSON value (string contents are not decoded)."""
+    keys, stack = set(), [value]
+    while stack:
+        item = stack.pop()
+        if type(item) is dict:
+            keys.update(item)
+            stack.extend(item.values())
+        elif type(item) is list:
+            stack.extend(item)
+    return keys
+
 
 def completed_message(turn):
     return {
@@ -177,7 +192,7 @@ def codex_worker(tmp_path):
         assert evidence["kind"] == "source"
         page = evidence["page"]
         assert page["event_ref"] == trace["event_ref"]
-        assert page["encoding"] == "canonical-json:utf-8-surrogatepass:base64"
+        assert page["encoding"] == "carrier-free-canonical-json:utf-8-surrogatepass:base64"
         assert page["offset"] == len(trace["source"])
         trace["source"] += base64.b64decode(page["data_base64"], validate=True)
         trace["pages"] += 1
@@ -815,7 +830,9 @@ def assert_native_replay(report, sent, baseline):
             "ariadne_find",
             "ariadne_zoom",
         ]
-        assert "codex_message_items" not in json.dumps(request["body"])
+        # No replayed carrier KEY on the wire. (Zoom tool outputs may name it in
+        # omitted_keys inside their string content: that is a name, not a carrier, #29.)
+        assert "codex_message_items" not in json_keys(request["body"])
         for message in entry["request"]:
             assert not message.get("codex_reasoning_items"), "ordinary carrier coverage only"
             for item in message.get("codex_message_items", []):
@@ -903,7 +920,8 @@ def test_native_reasoning_tools_and_restart(codex_worker, reasoning_count):
     )
     source = base64.b64decode(live["exact_source_base64"], validate=True)
     assert trace["complete"] and trace["pages"] > 1
-    assert trace["source"] == source
+    # Zoom pages the carrier-free projection of the exact archived row (#29).
+    assert trace["source"] == canonical_json(carrier_free(json.loads(source))[0])
     assert (
         trace["event_ref"]
         == live["exact_event_ref"]
@@ -2337,7 +2355,8 @@ def test_native_codex_tool_cycle_and_restart_keep_selection_and_exact_source(cod
     assert len(original) == len(resumed) == 1
     assert trace["complete"] and trace["pages"] > 1
     source = base64.b64decode(live["exact_source_base64"], validate=True)
-    assert trace["source"] == source
+    # Zoom pages the carrier-free projection of the exact archived row (#29).
+    assert trace["source"] == canonical_json(carrier_free(json.loads(source))[0])
     assert (
         trace["event_ref"]
         == live["exact_event_ref"]

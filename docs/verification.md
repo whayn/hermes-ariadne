@@ -77,7 +77,7 @@ via real discovery, bind a real `SessionDB`, and use real HTTP/SSE transport to 
 scripted loopback provider fixture. The first exits with `os._exit(0)`, deliberately
 skipping session-end cleanup after an additional host row is committed. The
 second reconciles that row, resumes history, receives a provider tool-call fixture,
-dispatches `ariadne_search` through Hermes, and sends its exact stored result back
+dispatches `ariadne_search` through Hermes, and sends its stored result (carrier-free, #29) back
 to the fixture before receiving the final answer fixture. No paid LLM was called.
 
 The fixture also confirms the host's existing outgoing whitespace normalization

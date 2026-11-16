@@ -9,7 +9,7 @@ import pytest
 from test_rolling_selection import POLICY, fixture
 
 from hermes_ariadne import rolling
-from hermes_ariadne.store import canonical_json
+from hermes_ariadne.store import REASONING_CARRIERS, canonical_json, carrier_free
 
 
 def call(view, store, settings, args, *, name="ariadne_rolling_page", session_id="s", **kwargs):
@@ -176,8 +176,11 @@ def test_existing_exact_event_pages_reconstruct_unchanged_archive_and_no_binary_
         offset = result["page"]["next_offset"]
         if offset is None:
             break
-    assert b"".join(chunks) == canonical_json(source[3])
-    assert b"OPAQUE" in b"".join(chunks)
+    # #29: zoom pages the carrier-free projection; the archive keeps the exact row.
+    assert b"".join(chunks) == canonical_json(carrier_free(source[3])[0])
+    assert b"OPAQUE" not in b"".join(chunks) and b"OPAQUE" in canonical_json(source[3])
+    assert result["page"]["omitted_keys"] == sorted(source[3].keys() & REASONING_CARRIERS)
+    assert store.get_event(view.event_ids[-1], session_id="s") == source[3]
     found = call(view, store, settings, {"query": "answer old"}, name="ariadne_find")
     assert found["ok"] and found["results"][0]["event_ref"] == event
     assert (
@@ -270,3 +273,20 @@ def test_current_ref_with_missing_or_changed_parent_never_returns_partial_index(
             parent_loader=loader,
         )
         assert result["ok"] is False and "results" not in result and "total" not in result
+
+
+def test_rolling_page_and_find_expose_no_reasoning_carrier(tmp_path):
+    # #29: the fixture's assistant rows carry Codex reasoning (OPAQUE_*) and companions.
+    store, settings, view, source, _, _ = fixture(tmp_path)
+    assert any(b"OPAQUE" in canonical_json(row) for row in source[:4])
+    args = {"ref": "rolling:" + view.generation_id, "limit": 20}
+    page = call(view, store, settings, args)
+    assert page["ok"] and page["total"] == len(view.event_ids)
+    serialized = json.dumps(page)
+    assert "OPAQUE" not in serialized and "companion" not in serialized
+    for item in page["results"]:
+        assert set(item) == {"index", "event_ref", "role"}
+    for query in ("answer old", "old"):
+        found = call(view, store, settings, {"query": query}, name="ariadne_find")
+        assert found["ok"] and found["results"]
+        assert "OPAQUE" not in json.dumps(found) and "companion" not in json.dumps(found)

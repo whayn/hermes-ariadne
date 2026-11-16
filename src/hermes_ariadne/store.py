@@ -77,6 +77,117 @@ def canonical_json(value):
     ).encode("utf-8", "surrogatepass")
 
 
+# Provider reasoning/replay state on a message row. Keys only. Retrieval never returns
+# these values (#29); the archive keeps them exactly. Shared with the provider codec.
+REASONING_CARRIERS = frozenset(
+    {
+        "reasoning",
+        "reasoning_content",
+        "reasoning_details",
+        "codex_reasoning_items",
+        "codex_message_items",
+        "anthropic_content_blocks",
+        "_anthropic_content_blocks",
+        "bedrock_content_blocks",
+        "thinking",
+        "extra_content",
+        "thought_signature",
+    }
+)
+_CALL_CARRIER = "extra_content"
+_FUNCTION_CARRIER = "thought_signature"
+
+
+def _nested_carriers(calls):
+    """Names of carriers inside a tool-call list (Gemini signatures), without values."""
+    found = set()
+    for call in calls if type(calls) is list else ():
+        if type(call) is not dict:
+            continue
+        if _CALL_CARRIER in call:
+            found.add("tool_calls[]." + _CALL_CARRIER)
+        if type(call.get("function")) is dict and _FUNCTION_CARRIER in call["function"]:
+            found.add("tool_calls[].function." + _FUNCTION_CARRIER)
+    return found
+
+
+def _has_carrier_key(value):
+    """Whether any mapping anywhere inside a decoded JSON value has a carrier key."""
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if type(item) is dict:
+            if item.keys() & REASONING_CARRIERS:
+                return True
+            stack.extend(item.values())
+        elif type(item) is list:
+            stack.extend(item)
+    return False
+
+
+def _strict_json(text):
+    """Decode JSON text, refusing duplicate members a lossy decode would hide."""
+
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate JSON member")
+            result[key] = value
+        return result
+
+    return json.loads(text, object_pairs_hook=pairs)
+
+
+def carrier_free(message):
+    """``(projection, omitted)``: a copy of a row without any reasoning carrier.
+
+    Every present carrier key is dropped, empty or not, and named in ``omitted``
+    (sorted names only, never values). Tool calls lose their known nested carriers
+    (``extra_content`` and ``function.thought_signature``). ``tool_calls`` is dropped
+    whole, and named, when a carrier key remains anywhere inside it, or when it is JSON
+    text that cannot be strictly decoded (malformed, too deep, duplicate members):
+    uninspectable text is never treated as carrier-free. Everything else is unchanged.
+    The input is not mutated and nothing is written: the archive stays exact.
+    """
+    projection = {key: value for key, value in message.items() if key not in REASONING_CARRIERS}
+    omitted = set(message.keys() & REASONING_CARRIERS)
+    calls = projection.get("tool_calls")
+    if type(calls) is list:
+        nested = _nested_carriers(calls)
+        if nested:
+            omitted |= nested
+            calls = projection["tool_calls"] = [
+                call
+                if type(call) is not dict
+                else {
+                    key: (
+                        {k: v for k, v in value.items() if k != _FUNCTION_CARRIER}
+                        if key == "function" and type(value) is dict
+                        else value
+                    )
+                    for key, value in call.items()
+                    if key != _CALL_CARRIER
+                }
+                for call in calls
+            ]
+        if _has_carrier_key(calls):
+            del projection["tool_calls"]
+            omitted.add("tool_calls")
+    elif type(calls) is str:
+        try:
+            unsafe = _has_carrier_key(_strict_json(calls))
+        except (ValueError, RecursionError):
+            unsafe = True
+        if unsafe:
+            del projection["tool_calls"]
+            omitted.add("tool_calls")
+    elif _has_carrier_key(calls):  # Any other JSON shape, e.g. a mapping: same deep scan.
+        del projection["tool_calls"]
+        omitted.add("tool_calls")
+    return projection, sorted(omitted)
+
+
 def search_text(text):
     # SQLite instr(BLOB, BLOB) is literal and avoids surrogate/escape aliases.
     return text.encode("utf-8", "surrogatepass")

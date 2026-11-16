@@ -27,7 +27,8 @@ provider limits. This is not yet a production long-horizon memory engine.
 - Session-scoped reconciliation using the **bound host's read API** at start,
   turn completion, session end, and search. This also catches retained rows from
   failure paths whose turn-complete callback did not fire.
-- `ariadne_search` returns exact stored snapshots, not generated answers/snippets.
+- `ariadne_search` returns stored snapshots, not generated answers/snippets, without
+  their reasoning/replay fields (see [Search](#search)).
 - No `select_context` override; provider requests and tool dispatch remain owned
   by Hermes. No model clients, embeddings, summaries or background agent calls.
 
@@ -125,8 +126,16 @@ Tool name: `ariadne_search`
   LIKE patterns, a query language, FTS ranking, or semantic retrieval.
 - `limit`: integer 1–100, default 20; `offset`: nonnegative integer, default 0.
 - Result: `results`, page `count`, and `session_id`. Each hit carries `event_id`,
-  `message_uid`, the exact `message` mapping, `origin` and observed `position`.
-  Position is the index in the source snapshot, not a globally stable identifier.
+  `message_uid`, the stored `message` mapping, `omitted_keys`, `origin` and observed
+  `position`. Position is the index in the source snapshot, not a globally stable
+  identifier.
+- `message` is the exact stored mapping **minus every reasoning/replay carrier**
+  (`reasoning`, `reasoning_content`, `reasoning_details`, `codex_reasoning_items`,
+  `codex_message_items`, `thinking`, Anthropic/Bedrock content blocks,
+  `extra_content`, `thought_signature`, and Gemini signatures inside `tool_calls`).
+  `omitted_keys` lists the names of the dropped fields (never values), including
+  empty ones. No argument returns them: reasoning is never shown by any Ariadne
+  tool (#29). The archive keeps the exact record.
 - Search includes **historical versions**, including retained inactive/rewound
   host rows. One message may therefore yield multiple snapshots. Metadata changes
   also count as versions; a copied durable row can yield a new snapshot while

@@ -59,7 +59,8 @@ def test_event_zoom_recovers_exact_large_unicode_code_bytes_without_mutation(tmp
         wire(result)
         assert result["ok"] and result["kind"] == "source"
         page = result["page"]
-        assert page["encoding"] == "canonical-json:utf-8-surrogatepass:base64"
+        assert page["encoding"] == "carrier-free-canonical-json:utf-8-surrogatepass:base64"
+        assert page["omitted_keys"] == []  # Carrier-free: the projection is the record.
         assert page["event_ref"] == ref
         assert page["offset"] == offset
         assert page["total_bytes"] == len(canonical_json(message))
@@ -994,3 +995,323 @@ def test_any_restricted_projection_source_refuses_all_derived_nodes(tmp_path, re
     )
     assert direct["ok"]
     assert (store.path.read_bytes(), kernel.path.read_bytes(), kernel.view()) == before
+
+
+# --- Reasoning carriers never leave retrieval (#29, maintainer decision 4) ---
+
+SENTINEL = "CARRIER-SENTINEL"
+_TOP_CARRIERS = {
+    "reasoning": SENTINEL + "-reasoning",
+    "reasoning_content": SENTINEL + "-reasoning-content",
+    "reasoning_details": [
+        {"type": "thinking", "thinking": SENTINEL + "-thinking", "signature": SENTINEL + "-sig"}
+    ],
+    "codex_reasoning_items": [
+        {
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": SENTINEL + "-encrypted",
+            "summary": [{"type": "summary_text", "text": SENTINEL + "-summary"}],
+            "_issuer_kind": "codex_backend",
+            "_issuer_model": "gpt-test",
+        }
+    ],
+    "codex_message_items": json.dumps(
+        [
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "id": "msg_" + SENTINEL,
+                "content": [{"type": "output_text", "text": "visible needle answer"}],
+            }
+        ]
+    ),
+    "anthropic_content_blocks": [{"type": "redacted_thinking", "data": SENTINEL + "-redacted"}],
+    "_anthropic_content_blocks": [{"type": "thinking", "thinking": SENTINEL + "-private"}],
+    "bedrock_content_blocks": [{"reasoningContent": {"text": SENTINEL + "-bedrock"}}],
+    "thinking": SENTINEL + "-bare-thinking",
+    "extra_content": {"google": {"thought_signature": SENTINEL + "-extra"}},
+    "thought_signature": SENTINEL + "-signature",
+}
+
+
+def _tool_call(**extra):
+    return {
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": '{"q":"needle"}'},
+        **extra,
+    }
+
+
+def carrier_message(uid="carrier"):
+    call = _tool_call(extra_content={"google": {"thought_signature": SENTINEL + "-call"}})
+    call["function"]["thought_signature"] = SENTINEL + "-function"
+    return {
+        "message_uid": uid,
+        "role": "assistant",
+        "content": "visible needle answer",
+        "tool_calls": [call, _tool_call(id="call_2")],
+        "display_metadata": None,
+        **copy.deepcopy(_TOP_CARRIERS),
+    }
+
+
+def carrier_free(message):
+    """Independent expectation: the row without any carrier, tool calls included."""
+    expected = {k: v for k, v in message.items() if k not in _TOP_CARRIERS}
+    if type(expected.get("tool_calls")) is list:
+        calls = []
+        for call in expected["tool_calls"]:
+            call = {k: v for k, v in call.items() if k != "extra_content"}
+            call["function"] = {
+                k: v for k, v in call["function"].items() if k != "thought_signature"
+            }
+            calls.append(call)
+        expected["tool_calls"] = calls
+    return expected
+
+
+ALL_OMITTED = sorted(
+    [*_TOP_CARRIERS, "tool_calls[].extra_content", "tool_calls[].function.thought_signature"]
+)
+
+
+def zoom_all(api, store, ref, *, limit=97, session_id="attached", **kwargs):
+    offset, data, pages = 0, bytearray(), []
+    while True:
+        result = api.handle_evidence_tool(
+            "ariadne_zoom",
+            {"ref": ref, "offset": offset, "limit": limit},
+            store=store,
+            session_id=session_id,
+            **kwargs,
+        )
+        wire(result)
+        assert result["ok"] and result["kind"] == "source", result
+        pages.append(result)
+        data.extend(base64.b64decode(result["page"]["data_base64"], validate=True))
+        offset = result["page"]["next_offset"]
+        if offset is None:
+            return bytes(data), pages
+
+
+def test_event_zoom_pages_a_carrier_free_projection_and_names_every_omitted_key(tmp_path):
+    api = retrieval()
+    store = EventStore(tmp_path / "archive.sqlite3")
+    message = carrier_message()
+    original = copy.deepcopy(message)
+    store.ingest("attached", [message], origin="fixture")
+    before = store.path.read_bytes()
+    ref = "event:" + identity(message)
+    data, pages = zoom_all(api, store, ref)
+    expected = canonical_json(carrier_free(original))
+    assert data == expected
+    assert json.loads(data.decode("utf-8", "surrogatepass")) == carrier_free(original)
+    assert SENTINEL.encode() not in data
+    for page in pages:
+        assert SENTINEL not in json.dumps(page)
+        assert page["page"]["encoding"] == api.SOURCE_ENCODING
+        assert page["page"]["encoding"] == "carrier-free-canonical-json:utf-8-surrogatepass:base64"
+        assert page["page"]["omitted_keys"] == ALL_OMITTED
+        assert page["page"]["total_bytes"] == len(expected)
+    assert len(pages) > 1  # Offsets/limits are defined over the projection bytes.
+    # The archive still holds the exact canonical row, carriers included.
+    assert store.path.read_bytes() == before
+    assert store.get_event(identity(message), session_id="attached") == original
+    assert message == original
+
+
+@pytest.mark.parametrize("key", sorted(_TOP_CARRIERS))
+def test_each_top_level_carrier_alone_is_omitted_by_name(tmp_path, key):
+    api = retrieval()
+    store = EventStore(tmp_path / "archive.sqlite3")
+    message = {
+        "message_uid": "m",
+        "role": "assistant",
+        "content": "needle",
+        key: copy.deepcopy(_TOP_CARRIERS[key]),
+    }
+    store.ingest("attached", [message], origin="fixture")
+    data, pages = zoom_all(api, store, "event:" + identity(message), limit=2048)
+    assert len(pages) == 1 and pages[0]["page"]["omitted_keys"] == [key]
+    assert data == canonical_json({"message_uid": "m", "role": "assistant", "content": "needle"})
+    assert SENTINEL.encode() not in data
+
+
+@pytest.mark.parametrize("value", [None, "", [], {}, False, 0])
+def test_empty_carrier_keys_are_omitted_and_named_too(tmp_path, value):
+    # No value-dependent exposure rule: a present carrier key is never forwarded.
+    api = retrieval()
+    store = EventStore(tmp_path / "archive.sqlite3")
+    message = {"message_uid": "m", "role": "assistant", "content": "x", "reasoning": value}
+    store.ingest("attached", [message], origin="fixture")
+    data, pages = zoom_all(api, store, "event:" + identity(message), limit=2048)
+    assert pages[0]["page"]["omitted_keys"] == ["reasoning"]
+    assert data == canonical_json({"message_uid": "m", "role": "assistant", "content": "x"})
+
+
+def test_carrier_free_row_pages_its_unchanged_canonical_bytes(tmp_path):
+    api = retrieval()
+    store = EventStore(tmp_path / "archive.sqlite3")
+    message = {
+        "message_uid": "m",
+        "role": "assistant",
+        "content": "needle",
+        "tool_calls": [_tool_call()],
+        "metadata": {"reasoning": "a nested non-carrier field named like one stays"},
+    }
+    store.ingest("attached", [message], origin="fixture")
+    data, pages = zoom_all(api, store, "event:" + identity(message), limit=2048)
+    assert data == canonical_json(message)
+    assert pages[0]["page"]["omitted_keys"] == []
+
+
+@pytest.mark.parametrize(
+    "tool_calls, omitted",
+    [
+        (json.dumps([_tool_call(extra_content={"s": SENTINEL})]), ["tool_calls"]),
+        (
+            json.dumps(
+                [
+                    {
+                        **_tool_call(),
+                        "function": {"name": "f", "arguments": "", "thought_signature": SENTINEL},
+                    }
+                ]
+            ),
+            ["tool_calls"],
+        ),
+        (json.dumps([_tool_call()]), []),
+        ("not json " + "extra_content", ["tool_calls"]),  # Uninspectable: never "clean".
+        ("not json", ["tool_calls"]),
+    ],
+)
+def test_json_text_tool_calls_with_nested_carriers_are_omitted_whole(tmp_path, tool_calls, omitted):
+    api = retrieval()
+    store = EventStore(tmp_path / "archive.sqlite3")
+    message = {"message_uid": "m", "role": "assistant", "content": "x", "tool_calls": tool_calls}
+    store.ingest("attached", [message], origin="fixture")
+    data, pages = zoom_all(api, store, "event:" + identity(message), limit=2048)
+    assert pages[0]["page"]["omitted_keys"] == omitted
+    assert SENTINEL.encode() not in data
+    if not omitted:
+        assert data == canonical_json(message)
+
+
+def test_node_zoom_source_leaf_uses_the_same_carrier_free_projection(tmp_path):
+    api = retrieval()
+    store = EventStore(tmp_path / "archive.sqlite3")
+    messages = [carrier_message(f"m{i}") for i in range(2)]
+    store.ingest("attached", messages, origin="fixture")
+    kernel = MemoryKernel(
+        Projection(store, "attached", [identity(m) for m in messages]),
+        tmp_path / "kernel.json",
+        node_bytes=128,
+    )
+    kernel.build(lambda _: "navigation text")
+    data, pages = zoom_all(
+        api,
+        store,
+        node_ref(kernel, Part(0, 1)),
+        kernel=kernel,
+        checkpoint_id=checkpoint_id(kernel),
+    )
+    assert pages[0]["page"]["event_ref"] == "event:" + identity(messages[1])
+    assert pages[0]["page"]["omitted_keys"] == ALL_OMITTED
+    assert data == canonical_json(carrier_free(messages[1]))
+    assert SENTINEL.encode() not in data
+
+
+def test_find_exposes_no_carrier_even_when_the_query_names_one(tmp_path):
+    api = retrieval()
+    store = EventStore(tmp_path / "archive.sqlite3")
+    message = carrier_message()
+    message["content"] = "needle " + "reasoning_details thought_signature"
+    store.ingest("attached", [message], origin="fixture")
+    for query in ("needle", "reasoning_details", SENTINEL):
+        result = api.handle_evidence_tool(
+            "ariadne_find", {"query": query}, store=store, session_id="attached"
+        )
+        serialized = wire(result)
+        assert result["ok"]
+        assert SENTINEL not in serialized
+        for item in result["results"]:
+            assert set(item) == {"event_ref", "role", "preview_lossy"}
+    # Find searches content only: carrier text is not even a match.
+    assert (
+        api.handle_evidence_tool(
+            "ariadne_find", {"query": SENTINEL}, store=store, session_id="attached"
+        )["count"]
+        == 0
+    )
+
+
+def test_carrier_key_set_is_the_one_shared_with_the_provider_codec():
+    from hermes_ariadne import prepared, store
+
+    assert prepared._REASONING_CARRIERS is store.REASONING_CARRIERS
+    assert set(_TOP_CARRIERS) == store.REASONING_CARRIERS
+
+
+@pytest.mark.parametrize(
+    "tool_calls",
+    [
+        # Duplicate members: a lossy decoder keeps only the last, hiding the carrier.
+        '[{"id":"c","function":{"name":"f","thought_signature":"' + SENTINEL + '"},"function":{}}]',
+        '[{"id":"c","extra_content":"' + SENTINEL + '","extra_content":null}]',
+        # Undecodable text (4300-digit integer limit, malformed) must not count as clean.
+        '[{"extra_content":"' + SENTINEL + '","function":{"arguments":' + "1" * 4301 + "}}]",
+        '[{"extra_content":"' + SENTINEL + '"',
+        # Escaped key names and carriers outside the known call positions.
+        '[{"extra\\u005fcontent":"' + SENTINEL + '"}]',
+        '{"extra_content":"' + SENTINEL + '"}',
+        '[{"function":{"name":"f","args":{"reasoning_details":"' + SENTINEL + '"}}}]',
+    ],
+)
+def test_uninspectable_or_hidden_tool_call_carriers_drop_tool_calls_whole(tmp_path, tool_calls):
+    api = retrieval()
+    store = EventStore(tmp_path / "archive.sqlite3")
+    message = {"message_uid": "m", "role": "assistant", "content": "x", "tool_calls": tool_calls}
+    store.ingest("attached", [message], origin="fixture")
+    data, pages = zoom_all(api, store, "event:" + identity(message), limit=2048)
+    assert pages[0]["page"]["omitted_keys"] == ["tool_calls"]
+    assert data == canonical_json({"message_uid": "m", "role": "assistant", "content": "x"})
+    assert SENTINEL.encode() not in data
+
+
+def test_list_tool_calls_with_a_carrier_outside_known_positions_drop_whole(tmp_path):
+    api = retrieval()
+    store = EventStore(tmp_path / "archive.sqlite3")
+    call = _tool_call()
+    call["function"]["nested"] = {"reasoning": SENTINEL}
+    message = {"message_uid": "m", "role": "assistant", "content": "x", "tool_calls": [call]}
+    store.ingest("attached", [message], origin="fixture")
+    data, pages = zoom_all(api, store, "event:" + identity(message), limit=2048)
+    assert pages[0]["page"]["omitted_keys"] == ["tool_calls"]
+    assert SENTINEL.encode() not in data
+
+
+@pytest.mark.parametrize(
+    "tool_calls",
+    [
+        {"id": "c", "extra_content": {"google": {"thought_signature": SENTINEL}}},
+        {"function": {"name": "f", "thought_signature": SENTINEL}},
+    ],
+)
+def test_mapping_valued_tool_calls_with_a_carrier_drop_whole(tmp_path, tool_calls):
+    api = retrieval()
+    store = EventStore(tmp_path / "archive.sqlite3")
+    message = {"message_uid": "m", "role": "assistant", "content": "x", "tool_calls": tool_calls}
+    store.ingest("attached", [message], origin="fixture")
+    data, pages = zoom_all(api, store, "event:" + identity(message), limit=2048)
+    assert pages[0]["page"]["omitted_keys"] == ["tool_calls"]
+    assert data == canonical_json({"message_uid": "m", "role": "assistant", "content": "x"})
+
+
+def test_mapping_valued_tool_calls_without_a_carrier_are_kept():
+    from hermes_ariadne.store import carrier_free
+
+    message = {"role": "assistant", "content": "x", "tool_calls": {"id": "c", "function": {}}}
+    assert carrier_free(message) == (message, [])

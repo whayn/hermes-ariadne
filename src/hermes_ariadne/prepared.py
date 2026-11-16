@@ -27,7 +27,7 @@ from .retrieval import (
 )
 from .simulation import _tool_sequence, ascii_json_units
 from .sources import Projection
-from .store import canonical_json
+from .store import REASONING_CARRIERS, canonical_json
 from .tree import Part
 
 FORMAT = "hermes-ariadne-prepared"
@@ -47,21 +47,7 @@ class ReasoningReplayPolicy:
 
 # Provider reasoning/replay state that only an explicit policy may admit. Keys only:
 # a refusal names the key so the rolling engine can report it, never its value.
-_REASONING_CARRIERS = frozenset(
-    {
-        "reasoning",
-        "reasoning_content",
-        "reasoning_details",
-        "codex_reasoning_items",
-        "codex_message_items",
-        "anthropic_content_blocks",
-        "_anthropic_content_blocks",
-        "bedrock_content_blocks",
-        "thinking",
-        "extra_content",
-        "thought_signature",
-    }
-)
+_REASONING_CARRIERS = REASONING_CARRIERS
 
 
 def _carrier_error(message, key):
