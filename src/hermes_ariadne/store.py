@@ -182,6 +182,9 @@ def carrier_free(message):
         if unsafe:
             del projection["tool_calls"]
             omitted.add("tool_calls")
+    elif _has_carrier_key(calls):  # Any other JSON shape, e.g. a mapping: same deep scan.
+        del projection["tool_calls"]
+        omitted.add("tool_calls")
     return projection, sorted(omitted)
 
 
