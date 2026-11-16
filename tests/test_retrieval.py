@@ -1291,3 +1291,27 @@ def test_list_tool_calls_with_a_carrier_outside_known_positions_drop_whole(tmp_p
     data, pages = zoom_all(api, store, "event:" + identity(message), limit=2048)
     assert pages[0]["page"]["omitted_keys"] == ["tool_calls"]
     assert SENTINEL.encode() not in data
+
+
+@pytest.mark.parametrize(
+    "tool_calls",
+    [
+        {"id": "c", "extra_content": {"google": {"thought_signature": SENTINEL}}},
+        {"function": {"name": "f", "thought_signature": SENTINEL}},
+    ],
+)
+def test_mapping_valued_tool_calls_with_a_carrier_drop_whole(tmp_path, tool_calls):
+    api = retrieval()
+    store = EventStore(tmp_path / "archive.sqlite3")
+    message = {"message_uid": "m", "role": "assistant", "content": "x", "tool_calls": tool_calls}
+    store.ingest("attached", [message], origin="fixture")
+    data, pages = zoom_all(api, store, "event:" + identity(message), limit=2048)
+    assert pages[0]["page"]["omitted_keys"] == ["tool_calls"]
+    assert data == canonical_json({"message_uid": "m", "role": "assistant", "content": "x"})
+
+
+def test_mapping_valued_tool_calls_without_a_carrier_are_kept():
+    from hermes_ariadne.store import carrier_free
+
+    message = {"role": "assistant", "content": "x", "tool_calls": {"id": "c", "function": {}}}
+    assert carrier_free(message) == (message, [])
