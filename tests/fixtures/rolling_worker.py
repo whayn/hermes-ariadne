@@ -191,17 +191,69 @@ def checkpoint(rows):
 
 
 def durable_view():
+    """Independent artifact walk: expose DERIVED full coverage to existing oracles."""
     directory = home / "ariadne" / "rolling" / hashlib.sha256(SESSION.encode()).hexdigest()
+    selector = directory / "storage.json"
+    if selector.exists():
+        selected = json.loads(selector.read_bytes())
+        assert selected["schema"] == 3 and selected["session_id"] == SESSION
+        assert (
+            selected["receipt_sha256"]
+            == hashlib.sha256((directory / "migration.json").read_bytes()).hexdigest()
+        )
+        directory = directory / "v3"
     manifest = directory / "manifest.json"
     if not manifest.exists():
         return None
     published = json.loads(manifest.read_bytes())
-    generation = published["generation_id"]
-    content = (directory / "generations" / (generation + ".json")).read_bytes()
-    assert hashlib.sha256(content).hexdigest() == generation
-    view = json.loads(content)
-    assert view["session_id"] == SESSION
-    return {**view, "generation_id": generation}
+    seen = set()
+
+    def read_generation(generation):
+        assert isinstance(generation, str) and len(generation) == 64
+        assert all(c in "0123456789abcdef" for c in generation)
+        assert generation not in seen and len(seen) < 64
+        seen.add(generation)
+        content = (directory / "generations" / (generation + ".json")).read_bytes()
+        assert hashlib.sha256(content).hexdigest() == generation
+        view = json.loads(content)
+        assert view["session_id"] == SESSION
+        assert type(view["version"]) is int and view["version"] in (1, 2)
+        assert hashlib.sha256(view["summary_text"].encode()).hexdigest() == view["summary_sha256"]
+        if view["version"] == 2:
+            assert "event_ids" not in view and "message_uids" not in view
+            parent = (
+                None
+                if view["parent_generation"] is None
+                else read_generation(view["parent_generation"])
+            )
+            events, uids = (
+                ([], []) if parent is None else (parent["event_ids"], parent["message_uids"])
+            )
+            if parent is not None:
+                assert parent["version"] == 2
+                assert view["parent_summary_sha256"] == parent["summary_sha256"]
+                assert view["sequence"] == parent["sequence"] + 1
+            else:
+                assert view["sequence"] == 1 and view["parent_summary_sha256"] is None
+            assert view["delta_start"] == len(events)
+            assert view["delta_event_ids"] and len(view["delta_event_ids"]) == len(
+                view["delta_message_uids"]
+            )
+            view["event_ids"] = events + view["delta_event_ids"]
+            view["message_uids"] = uids + view["delta_message_uids"]
+        assert (
+            len(view["event_ids"])
+            == len(view["message_uids"])
+            == view["frontier_count"]
+            == view["delta_stop"]
+        )
+        prefix = json.dumps(view["event_ids"], sort_keys=True, separators=(",", ":")).encode()
+        assert hashlib.sha256(prefix).hexdigest() == view["prefix_sha256"]
+        return {**view, "generation_id": generation}
+
+    view = read_generation(published["generation_id"])
+    assert view["job_id"] == published["job_id"]
+    return view
 
 
 def backup_before(turn):

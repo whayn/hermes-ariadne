@@ -3,6 +3,8 @@
 Opt-in native tracer: set HERMES_ARIADNE_ROLLING_NATIVE=1 and run via scripts/test.sh
 (HERMES_SOURCE/HERMES_PYTHON required). The pure oracle checks in test_rolling_oracle.py
 need neither. No native modules, sockets or subprocesses are used until the gated test runs.
+Set ARIADNE_ROLLING_LEGACY_PACKAGE to an installed old wheel's site-packages to
+exercise old-wheel publication, explicit offline migration and new-plugin restart.
 """
 
 import base64
@@ -248,6 +250,10 @@ def test_two_automatic_advances_and_fresh_process_restart(tmp_path):
     import hermes_ariadne
 
     origin = Path(hermes_ariadne.__file__).resolve()
+    legacy_site = os.environ.get("ARIADNE_ROLLING_LEGACY_PACKAGE")
+    if legacy_site:
+        legacy_site = Path(legacy_site).resolve()
+        assert (legacy_site / "hermes_ariadne" / "__init__.py").is_file()
     worker = Path(__file__).parent / "fixtures" / "rolling_worker.py"
     root = tmp_path / "synthetic-profile"
     home = root / "isolated-home"
@@ -465,13 +471,21 @@ def test_two_automatic_advances_and_fresh_process_restart(tmp_path):
         (home / "auth.json").write_text('{"credential_pool":{}}')
         env = {key: os.environ[key] for key in ("PATH", "LANG", "TMPDIR") if key in os.environ}
         # Use the runner-selected package/dependencies; NEVER append checkout/src.
+        package_origin = (
+            (legacy_site / "hermes_ariadne" / "__init__.py")
+            if legacy_site and mode == "advance"
+            else origin
+        )
+        package_path = str(legacy_site) if legacy_site and mode == "advance" else ""
         env.update(
             HOME=str(home.parent),
             HERMES_HOME=str(home),
             TZ="UTC",
             HERMES_MANAGED_DIR=tempfile.mkdtemp(prefix="rolling-managed-", dir=tmp_path),
-            PYTHONPATH=os.pathsep.join(filter(None, (source, os.environ.get("PYTHONPATH")))),
-            ARIADNE_EXPECT_ORIGIN=str(origin),
+            PYTHONPATH=os.pathsep.join(
+                filter(None, (source, package_path, os.environ.get("PYTHONPATH")))
+            ),
+            ARIADNE_EXPECT_ORIGIN=str(package_origin),
             ARIADNE_HOST_SOURCE=str(Path(source).resolve()),
             HERMES_ARIADNE_ROLLING_NATIVE="1",
         )
@@ -493,7 +507,7 @@ def test_two_automatic_advances_and_fresh_process_restart(tmp_path):
         assert not errors, f"synthetic server assertion failures: {errors}"
         assert code == 0, f"rolling worker {mode} failed (exit {code}); see {stderr_path.name}"
         report = json.loads(process.stdout.splitlines()[-1])
-        assert report["operator_package_origin"] == str(origin)
+        assert report["operator_package_origin"] == str(package_origin)
         receipt = json.loads((home / f"receipt-{mode}.json").read_bytes())
         return report, receipt, copy.deepcopy(requests[start:])
 
@@ -502,6 +516,10 @@ def test_two_automatic_advances_and_fresh_process_restart(tmp_path):
         assert first["credential_violations"] == live["credential_violations"] == 0
         assert len(aux_inputs) == 3, "advance must spend exactly G1, G2, G3"
         g1, g2, g3 = live["views"]["B"], live["views"]["C"], live["views"]["D"]
+        if legacy_site:
+            assert all(view["version"] == 1 for view in (g1, g2, g3)), (
+                "legacy phase must use the actual old package"
+            )
         assert live["views"]["A"] is None
         # Every turn's engine status is asserted: a silently failed on_turn_complete
         # would leave 'unavailable'/'failed'/'uncertain' or a stale ledger here.
@@ -596,6 +614,67 @@ def test_two_automatic_advances_and_fresh_process_restart(tmp_path):
         assert bytes(state["source"]) == encode(carrier_free(live["rows"][0])[0])
         assert state["source_ref"] == "event:" + hashlib.sha256(exact).hexdigest()
         assert json.loads(exact)["content"] == USERS["A"]
+        restart_campaign = copy.deepcopy(live["turns"]["D"]["rolling"])
+        if legacy_site:
+            # Real old wheel -> explicit CLI conversion -> real new wheel/plugin.
+            # No fake facade, hook invocation, manual publication or forced codec.
+            from hermes_ariadne.install import install
+
+            (home / ".ariadne-offline-migration").touch(mode=0o600)
+            cli_env = {
+                key: os.environ[key] for key in ("PATH", "LANG", "TMPDIR") if key in os.environ
+            }
+            cli_env.update(
+                HOME=str(home.parent),
+                HERMES_HOME=str(home),
+                PYTHONPATH=os.pathsep.join(filter(None, (source, os.environ.get("PYTHONPATH")))),
+            )
+            stderr_path = tmp_path / "migration-cli.stderr"
+            with stderr_path.open("wb") as stderr_file:
+                process = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "hermes_ariadne.rolling_migrate",
+                        "--home",
+                        str(home),
+                        "--session",
+                        SESSION,
+                        "--settings",
+                        json.dumps(SETTINGS),
+                    ],
+                    cwd=home.parent,
+                    env=cli_env,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr_file,
+                    timeout=180,
+                )
+            assert process.returncode == 0, "offline migration CLI failed; see migration-cli.stderr"
+            assert len(aux_inputs) == 3, "migration called the summary facade"
+            directory = home / "ariadne" / "rolling" / hashlib.sha256(SESSION.encode()).hexdigest()
+            mapping = json.loads((directory / "migration.json").read_bytes())
+            migrated_id = mapping["generations"][g3["generation_id"]]
+            data = (directory / "v3" / "generations" / (migrated_id + ".json")).read_bytes()
+            assert hashlib.sha256(data).hexdigest() == migrated_id
+            migrated = json.loads(data)
+            assert migrated["version"] == 2
+            assert migrated["prefix_sha256"] == g3["prefix_sha256"]
+            assert migrated["parent_generation"] == mapping["generations"][g2["generation_id"]]
+            assert migrated["job_id"] == mapping["jobs"][g3["job_id"]]
+            # Coverage expectation is the ORIGINAL canonical prefix. The fresh
+            # worker independently reconstructs it from hashed delta artifacts.
+            g3 = {
+                **migrated,
+                "generation_id": migrated_id,
+                "event_ids": g3["event_ids"],
+                "message_uids": g3["message_uids"],
+            }
+            restart_campaign["published_generation"] = migrated_id
+            shutil.move(
+                str(home / "plugins" / "ariadne-rolling-plugin"),
+                str(tmp_path / "legacy-plugin-evidence"),
+            )
+            install(home, rolling=True)
         plan["restart_expected"] = {
             "generation_id": g3["generation_id"],
             "frontier_count": g3["frontier_count"],
@@ -608,7 +687,7 @@ def test_two_automatic_advances_and_fresh_process_restart(tmp_path):
         assert_checkpoint(resumed["initial_rows"], live["checkpoints"]["D"])
         # The fresh process loads the PERSISTED ledger (compared status keys); the view's
         # bytes are verified against its generation sha256 in the worker's durable_view.
-        assert_restart(live["turns"]["D"]["rolling"], resumed["initial"]["rolling"])
+        assert_restart(restart_campaign, resumed["initial"]["rolling"])
         assert resumed["initial"]["rolling"]["logical_reservations"] == 3
         assert resumed["initial"]["rolling"]["published_generation"] == g3["generation_id"]
         assert resumed["initial_view"] == g3
@@ -672,6 +751,7 @@ def test_two_automatic_advances_and_fresh_process_restart(tmp_path):
                         "logical_reservations": [r["logical_reservations"] for r in ledger]
                         + [rolling["logical_reservations"]],
                         "restart_pid_changed": restarted["pid"] != first["pid"],
+                        "migrated_legacy": bool(legacy_site),
                         "canonical_rows": len(live["rows"]),
                         "exact_source_sha256": hashlib.sha256(exact).hexdigest(),
                         "operator_package_origin": str(origin),

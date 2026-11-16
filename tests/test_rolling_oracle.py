@@ -41,6 +41,38 @@ def fixture():
     )
 
 
+def test_worker_reconstructs_delta_coverage_without_plugin_helpers(tmp_path):
+    from test_rolling_state import ready, setup, target
+
+    from hermes_ariadne import rolling, rolling_state
+
+    store, settings = setup(tmp_path)
+    with rolling_state.RollingJournal(
+        tmp_path, "s", settings, store=store, storage_version=3
+    ) as journal:
+        first = journal.encode_target(target(store, settings, 1), None)
+        ready(journal, first)
+        parent = journal.publish_ready(
+            first.job_id, rolling.generation_bytes(first, "summary", sequence=1, settings=settings)
+        )
+        second = journal.encode_target(target(store, settings, 2, parent), parent)
+        ready(journal, second)
+        expected = journal.publish_ready(
+            second.job_id,
+            rolling.generation_bytes(second, "summary", sequence=2, settings=settings),
+        )
+    worker = Path(tracer.__file__).parent / "fixtures" / "rolling_worker.py"
+    tree = ast.parse(worker.read_text())
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "durable_view")
+    namespace = {"home": tmp_path, "SESSION": "s", "hashlib": hashlib, "json": json}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(worker), "exec"), namespace)
+    found = namespace["durable_view"]()
+    assert found["event_ids"] == list(expected.event_ids)
+    assert found["message_uids"] == list(expected.message_uids)
+    assert found["generation_id"] == expected.generation_id
+    assert found["prefix_sha256"] == expected.prefix_sha256
+
+
 def test_wire_oracle_exists_and_accepts_exact_positive():
     assert callable(getattr(tracer, "assert_wire", None)), "wire oracle not implemented"
     baseline, selected, nav = fixture()
