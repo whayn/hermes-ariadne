@@ -468,8 +468,9 @@ Anthropic thinking path can raise `max_tokens`, but this was not confirmed.
 ### Anthropic with thinking (#29)
 
 Two runs of the same script on 2026-11-15: plugin installed with `ariadne-install
---rolling` from a wheel built from this branch (installed files hash-identical to the
-source), Hermes v0.23.1 source tree (not the CI pin), in-process `AIAgent` in the
+--rolling` from a wheel built from this branch at `e90acdc` (installed files
+hash-identical to the source; before the later retrieval fix for JSON-text tool calls,
+which does not touch selection), Hermes v0.23.1 source tree (not the CI pin), in-process `AIAgent` in the
 dedicated development profile (no gateway, no `hermes chat`; fallback providers
 disabled for the run, configuration restored byte-exact afterwards), Anthropic
 `claude-sonnet-5-5` for turns and `ctx.llm`, reasoning `high` (the host sent adaptive
