@@ -208,6 +208,8 @@ ROLLING_FILES = {
             "rolling_state.py",
             "rolling_selection.py",
             "rolling_retrieval.py",
+            "rolling_delta.py",
+            "rolling_migrate.py",
         )
     },
 }

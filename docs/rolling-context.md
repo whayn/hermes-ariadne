@@ -63,7 +63,7 @@ export ARIADNE_DEV_HOME=/absolute/path/to/new/ariadne-dev-home
 .venv/bin/ariadne-install --home "$ARIADNE_DEV_HOME" --rolling
 ```
 
-The installer copies a strict 17-file runtime allowlist into
+The installer copies a strict 19-file runtime allowlist into
 `$ARIADNE_DEV_HOME/plugins/ariadne-rolling-plugin/`. It does not copy the whole
 package, caches, private configuration, credentials or history. It does not call
 a model, alter configuration or activate anything. `--rolling` and `--prepared`
@@ -289,7 +289,9 @@ full provider fit (tool schemas, output runway and provider overhead also matter
 A declined `select_context` returns `None`: Hermes can send the original request,
 which can overflow. This is **not a dispatch veto** or a universal size guarantee.
 
-**Known performance limit (#19).** Every request and every rolling navigation call
+**Legacy schema-2 performance history (#19).** The measurements and storage-specific
+notes in this subsection describe schema 2; see the delta-only subsection below
+for schema 3 and its remaining cold-open limit. Every request and every rolling navigation call
 reopens the session journal and revalidates the pinned view. One journal open now
 shares its validation memo across reconciliation, loading and revalidation until
 close. A failed operation discards it; caught nested reentry does not take ownership
@@ -419,6 +421,52 @@ format to hold only deltas.
 If a session exceeds `max_prefix_events` before the trigger threshold is reached,
 or the logical-job budget is exhausted, rolling status reports `unavailable` while
 any retained view keeps being served; the label is coarser than the cause.
+
+## Delta-only storage and explicit conversion (#26)
+
+New engine-created sessions use journal schema 3 with version-2 delta-only targets
+and generations. Each record stores only its own source IDs and UIDs plus its
+validated parent binding. Ordered coverage is reconstructed from immutable
+segments; the full-prefix coverage digest, summarizer inputs, logical accounting
+and source/retirement policy are unchanged. Existing schema-2 sessions remain
+legacy, without automatic conversion or charge reset. The low-level journal API
+retains its explicit legacy-compatible default; the rolling engine requests schema
+3 when creating a session.
+
+The exact encoding, migration state machine, old-reader fence and rollback limits
+are specified in [rolling storage](rolling-storage.md). Conversion is offline and
+explicit, with stopped development-session runtimes, a private marker, a retained
+exact legacy snapshot and a permanent old→new ID map. It never calls `ctx.llm`.
+Nonempty journal SQLite companions are refused rather than silently recovered;
+checkpoint them separately while stopped. Do not delete a journal to obtain retries.
+
+From a wheel installed in a separate Ariadne development environment, for an
+**existing disposable legacy home**, with its exact rolling settings:
+
+```bash
+(umask 077; touch "$ARIADNE_DEV_HOME/.ariadne-offline-migration")
+.venv/bin/python -m hermes_ariadne.rolling_migrate \
+  --home "$ARIADNE_DEV_HOME" --session '<synthetic-session-id>' \
+  --settings '{"trigger_bytes":1024,"max_delta_exchanges":2}'
+```
+
+Omitted settings take their usual defaults, so supply every nondefault value from
+that session. For supported Codex replay data also supply the original
+`--provider` and `--model` policy labels; these select validation policy, not a
+provider call. The CLI reads the already-existing archive through a read-only
+connection and cannot initialize or ingest into it. Rollback uses the same command
+with `--rollback`, and refuses after **any** destination lifecycle divergence,
+including reserved→uncertain recovery or another logical reservation. No live-home
+activation, installer overwrite/upgrade or managed-environment modification is
+part of this command.
+
+Delta storage alone does not make cold opens fast: one preliminary cap run on a
+source snapshot measured 134.516 s cold and 2.299 s warm, with 200,000 stored event
+references for 100,000 events and 64 generations. This is not the final three-run
+median gate or a usability sign-off. A 16,384-event cold profile still canonicalized
+each target and generation's delta and spent most time in source serialization and
+validation. The <=5 s **cold and warm** target is not met; #19 remains open.
+The preceding journal-open measurements describe legacy schema-2 storage, not schema 3.
 
 ## Installed-host pilot (#17)
 
@@ -560,9 +608,12 @@ not covered.
 
 ## Durable state, rollback and evidence
 
-Rolling journal schema v2 retains work/charge lineage. Existing v1 journals fail
-closed, without reset, migration or spending-counter forgiveness. Operator reset
-or recovery is out of scope; do not delete journals to obtain automatic retries.
+Rolling journal schemas 2 and 3 retain work/charge lineage. Schema 2 remains
+readable and continues in its original encoding until the explicit offline
+conversion described above. Schema-1 journals still fail closed, without reset,
+migration or spending-counter forgiveness. Operator spending resets and reverse
+migration after ledger divergence are out of scope; do not delete journals to
+obtain automatic retries.
 Archives/journals contain sensitive source material and require private paths;
 there is no encryption, erasure or cross-profile retrieval feature.
 

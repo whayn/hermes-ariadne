@@ -349,6 +349,7 @@ def test_ready_pending_target_publishes_without_another_reservation(tmp_path, mo
     with RollingJournal(
         tmp_path, "s", engine._settings, store=engine._store, policy=POLICY
     ) as journal:
+        target = journal.encode_target(target, None)
         journal.freeze_target(target)
         assert journal.reserve(target.job_id, target.request_bytes, lambda: None, lambda: None)
         journal.record_ready(
@@ -379,6 +380,7 @@ def test_frozen_planned_target_wins_over_newly_appended_exchanges(tmp_path, monk
     with RollingJournal(
         tmp_path, "s", engine._settings, store=engine._store, policy=POLICY
     ) as journal:
+        target = journal.encode_target(target, None)
         journal.freeze_target(target)
     db.rows += exchange("C")
     complete(engine, db, "C")

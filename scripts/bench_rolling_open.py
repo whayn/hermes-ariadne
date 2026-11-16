@@ -155,7 +155,7 @@ def exchange(tag):
     ]
 
 
-def build(directory, events, generations):
+def build(directory, events, generations, storage_version=2):
     if type(generations) is not int or generations <= 0:
         raise SystemExit("--generations must be a positive integer")
     if events % ROWS_PER_EXCHANGE or events < ROWS_PER_EXCHANGE * generations:
@@ -170,7 +170,7 @@ def build(directory, events, generations):
     started = time.perf_counter()
     rows, event_ids, parent = [], [], None
     with rolling_state.RollingJournal(
-        directory, SESSION, config, store=store, policy=POLICY
+        directory, SESSION, config, store=store, policy=POLICY, storage_version=storage_version
     ) as journal:
         for sequence in range(1, generations + 1):
             count = base + (sequence <= extra)
@@ -199,6 +199,7 @@ def build(directory, events, generations):
                 request_bytes=REQUEST,
                 route_labels=ROUTE,
             )
+            frozen = journal.encode_target(frozen, parent)
             journal.freeze_target(frozen)
             if not journal.reserve(frozen.job_id, REQUEST, lambda: None, lambda: None):
                 raise RuntimeError("reservation refused")
@@ -232,6 +233,10 @@ def retained_mib(cache):
             stack.extend(item.values())
         elif isinstance(item, (tuple, list, set, frozenset)):
             stack.extend(item)
+        elif hasattr(type(item), "__slots__"):
+            stack.extend(
+                getattr(item, name) for name in type(item).__slots__ if hasattr(item, name)
+            )
         elif hasattr(item, "__dict__"):
             size += sys.getsizeof(vars(item))
             stack.extend(vars(item).values())
@@ -242,6 +247,31 @@ def maxrss_mib():
     """Peak RSS in MiB: ``ru_maxrss`` is KiB on Linux but bytes on macOS."""
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return round(peak / (2**20 if sys.platform == "darwin" else 2**10), 1)
+
+
+def storage_stats(home):
+    """Distinct stored bytes/references, not a claim about total SQL read traffic."""
+    import sqlite3
+
+    directory = Path(home).absolute() / "ariadne" / "rolling" / rolling.sha256(SESSION.encode())
+    if (directory / "storage.json").exists():
+        directory = directory / "v3"
+    targets = artifacts = references = 0
+    with sqlite3.connect((directory / "journal.sqlite3").as_uri() + "?mode=ro", uri=True) as conn:
+        for (payload,) in conn.execute("SELECT payload FROM targets"):
+            targets += len(payload)
+            value = json.loads(payload)
+            references += len(value.get("delta_event_ids", value.get("event_ids")))
+    for path in (directory / "generations").iterdir():
+        data = path.read_bytes()
+        artifacts += len(data)
+        value = json.loads(data)
+        references += len(value.get("delta_event_ids", value.get("event_ids")))
+    return {
+        "stored_target_bytes": targets,
+        "stored_artifact_bytes": artifacts,
+        "stored_identity_references": references,
+    }
 
 
 def measure(directory, profile, in_place=False, cache=False):
@@ -255,6 +285,19 @@ def measure(directory, profile, in_place=False, cache=False):
         if not in_place:
             shutil.copytree(directory, home)
         store = EventStore(home / "ariadne" / "events.sqlite3")
+        source_checks = {"count": 0}
+        original_get, original_verify = store.get_event, store.verify_events
+
+        def counted_get(event, **kwargs):
+            source_checks["count"] += 1
+            return original_get(event, **kwargs)
+
+        def counted_verify(events, **kwargs):
+            source_checks["count"] += len(events)
+            return original_verify(events, **kwargs)
+
+        store.get_event, store.verify_events = counted_get, counted_verify
+        stored = storage_stats(home)
         reads = {"count": 0, "bytes": 0}
         encoded = {"calls": 0, "bytes": 0}
         read, encode = rolling_state._read, rolling.encode_json
@@ -281,6 +324,7 @@ def measure(directory, profile, in_place=False, cache=False):
             )
             open_s = time.perf_counter() - started
             open_reads, open_encoded = dict(reads), dict(encoded)
+            open_source_checks = source_checks["count"]
             try:
                 started = time.perf_counter()
                 view = journal.load_view()
@@ -289,6 +333,7 @@ def measure(directory, profile, in_place=False, cache=False):
                 journal.close()
             if cache:
                 reads.update(count=0, bytes=0)
+                source_checks["count"] = 0
                 encoded.update(calls=0, bytes=0)
                 started = time.perf_counter()
                 journal = rolling_state.RollingJournal(
@@ -312,6 +357,8 @@ def measure(directory, profile, in_place=False, cache=False):
             "events": len(view.event_ids),
             "generations": view.sequence,
             "open_s": round(open_s, 3),
+            "open_source_checks": open_source_checks,
+            **stored,
             "open_artifact_reads": open_reads["count"],
             "open_artifact_mib": round(open_reads["bytes"] / 2**20, 2),
             "open_encode_json_calls": open_encoded["calls"],
@@ -322,6 +369,7 @@ def measure(directory, profile, in_place=False, cache=False):
         if cache:
             result.update(
                 warm_open_s=round(warm_open_s, 3),
+                warm_source_checks=source_checks["count"],
                 warm_open_artifact_reads=warm_reads["count"],
                 warm_open_encode_json_mib=round(warm_encoded["bytes"] / 2**20, 2),
                 warm_load_view_s=round(warm_load_s, 3),
@@ -349,6 +397,7 @@ def main(argv=None):
     build_parser.add_argument("directory")
     build_parser.add_argument("--events", type=int, required=True)
     build_parser.add_argument("--generations", type=int, default=64)
+    build_parser.add_argument("--storage-version", type=int, choices=(2, 3), default=2)
     measure_parser = commands.add_parser("measure", help="time one journal open of DIR")
     measure_parser.add_argument("directory")
     measure_parser.add_argument("--profile", type=int, default=0, metavar="LINES")
@@ -364,7 +413,7 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     if args.command == "build":
-        result = build(args.directory, args.events, args.generations)
+        result = build(args.directory, args.events, args.generations, args.storage_version)
     else:
         result = measure(args.directory, args.profile, args.in_place, args.cache)
     profile = result.pop("profile", None)
