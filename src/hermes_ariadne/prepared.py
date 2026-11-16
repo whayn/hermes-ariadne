@@ -548,12 +548,61 @@ def _carrier_values(message):
     return found
 
 
+class _OverBound(ValueError):
+    """Internal: a bounded measurement passed its limit."""
+
+
+def _bounded_json_units(value, limit):
+    """``ascii_json_units(value)`` without serializing past ``limit``.
+
+    Same byte unit (compact, sorted, ASCII-escaped JSON), computed by an iterative walk
+    that raises ``_OverBound`` as soon as the running total exceeds ``limit``: a string
+    is only escaped once its raw length (a lower bound of its escaped length) fits, and a
+    container's framing is counted before its items are queued, so cycles and huge
+    fan-out stop at the bound too. Non-JSON values raise ``ValueError``.
+    """
+    size, stack = 0, [value]
+    while stack:
+        item = stack.pop()
+        if type(item) is str:
+            if size + len(item) + 2 > limit:
+                raise _OverBound()
+            size += len(json.dumps(item, ensure_ascii=True))
+        elif type(item) is dict:
+            size += 1 + 2 * len(item) if item else 2  # Braces, colons and commas.
+            if size > limit:
+                raise _OverBound()
+            for key, member in item.items():
+                if type(key) is not str:
+                    raise ValueError("non-string JSON key")
+                stack.extend((key, member))
+        elif type(item) is list:
+            size += 1 + len(item) if item else 2  # Brackets and commas.
+            if size > limit:
+                raise _OverBound()
+            stack.extend(item)
+        elif item is None or type(item) is bool:
+            size += 4 if item is None or item is True else 5
+        elif type(item) is int:
+            size += len(repr(item))
+        elif type(item) is float:
+            if item != item or item in (float("inf"), float("-inf")):
+                raise ValueError("nonfinite JSON number")
+            size += len(repr(item))
+        else:
+            raise ValueError("non-JSON value")
+        if size > limit:
+            raise _OverBound()
+    return size
+
+
 def _admit_opaque_carriers(message):
     """Structural admission of one message's opaque carriers; returns their JSON bytes.
 
     Assistant rows only; a JSON string, list or object; at most
-    ``_MAX_CARRIER_MESSAGE_BYTES`` for all of one message's carriers together. Values
-    are measured, never interpreted. Every refusal names the key, never the value.
+    ``_MAX_CARRIER_MESSAGE_BYTES`` for all of one message's carriers together, measured
+    without serializing past the bound. Values are measured, never interpreted. Every
+    refusal names the key, never the value.
     """
     size = 0
     for key, value in _carrier_values(message):
@@ -561,16 +610,12 @@ def _admit_opaque_carriers(message):
             raise _carrier_error("reasoning carrier on a non-assistant message", key)
         if type(value) not in (str, list, dict):
             raise _carrier_error("non-JSON reasoning carrier", key)
-        # Escaped JSON is never shorter than the string: refuse before serializing it.
-        if type(value) is str and size + len(value) > _MAX_CARRIER_MESSAGE_BYTES:
-            raise _carrier_error("reasoning carrier exceeds its admission bound", key)
         try:
-            _safe_json(value)
-            size += ascii_json_units(value)
-        except (ValueError, TypeError, RecursionError):
+            size += _bounded_json_units(value, _MAX_CARRIER_MESSAGE_BYTES - size)
+        except _OverBound:
+            raise _carrier_error("reasoning carrier exceeds its admission bound", key) from None
+        except (ValueError, TypeError, RecursionError, OverflowError):
             raise _carrier_error("non-JSON reasoning carrier", key) from None
-        if size > _MAX_CARRIER_MESSAGE_BYTES:
-            raise _carrier_error("reasoning carrier exceeds its admission bound", key)
     return size
 
 

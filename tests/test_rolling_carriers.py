@@ -585,3 +585,74 @@ def test_non_json_assembled_carrier_is_named_at_selection(tmp_path, monkeypatch)
     selection = engine.get_status()["selection"]
     assert selection["reason"] == "unsupported_carrier"
     assert selection["carrier"] == "reasoning_details"
+
+
+EQUIVALENCE_VALUES = [
+    "",
+    "plain",
+    'quote " backslash \\ newline \n tab \t nul \x00 del \x7f',
+    "λ😀漢字\ud800",
+    [],
+    {},
+    [None, True, False, 0, -7, 2**80, 1.5, -0.0, 1e300, 3.141592653589793],
+    {"b": [1, {"z": "é", "a": []}], "a": {"": None}},
+    [[[[["deep"]]]], {"k" * 50: ["v"] * 30}],
+    [{"type": "thinking", "thinking": "x" * 3000, "signature": "c2ln" * 100}],
+]
+
+
+@pytest.mark.parametrize("value", EQUIVALENCE_VALUES)
+def test_bounded_measure_equals_the_serialized_unit(value):
+    from hermes_ariadne.simulation import ascii_json_units
+
+    expected = ascii_json_units(value)
+    assert prepared._bounded_json_units(value, 10**9) == expected
+    assert prepared._bounded_json_units(value, expected) == expected
+    with pytest.raises(prepared._OverBound):
+        prepared._bounded_json_units(value, expected - 1)
+
+
+@pytest.mark.parametrize(
+    "value", [[float("nan")], {"a": float("inf")}, {1: "x"}, [b"x"], [10**5000]]
+)
+def test_bounded_measure_refuses_non_json(value):
+    with pytest.raises(ValueError):
+        prepared._bounded_json_units(value, 10**9)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        ["\x00" * 400],  # Escapes to 6x: refused on the raw-length lower bound.
+        [{"thinking": "x" * 400}],
+        {"a": ["x" * 100] * 10},
+        [None] * 1000,  # Fan-out is refused when the container is framed.
+    ],
+)
+def test_nested_oversized_carrier_is_refused_without_full_serialization(monkeypatch, value):
+    monkeypatch.setattr(prepared, "_MAX_CARRIER_MESSAGE_BYTES", 256)
+    real_dumps = prepared.json.dumps
+
+    def bounded_dumps(item, *args, **kwargs):
+        if not isinstance(item, str) or len(item) > 256:
+            raise AssertionError("a carrier was serialized past its bound")
+        return real_dumps(item, *args, **kwargs)
+
+    def no_serialization(item):
+        raise AssertionError("generic serializer ran on a carrier")
+
+    monkeypatch.setattr(prepared.json, "dumps", bounded_dumps)
+    monkeypatch.setattr(prepared, "ascii_json_units", no_serialization)
+    monkeypatch.setattr(prepared, "_safe_json", no_serialization)
+    with pytest.raises(ValueError) as caught:
+        prepared._admit_opaque_carriers({"role": "assistant", "reasoning_details": value})
+    assert str(caught.value) == "reasoning carrier exceeds its admission bound"
+    assert caught.value.carrier == "reasoning_details"
+
+
+def test_cyclic_carrier_terminates_at_the_bound():
+    loop = []
+    loop.append(loop)
+    with pytest.raises(ValueError) as caught:
+        prepared._admit_opaque_carriers({"role": "assistant", "reasoning_details": loop})
+    assert caught.value.carrier == "reasoning_details"
