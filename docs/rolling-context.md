@@ -466,13 +466,19 @@ copies only when they are private, regular, single-link files with the exact
 retained snapshot digest. Unknown, partial or unsafe candidates are left untouched
 and require inspection; recovery does not blindly delete files by name.
 
-Delta storage alone does not make cold opens fast: one preliminary cap run on a
-source snapshot measured 134.516 s cold and 2.299 s warm, with 200,000 stored event
-references for 100,000 events and 64 generations. This is not the final three-run
-median gate or a usability sign-off. A 16,384-event cold profile still canonicalized
-each target and generation's delta and spent most time in source serialization and
-validation. The <=5 s **cold and warm** target is not met; #19 remains open.
-The preceding journal-open measurements describe legacy schema-2 storage, not schema 3.
+The final sequential matrix on runtime `213cd77` completed 51 cold/warm pairs,
+three repetitions per group. At 100,000 events and 64 generations, median opens
+were 180.953/7.621 s cold/warm for legacy storage, 134.498/2.443 s for native delta
+storage, and 135.463/2.457 s after migration. Serialized target/generation payload
+fell from 520,641,187 to 32,387,974 bytes (93.78% less); delta records contain
+200,000 event-ID references rather than 6,503,840 repeated-prefix references.
+
+This **fails** the <=5 s cold-and-warm gate: storage reduction and warm reuse are
+not first-open usability. Strict source serialization/validation and repeated
+ancestor work remain profiling concerns; #19/#26 acceptance stays open. See the
+[complete matrix and limits](rolling-storage-benchmark.md) for ranges, conversion
+cost, retained-backup disk, depth scaling and memory caveats. The earlier benchmark
+table above this section describes legacy schema-2 storage, not schema 3.
 
 ## Installed-host pilot (#17)
 
