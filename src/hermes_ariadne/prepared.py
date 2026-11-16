@@ -523,21 +523,27 @@ def _opaque(message, carriers):
     return carriers and message.get("codex_reasoning_items") in _ABSENT
 
 
+def _carrier_absent(value):
+    """Type-aware absence: None or an EMPTY string/list/object. Unlike the legacy codec's
+    ``_ABSENT`` equality, False/0/0.0 are present (and then refused as non-JSON)."""
+    return value is None or (type(value) in (str, list, dict) and not value)
+
+
 def _carrier_values(message):
     """``(key, value)`` of every present non-empty opaque carrier, tool-call ones included."""
     found = [
         (key, message[key])
         for key in sorted(_OPAQUE_CARRIERS & message.keys())
-        if message[key] not in _ABSENT
+        if not _carrier_absent(message[key])
     ]
     calls = message.get("tool_calls")
     for call in calls if type(calls) is list else ():
         if type(call) is not dict:
             continue
-        if call.get("extra_content") not in _ABSENT:
+        if not _carrier_absent(call.get("extra_content")):
             found.append(("extra_content", call["extra_content"]))
         function = call.get("function")
-        if type(function) is dict and function.get("thought_signature") not in _ABSENT:
+        if type(function) is dict and not _carrier_absent(function.get("thought_signature")):
             found.append(("thought_signature", function["thought_signature"]))
     return found
 
@@ -555,6 +561,9 @@ def _admit_opaque_carriers(message):
             raise _carrier_error("reasoning carrier on a non-assistant message", key)
         if type(value) not in (str, list, dict):
             raise _carrier_error("non-JSON reasoning carrier", key)
+        # Escaped JSON is never shorter than the string: refuse before serializing it.
+        if type(value) is str and size + len(value) > _MAX_CARRIER_MESSAGE_BYTES:
+            raise _carrier_error("reasoning carrier exceeds its admission bound", key)
         try:
             _safe_json(value)
             size += ascii_json_units(value)

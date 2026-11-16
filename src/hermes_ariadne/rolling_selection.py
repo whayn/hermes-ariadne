@@ -6,10 +6,12 @@ from dataclasses import dataclass
 
 from .prepared import (
     SelectionDecision,
+    _admit_opaque_carriers,
     _comparison,
     _exact_occurrences,
     _exact_payloads,
     _leading,
+    _opaque,
     _reasoning_permissions,
     _reasoning_resource_preflight,
     _safe_json,
@@ -36,6 +38,8 @@ def _admit_messages(*groups):
         for message in messages:
             _require_supported_data_use(message)
             _reasoning_resource_preflight(message)
+            if _opaque(message, True):  # Name the carrier before generic serialization.
+                _admit_opaque_carriers(message)
         _safe_json(messages)
 
 

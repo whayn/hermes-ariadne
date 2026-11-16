@@ -518,3 +518,70 @@ def test_codex_reasoning_rows_keep_their_audited_codec_under_the_rolling_flag():
         prepared._comparison_payloads(rows, [POLICY] * 4, durable=True, carriers=True)
     assert str(caught.value) == "unsupported replay carrier"
     assert caught.value.carrier == "reasoning_details"
+
+
+@pytest.mark.parametrize("value", [False, 0, 0.0, True, 7])
+def test_scalar_carrier_values_are_refused_not_treated_as_absent(value):
+    message = {"role": "assistant", "content": "x", "reasoning": value}
+    with pytest.raises(ValueError) as caught:
+        prepared._comparison_payloads([message], [None], carriers=True)
+    assert caught.value.carrier == "reasoning"
+
+
+@pytest.mark.parametrize("key", ["reasoning", "reasoning_details"])
+def test_restored_scalar_carrier_needs_canonical_origin(key):
+    rows = exchange("A", "reasoning")
+    rows[3]["reasoning"] = None
+    observed = restored(rows, "reasoning")
+    observed[3][key] = 0
+    with pytest.raises(ValueError) as caught:
+        rolling.validate_completed_turn(rows, observed, reasoning_policy=None)
+    assert caught.value.carrier == key
+
+
+def test_carrier_admission_runs_before_generic_serialization(monkeypatch):
+    """Oversized or non-JSON carriers are named, not lost to a generic size/JSON error."""
+    monkeypatch.setattr(prepared, "_MAX_CARRIER_MESSAGE_BYTES", 256)
+    settings = rolling.RollingSettings(max_checkpoint_bytes=4096)
+    for value in ("x" * 5000, [float("nan")]):
+        rows = exchange("A", "reasoning")
+        rows[3]["reasoning_details"] = value
+        with pytest.raises(ValueError) as caught:
+            rolling.readable_delta(rows, policy=None, settings=settings)
+        assert caught.value.carrier == "reasoning_details", value
+        with pytest.raises(ValueError) as caught:
+            rolling.validate_completed_turn(
+                exchange("A", "reasoning"),
+                [
+                    {**m, "reasoning_details": value} if m["role"] == "assistant" else m
+                    for m in restored(exchange("A", "reasoning"), "reasoning")
+                ],
+                reasoning_policy=None,
+                settings=settings,
+            )
+        assert caught.value.carrier == "reasoning_details", value
+
+
+def test_oversized_string_carrier_is_refused_before_it_is_serialized(monkeypatch):
+    monkeypatch.setattr(prepared, "_MAX_CARRIER_MESSAGE_BYTES", 256)
+
+    def no_serialization(value):
+        raise AssertionError("oversized carrier was serialized")
+
+    monkeypatch.setattr(prepared, "ascii_json_units", no_serialization)
+    monkeypatch.setattr(prepared, "_safe_json", no_serialization)
+    with pytest.raises(ValueError) as caught:
+        prepared._admit_opaque_carriers({"role": "assistant", "reasoning": "x" * 300})
+    assert caught.value.carrier == "reasoning"
+
+
+def test_non_json_assembled_carrier_is_named_at_selection(tmp_path, monkeypatch):
+    engine, db, _ = _engine_after_publication(tmp_path, monkeypatch)
+    db.rows += exchange("C", "anthropic", complete=False)[:1]
+    request, _, _ = request_for(db, "C", "anthropic")
+    request[-2]["reasoning_details"] = [float("nan")]  # B's answer has a canonical carrier.
+    _, result = choose(engine, db, "C", "anthropic", request=request)
+    assert result is None
+    selection = engine.get_status()["selection"]
+    assert selection["reason"] == "unsupported_carrier"
+    assert selection["carrier"] == "reasoning_details"
