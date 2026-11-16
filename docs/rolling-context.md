@@ -191,14 +191,48 @@ skip all preparation (`gate=unsupported_carrier`). A new session binding clears 
 host sends the original request on every such decline. A decline after a request of the
 same user turn was already selected is flagged `mid_turn` (status and log).
 
-What was exercised: synthetic engine tests with route-shaped fixtures (Anthropic thinking
-with live-only content blocks, `reasoning_content`, `reasoning`, OpenRouter text and
-encrypted details, Gemini signatures, the must-echo pad), and two installed-host runs on
-Anthropic with thinking (below). **Not verified:** first-party must-echo routes
-(DeepSeek, Kimi, MiMo; no tokens available), where the inserted summary is an assistant
-message without the pad; it is assumed safe until an issue reports otherwise. Other real
-providers (OpenRouter, Gemini, Bedrock) were not run. Inline `<think>` text that a route
-leaves in `content` is ordinary content and reaches the summarizer; that is unmeasured.
+What was exercised: synthetic engine tests with route-shaped fixtures, two
+installed-host runs on Anthropic with thinking (below), and a synthetic-host matrix
+(next paragraph).
+
+**Synthetic-host matrix (2026-11-16).** Each case was run once on Ariadne `81ddfd2`, with
+the plugin installed from a wheel and Hermes v0.23.1 from its source tree. Every case used
+a fresh private scratch home and a real `AIAgent`, `SessionDB`, finalizer and `ctx.llm`
+against a scripted loopback provider. The provider answered in each provider's documented
+response shape, and every answer carried reasoning. Each case ran six turns, with a tool
+call on turn 3, using `trigger_bytes=64` and `max_delta_exchanges=1`. Results:
+
+| Shape (provider name) | Persisted carriers | Carriers the host replayed | Requests per turn |
+| --- | --- | --- | --- |
+| Control, no reasoning (custom) | none | none | D, D, SS, S, S, S |
+| `reasoning_content` (custom) | `reasoning`, `reasoning_content` | same | same as control |
+| `reasoning` (custom) | `reasoning`, `reasoning_content` | same | same |
+| OpenRouter `reasoning.text` details (custom) | + `reasoning_details` | `reasoning`, `reasoning_content` | same |
+| OpenRouter `reasoning.encrypted` details (custom) | `reasoning_details` | none (route strips it) | same |
+| Gemini `thought_signature`, also on tool calls (custom) | `reasoning_details` | tool-call `extra_content` | same |
+| `<think>` tags in content (custom) | `reasoning`, `reasoning_content` | same | same |
+| Mistral thinking chunks (custom) | none (host drops them) | none | same |
+| DeepSeek route, no reasoning returned (`deepseek`) | `reasoning_content` pad | `reasoning_content` on every assistant | same |
+| DeepSeek route with `reasoning_content` (`deepseek`) | `reasoning`, `reasoning_content` | same | same |
+
+In every case, rolling status stayed `ready`, with no exception and no
+`unsupported_carrier`. Each case published five summaries. On `1fd68b8`, the same harness
+refused every case except the control and Mistral (#29), from turn 1 or 2.
+On this route Hermes moved `<think>` text out of `content` into the `reasoning` column,
+so it did not reach the summarizer. The archive kept it in the exact rows.
+
+These results are loopback evidence. They show how Hermes persists and replays each
+shape; they are not evidence of real-provider behaviour.
+
+**Not verified:**
+- First-party must-echo routes (DeepSeek, Kimi, MiMo), because no tokens are available.
+  On these routes the inserted summary is an assistant message without the pad. It is
+  assumed safe until an issue reports otherwise.
+- OpenRouter on its real API: this check was deliberately skipped (maintainer decision).
+  Its response shapes are covered only by the matrix above.
+- Gemini and Bedrock on their real APIs, and gateway execution with any real provider.
+- Routes that leave `<think>` text in `content`: none was observed. If one exists, that
+  text reaches the summarizer as ordinary content.
 
 ## Limits and accounting
 
