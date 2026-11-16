@@ -151,3 +151,42 @@ def test_prepared_restore_rejects_changed_snapshot_and_removes_temporary_copy(tm
             pytest.fail("a mismatched snapshot must never become publishable")
     assert source.read_bytes() == b"synthetic private database bytes"
     assert not list(tmp_path.glob(".rollback-*"))
+
+
+@pytest.mark.parametrize("action", ["migrate", "rollback"])
+@pytest.mark.parametrize("unsafe", [None, "bytes", "symlink", "hardlink", "mode", "name"])
+def test_orphan_cleanup_only_removes_confirmed_private_copies(tmp_path, action, unsafe):
+    import os
+
+    store, settings = setup(tmp_path)
+    with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
+        journal.freeze_target(target(store, settings, 1))
+        directory = journal.directory
+    (tmp_path / ".ariadne-offline-migration").touch(mode=0o600)
+    migration.migrate(tmp_path, "s", settings, store=store)
+    snapshot = directory / "legacy-snapshot" / "journal.sqlite3"
+    original = snapshot.read_bytes()
+    confirmed = directory / ".rollback-00000000"
+    confirmed.write_bytes(original)
+    confirmed.chmod(0o600)
+    candidate = directory / (".rollback-zz-invalid" if unsafe == "name" else ".rollback-zzzzzzzz")
+    if unsafe == "symlink":
+        candidate.symlink_to(snapshot)
+    elif unsafe == "hardlink":
+        os.link(snapshot, candidate)
+    else:
+        candidate.write_bytes(b"unknown partial copy" if unsafe == "bytes" else original)
+        candidate.chmod(0o644 if unsafe == "mode" else 0o600)
+    selector = (directory / "storage.json").read_bytes()
+    operation = getattr(migration, action)
+    if unsafe is not None:
+        with pytest.raises(ValueError):
+            operation(tmp_path, "s", settings, store=store)
+        assert confirmed.read_bytes() == original  # Validate all BEFORE deleting any.
+        assert candidate.exists() or candidate.is_symlink()
+        assert (directory / "storage.json").read_bytes() == selector
+        assert not (directory / "rollback-intent.json").exists()
+    else:
+        operation(tmp_path, "s", settings, store=store)
+        assert not list(directory.glob(".rollback-*"))
+    assert snapshot.read_bytes() == original

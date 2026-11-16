@@ -234,7 +234,7 @@ def test_unfenced_legacy_root_is_never_selected_as_migrated(tmp_path):
             pass
 
 
-@pytest.mark.parametrize("point", ["database", "selector", "marker", "complete"])
+@pytest.mark.parametrize("point", ["prepared", "database", "selector", "marker", "complete"])
 def test_rollback_process_death_is_resumable_without_reset(tmp_path, point):
     import os
 
@@ -253,6 +253,12 @@ def test_rollback_process_death_is_resumable_without_reset(tmp_path, point):
     if pid == 0:
         try:
             atomic, sync, replace = rolling_state._atomic, module._sync, os.replace
+            fsync = os.fsync
+
+            def at_fsync(fd):
+                fsync(fd)
+                if point == "prepared" and "/.rollback-" in os.readlink(f"/proc/self/fd/{fd}"):
+                    os._exit(73)
 
             def at_write(path, data):
                 atomic(path, data)
@@ -283,6 +289,7 @@ def test_rollback_process_death_is_resumable_without_reset(tmp_path, point):
 
             rolling_state._atomic, module._sync = at_write, at_sync
             os.replace = at_replace
+            os.fsync = at_fsync
             module.rollback(tmp_path, "s", settings, store=store)
             os._exit(0)
         except BaseException:
@@ -290,6 +297,7 @@ def test_rollback_process_death_is_resumable_without_reset(tmp_path, point):
     _, status = os.waitpid(pid, 0)
     assert os.waitstatus_to_exitcode(status) == 73
     module.rollback(tmp_path, "s", settings, store=store)
+    assert not list(directory.glob(".rollback-*"))
     with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
         assert journal.load_view() == view
         assert journal.report()["logical_reservations"] == 1

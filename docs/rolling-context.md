@@ -460,6 +460,12 @@ including reserved→uncertain recovery or another logical reservation. No live-
 activation, installer overwrite/upgrade or managed-environment modification is
 part of this command.
 
+Rollback streams, hash-checks and fsyncs a private restoration copy before it
+removes the selector. Explicit offline recovery cleans up interrupted `.rollback-*`
+copies only when they are private, regular, single-link files with the exact
+retained snapshot digest. Unknown, partial or unsafe candidates are left untouched
+and require inspection; recovery does not blindly delete files by name.
+
 Delta storage alone does not make cold opens fast: one preliminary cap run on a
 source snapshot measured 134.516 s cold and 2.299 s warm, with 200,000 stored event
 references for 100,000 events and 64 generations. This is not the final three-run

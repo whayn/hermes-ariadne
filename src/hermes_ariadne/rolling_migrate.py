@@ -498,7 +498,9 @@ def migrate(home, session_id, settings, *, store, policy=None):
             raise ValueError("session already entered rollback; use explicit rollback recovery")
         if (root / "storage.json").exists():
             resolve_storage(root, session_id, settings)
-            return _receipt(root, session_id, settings)[0]
+            receipt = _receipt(root, session_id, settings)[0]
+            _cleanup_rollback_copies(root, receipt)
+            return receipt
         if (root / "migration-intent.json").exists():
             return _finish(root, session_id, settings, store, policy)
         if any(
@@ -577,6 +579,29 @@ def _prepared_restore(source, directory, expected_digest):
             os.unlink(name)
 
 
+def _cleanup_rollback_copies(root, receipt):
+    """Caller holds writer.lock; delete only exact, private snapshot duplicates."""
+    candidates = sorted(root.glob(".rollback-*"))
+    if not candidates:
+        return
+    expected = receipt["source_files"]["journal.sqlite3"]
+    if _file_hash(root / "legacy-snapshot" / "journal.sqlite3") != expected:
+        raise ValueError("legacy snapshot changed")
+    for path in candidates:
+        suffix = path.name.removeprefix(".rollback-")
+        if (
+            len(suffix) != 8
+            or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789_" for c in suffix)
+            or _file_hash(path) != expected
+        ):
+            raise ValueError("unrecognized orphan rollback copy; inspect manually")
+    # Validate the entire set before unlinking anything. Unknown/partial files
+    # and links are never silently deleted or treated as a reusable database.
+    for path in candidates:
+        path.unlink()
+    _sync(root)
+
+
 def rollback(home, session_id, settings, *, store, policy=None):
     """Remove selector/publish completion metadata BEFORE final legacy admission."""
     with _owned(home, session_id, settings, store) as (root_home, root):
@@ -585,6 +610,7 @@ def rollback(home, session_id, settings, *, store, policy=None):
         _require_metadata(
             root / "migration-intent.json", _intent(session_id, settings, digest, "upgrade")
         )
+        _cleanup_rollback_copies(root, receipt)
         with closing(_read_db(root / "journal.sqlite3")) as conn:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
         if (root / "rollback-intent.json").exists():
