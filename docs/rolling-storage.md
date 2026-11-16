@@ -8,6 +8,8 @@ storage, not provider compatibility, summary accuracy, activation or release.
 Legacy journal schema 2 uses artifact format 1 and untagged whole-prefix targets.
 Its codec, identity pins, settings digest, prompt, policy and projection remain
 unchanged. New journal schema 3 uses artifact/target format 2, never mixed chains.
+New engine-created sessions use schema 3 directly at the stable root; the low-level
+journal API retains schema 2 as its compatibility default unless requested otherwise.
 Legacy sessions stay legacy until an explicit offline conversion. Schema 1 is
 still refused: absent actual charging identities cannot be reconstructed.
 
@@ -51,7 +53,10 @@ Let `R` be `ariadne/rolling/<sha256(session_id)>`. `R/writer.lock` is the same
 cooperative exclusive lock for old/new readers and migration; never rename R or
 replace its lock inode. Acquire it before choosing the active data path.
 All files/directories must satisfy existing private/no-symlink/single-link and
-SQLite-companion checks before archive reads or destination writes. All sibling
+SQLite-companion checks before archive reads or destination writes. Nonempty
+journal DB companions require an explicit offline checkpoint before this converter
+can run; it refuses them rather than recovering or checkpointing source state.
+Archive WAL companions are admitted and read normally. All sibling
 paths are fixed names, never strings supplied by a selector.
 
 Proposed layout:
@@ -64,15 +69,17 @@ Proposed layout:
 
 Selector exact keys: `format: "ariadne-rolling-storage"`, `version: 1`,
 `schema: 3`, `receipt_sha256` (digest of canonical migration receipt),
-`session_id`, `settings_digest`. Native-new journals use a separate explicit
-native selector with `receipt_sha256: null`; the root schema fence must exist
-before publication. A missing selector alongside v3, migration, snapshot or fence
+`session_id`, `settings_digest`. Native-new journals store schema 3 at the root
+without a selector; their schema version itself fences old readers. Converted
+journals use the selector and fence version 2147483000 at the old root.
+A missing selector alongside v3, migration, snapshot or fence
 state is NOT an empty session. Ordinary runtime opens refuse incomplete upgrades;
 only the explicit offline migrator may complete them.
 
 Receipt exact keys: `format: "ariadne-rolling-migration"`, `version: 1`,
 `session_id`, `settings_digest`, `source_fingerprint`, `destination_fingerprint`,
-`targets`, `jobs`, `generations`. Mappings are old-ID→new-ID objects, permanent
+`targets`, `jobs`, `generations`, `source_files`. `source_files` maps exact legacy
+relative file names to SHA-256 hashes. Identity mappings are old-ID→new-ID objects, permanent
 private audit data, never prompt material. Fingerprints hash a canonical mapping
 of relative artifact paths to exact byte hashes and canonical logical SQL rows
 (including blob hex), excluding volatile SQLite page-layout and lock contents.
@@ -80,9 +87,11 @@ Receipt also binds exact legacy snapshot file hashes; source evidence must not
 be confused with a post-recovery snapshot.
 
 Intent exact keys: `format: "ariadne-rolling-migration-intent"`, `version: 1`,
-`session_id`, `settings_digest`, `receipt_sha256`, `operation` (`upgrade` or
-`rollback`). A single immutable intent identifies the audited operation; phases
-are determined from exact validated disk state, not a mutable unchecked flag.
+`session_id`, `settings_digest`, `receipt_sha256`, `operation`. The immutable
+`migration-intent.json` has operation `upgrade`; a SEPARATE immutable
+`rollback-intent.json` has operation `rollback`. Retain both for audit; never
+overwrite the upgrade intent to begin rollback. Phases are determined from exact
+validated disk state, not a mutable unchecked phase flag.
 
 ## Offline conversion ordering and crash states
 
@@ -118,8 +127,13 @@ never dispatches a job or creates another campaign.
 
 Crash states:
 - no stage/intent/selector: ordinary legacy semantics;
-- stage/snapshot/receipt but no intent: ordinary runtime refuses; explicit audit
-can resume or refuse without touching original charges;
+- stage/snapshot/receipt but no intent: new runtime refuses; explicit conversion
+refuses for operator inspection rather than deleting/replacing orphan staging.
+Until the fence commits, an OLD binary can still use the valid original ledger.
+If it advances after a crash, all upgrade recovery must reject the stale stage;
+its new charges remain in the authoritative legacy ledger. Stopping old runtimes
+is an operator prerequisite, not an OS sandbox. This is a refusal/availability
+limit, not permission to reset or overwrite that source;
 - intent + source still schema2: explicit retry revalidates both snapshots before
 fencing/selecting; ordinary runtime refuses;
 - intent + fence + no selector: explicit retry selects ONLY exact validated stage;
@@ -136,9 +150,18 @@ is detected. Two directory renames are never described as one atomic switch.
 Keep snapshot/mapping after successful opens. Simple rollback requires destination
 state exactly migration-equivalent, including all lifecycle fields—not merely no
 new generation. A reserved→uncertain or ready→published recovery is divergence.
-Before any such mutation, under the same lock, persist a rollback intent, restore
-and sync exact legacy artifacts/DB, remove/sync selector, then complete a durable
-rollback receipt transition. Runtime refuses interrupted rollback. After any new
+Before any such mutation, under the same lock, publish the separate rollback
+intent, remove/fsync the selector while the legacy DB is STILL fenced, then
+publish/fsync the completed rollback metadata. Verify the original artifacts
+unchanged and atomically restore/fsync the exact legacy DB as the LAST publication
+point. Old binaries cannot admit schema 2 before all other rollback metadata is
+complete. The rollback receipt (`rollback.json`) has exact `format`, `version`,
+`session_id`, `settings_digest`, `receipt_sha256`; format
+`ariadne-rolling-rollback`, version 1. Keep mapping/snapshot, both immutable
+intents and retired v3 data. Completed rollback has no selector, both exact
+receipt-bound intents, an exact receipt-bound marker and root schema 2; runtime
+then uses the restored root journal. Before the final DB restore, the fence
+remains and both old/new opens refuse. Runtime refuses interrupted rollback. After any new
 charge or lifecycle divergence refuse; audited reverse migration is separate
 scope. Deleting a journal or reinstalling old code is never rollback.
 
