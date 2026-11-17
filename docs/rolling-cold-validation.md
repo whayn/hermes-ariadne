@@ -140,3 +140,84 @@ inventory commitments. To reproduce, use separate frozen baseline/implementation
 worktrees, the committed benchmark `measure HOME --in-place --cache`, identical
 synthetic fixtures, fresh processes, and separate fingerprint processes; never
 run timing alongside tests/builds or migrate a baseline original in place.
+
+## Exact launchers, hardware audit and reproduction
+
+The actual [low-RSS checkpoint launcher](benchmarks/cold-binding-launcher.py)
+and [callback-profile driver](benchmarks/cold-binding-callback-profile.py) are
+archived verbatim. They are run records, not portable installed commands: their
+absolute paths identify the original scratch trees and fixtures. To reproduce in
+a fresh location, change only those path/interpreter constants, retain the case
+list and assertions, and use synthetic fixture copies. The checkpoint launcher
+refuses to overwrite an existing result file.
+
+The CPU was identified in the follow-up audit as **ARM Neoverse-N1** (`lscpu -J`);
+the observed affinity was CPUs0,1. That model/CPU-index audit was obtained after
+the campaign, not recorded inside each sample. At campaign setup, two available
+affinity slots and aarch64 were recorded. No frequency/governor or exclusive-host
+claim is made. The campaign inherited its two-slot affinity; **no `taskset`
+command was used for the historical run**. Inspect a reproduction environment with:
+
+```sh
+lscpu -J
+python3 -c 'import os; print(sorted(os.sched_getaffinity(0)))'
+taskset -pc "$$"
+```
+
+If reproducing on a wider-affinity machine, explicitly select two available CPUs
+with `taskset -c CPU_A,CPU_B ...`; that is an example reproduction control, not a
+retroactive claim about the historical invocation.
+
+The exact historical checkpoint invocation was:
+
+```sh
+. /opt/data/cache/scratch/ariadne-19-cold/env.sh
+.venv/bin/python "$ARIADNE_SCR/run-checkpoints.py" > "$ARIADNE_SCR/checkpoints-driver.log" 2>&1
+```
+
+`run-checkpoints.py` is the verbatim archived launcher above. Its `TREES` selects
+the frozen baseline/candidate, and it launches each timed child with only that
+tree's `src` on `PYTHONPATH`:
+
+```sh
+PYTHONPATH="$TREE/src" "$PY" "$TREE/scripts/bench_rolling_open.py" \
+  measure "$FIXTURE" --in-place --cache
+```
+
+The exact fingerprint code is the launcher's `FP` string, executed in a separate
+process immediately before and after each timed child as `PY -c FP FIXTURE`, with
+the candidate's `src` on `PYTHONPATH`. It computes `rolling_migrate.fingerprint`
+for the active journal (`v3` when selected), hashes the canonical archive, records
+all root artifact and metadata hashes, and includes retained legacy-snapshot
+hashes when present. The launcher compares the entire before/after dictionaries,
+not only the final view. Keeping this work in short-lived children avoids
+contaminating later timing children's RSS with the launcher's large decoded data.
+
+Build equivalent inputs using the committed benchmark on a frozen tree, under
+private scratch `HOME`/`HERMES_HOME` and `umask 077`:
+
+```sh
+PYTHONPATH="$TREE/src" "$PY" "$TREE/scripts/bench_rolling_open.py" \
+  build "$FRESH_NATIVE_FIXTURE" --events 4096 --generations 64 --storage-version 3
+PYTHONPATH="$TREE/src" "$PY" "$TREE/scripts/bench_rolling_open.py" \
+  build "$FRESH_LEGACY_FIXTURE" --events 4096 --generations 64 --storage-version 2
+```
+
+Use the same commands with the event counts in the launcher's case list. For a
+migrated cap fixture, copy a schema2 cap fixture into a separate private home;
+never convert the baseline original. Create its private offline marker, then call
+`rolling_migrate.migrate(home, "s", bench.settings(), store=store,
+policy=bench.POLICY)` using `EventStore(home / "ariadne/events.sqlite3")` and the
+committed benchmark module (`settings()` and `POLICY` preserve the exact fixture
+settings/policy). The archived launcher uses the resulting separately converted
+home. Saved inventories bind the actual inputs used in this campaign; newly built
+SQLite files need not be physically byte-identical across SQLite versions.
+
+For callback reproduction, run the archived profile driver with the frozen repo
+as its first argument and a **new** output directory beneath the scratch root as
+its second. Set isolated `HOME`/`HERMES_HOME`, inspected `HERMES_SOURCE`, pinned
+dependencies and that frozen package's `src` on `PYTHONPATH` first. It uses the
+existing synthetic test DB/Facade, not provider dispatch. It creates32generations
+and a separate profile clone, measures each callback with a fresh cache, and
+asserts publication33 after completion. Do not run either driver alongside local
+tests, builds, other profiles or another benchmark.
