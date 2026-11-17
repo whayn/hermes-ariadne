@@ -63,7 +63,7 @@ export ARIADNE_DEV_HOME=/absolute/path/to/new/ariadne-dev-home
 .venv/bin/ariadne-install --home "$ARIADNE_DEV_HOME" --rolling
 ```
 
-The installer copies a strict 17-file runtime allowlist into
+The installer copies a strict 19-file runtime allowlist into
 `$ARIADNE_DEV_HOME/plugins/ariadne-rolling-plugin/`. It does not copy the whole
 package, caches, private configuration, credentials or history. It does not call
 a model, alter configuration or activate anything. `--rolling` and `--prepared`
@@ -289,7 +289,9 @@ full provider fit (tool schemas, output runway and provider overhead also matter
 A declined `select_context` returns `None`: Hermes can send the original request,
 which can overflow. This is **not a dispatch veto** or a universal size guarantee.
 
-**Known performance limit (#19).** Every request and every rolling navigation call
+**Legacy schema-2 performance history (#19).** The measurements and storage-specific
+notes in this subsection describe schema 2; see the delta-only subsection below
+for schema 3 and its remaining cold-open limit. Every request and every rolling navigation call
 reopens the session journal and revalidates the pinned view. One journal open now
 shares its validation memo across reconciliation, loading and revalidation until
 close. A failed operation discards it; caught nested reentry does not take ownership
@@ -419,6 +421,74 @@ format to hold only deltas.
 If a session exceeds `max_prefix_events` before the trigger threshold is reached,
 or the logical-job budget is exhausted, rolling status reports `unavailable` while
 any retained view keeps being served; the label is coarser than the cause.
+
+## Delta-only storage and explicit conversion (#26)
+
+New engine-created sessions use journal schema 3 with version-2 delta-only targets
+and generations. Each record stores only its own source IDs and UIDs plus its
+validated parent binding. Ordered coverage is reconstructed from immutable
+segments; the full-prefix coverage digest, summarizer inputs, logical accounting
+and source/retirement policy are unchanged. Existing schema-2 sessions remain
+legacy, without automatic conversion or charge reset. The low-level journal API
+retains its explicit legacy-compatible default; the rolling engine requests schema
+3 when creating a session.
+
+The exact encoding, migration state machine, old-reader fence and rollback limits
+are specified in [rolling storage](rolling-storage.md). Conversion is offline and
+explicit, with stopped development-session runtimes, a private marker, a retained
+exact legacy snapshot and a permanent old→new ID map. It never calls `ctx.llm`.
+Nonempty journal SQLite companions are refused rather than silently recovered;
+checkpoint them separately while stopped. Do not delete a journal to obtain retries.
+
+From a wheel installed in a separate Ariadne development environment, for an
+**existing disposable legacy home**, with its exact rolling settings:
+
+```bash
+(umask 077; touch "$ARIADNE_DEV_HOME/.ariadne-offline-migration")
+.venv/bin/python -m hermes_ariadne.rolling_migrate \
+  --home "$ARIADNE_DEV_HOME" --session '<synthetic-session-id>' \
+  --settings '{"trigger_bytes":1024,"max_delta_exchanges":2}'
+```
+
+Omitted settings take their usual defaults, so supply every nondefault value from
+that session. For supported Codex replay data also supply the original
+`--provider` and `--model` policy labels; these select validation policy, not a
+provider call. The CLI reads the already-existing archive through a read-only
+connection and cannot initialize or ingest into it. Rollback uses the same command
+with `--rollback`, and refuses after **any** destination lifecycle divergence,
+including reserved→uncertain recovery or another logical reservation. No live-home
+activation, installer overwrite/upgrade or managed-environment modification is
+part of this command.
+
+Repeating a completed conversion re-audits the selected schema-3 journal, sources
+and artifacts without running startup recovery or changing lifecycle state. Valid
+post-conversion advances remain valid; the original conversion fingerprint is a
+rollback boundary, not a freeze of later activity. Corruption refuses rather than
+reporting a successful conversion. Completed rollback retries likewise audit the
+current schema-2 state without recovering or overwriting valid later activity.
+After rollback, ordinary runtime opens may perform normal SQLite crash recovery,
+but only after rollback metadata and private paths/companions are admitted. Offline
+conversion/rollback audits still refuse nonempty recovery companions.
+
+Rollback streams, hash-checks and fsyncs a private restoration copy before it
+removes the selector. Explicit offline recovery cleans up interrupted `.rollback-*`
+copies only when they are private, regular, single-link files with the exact
+retained snapshot digest. Unknown, partial or unsafe candidates are left untouched
+and require inspection; recovery does not blindly delete files by name.
+
+The final sequential matrix on runtime `213cd77` completed 51 cold/warm pairs,
+three repetitions per group. At 100,000 events and 64 generations, median opens
+were 180.953/7.621 s cold/warm for legacy storage, 134.498/2.443 s for native delta
+storage, and 135.463/2.457 s after migration. Serialized target/generation payload
+fell from 520,641,187 to 32,387,974 bytes (93.78% less); delta records contain
+200,000 event-ID references rather than 6,503,840 repeated-prefix references.
+
+This **fails** the <=5 s cold-and-warm gate: storage reduction and warm reuse are
+not first-open usability. Strict source serialization/validation and repeated
+ancestor work remain profiling concerns; #19/#26 acceptance stays open. See the
+[complete matrix and limits](rolling-storage-benchmark.md) for ranges, conversion
+cost, retained-backup disk, depth scaling and memory caveats. The earlier benchmark
+table above this section describes legacy schema-2 storage, not schema 3.
 
 ## Installed-host pilot (#17)
 
@@ -560,9 +630,12 @@ not covered.
 
 ## Durable state, rollback and evidence
 
-Rolling journal schema v2 retains work/charge lineage. Existing v1 journals fail
-closed, without reset, migration or spending-counter forgiveness. Operator reset
-or recovery is out of scope; do not delete journals to obtain automatic retries.
+Rolling journal schemas 2 and 3 retain work/charge lineage. Schema 2 remains
+readable and continues in its original encoding until the explicit offline
+conversion described above. Schema-1 journals still fail closed, without reset,
+migration or spending-counter forgiveness. Operator spending resets and reverse
+migration after ledger divergence are out of scope; do not delete journals to
+obtain automatic retries.
 Archives/journals contain sensitive source material and require private paths;
 there is no encryption, erasure or cross-profile retrieval feature.
 

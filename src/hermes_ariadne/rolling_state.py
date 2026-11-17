@@ -10,7 +10,7 @@ import os
 import sqlite3
 import stat
 import tempfile
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 try:
@@ -110,12 +110,26 @@ def _atomic(path, data):
 
 
 class RollingJournal:
-    def __init__(self, home, session_id, settings, *, store, policy=None, guard=None, cache=None):
+    def __init__(
+        self,
+        home,
+        session_id,
+        settings,
+        *,
+        store,
+        policy=None,
+        guard=None,
+        cache=None,
+        storage_version=2,
+    ):
         bounded_text(session_id, 4096)
         if cache is not None and type(cache) is not RollingVerificationCache:
             raise ValueError("unsupported rolling verification cache")
         # Optional owner-held cross-open cache of content-addressed verdicts.
         self.cache = cache
+        if type(storage_version) is not int or storage_version not in (2, 3):
+            raise ValueError("unsupported rolling journal schema")
+        self.schema_version = storage_version
         self.settings, self.session_id, self.store, self.policy = (
             settings,
             session_id,
@@ -157,6 +171,19 @@ class RollingJournal:
                 fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise ValueError("rolling session already has a writer") from exc
+            from .rolling_migrate import resolve_storage
+
+            selected = resolve_storage(
+                self.directory, self.session_id, self.settings, recover_rollback=True
+            )
+            if selected != self.directory:
+                self.directory = selected
+                self.path = selected / "journal.sqlite3"
+                self.manifest_path = selected / "manifest.json"
+                self.generations = selected / "generations"
+                _path_check(self.generations)
+                if not self.path.is_file() or not self.generations.is_dir():
+                    raise ValueError("migrated journal missing")
             existed = self.path.exists() or self.path.is_symlink()
             _path_check(self.path, regular=True)
             artifacts = (
@@ -171,8 +198,15 @@ class RollingJournal:
                 _path_check(companion, regular=True)
                 if companion.exists() and not existed:
                     raise ValueError("orphaned rolling journal companion")
+            if existed:
+                with closing(sqlite3.connect(self.path, timeout=0)) as probe:
+                    found_version = probe.execute("PRAGMA user_version").fetchone()[0]
+                if found_version not in (2, 3):
+                    raise ValueError("unsupported rolling journal schema")
+                self.schema_version = found_version
             if not existed:
                 self._initialize()
+            self._memo.storage_version = 2 if self.schema_version == 3 else 1
             self._conn = sqlite3.connect(self.path, timeout=0)
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA foreign_keys=ON")
@@ -232,6 +266,7 @@ class RollingJournal:
                 self._memo = _ValidationMemo(
                     self.store, self.session_id, self.policy, self.cache, self.settings.digest
                 )
+                self._memo.storage_version = 2 if self.schema_version == 3 else 1
             # The memo's operation scope owns the ancestor artifact binding:
             # every operation rereads and rebinds each ancestor exactly once.
             with self._memo.operation():
@@ -273,7 +308,7 @@ class RollingJournal:
                     for sql in SCHEMA:
                         conn.execute(sql)
                     conn.execute(f"PRAGMA application_id={APPLICATION_ID}")
-                    conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                    conn.execute(f"PRAGMA user_version={self.schema_version}")
                     conn.execute(
                         "INSERT INTO campaign VALUES(1,?,?,1,0,0,NULL,NULL,NULL)",
                         (self.session_id, self.settings.digest),
@@ -306,7 +341,7 @@ class RollingJournal:
     def _validate_schema(self):
         if (
             self._conn.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID
-            or self._conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
+            or self._conn.execute("PRAGMA user_version").fetchone()[0] != self.schema_version
         ):
             raise ValueError("unsupported rolling journal schema")
         reference = sqlite3.connect(":memory:")
@@ -387,9 +422,20 @@ class RollingJournal:
         # A hit is a Target already parsed and verified from these exact bytes (in
         # this open or, through the cache, an earlier one in this scope); anything
         # else (including non-bytes) is parsed and rejected here.
-        target = known.target if known is not None else Target.from_bytes(payload, self.settings)
+        target = (
+            known.target
+            if known is not None
+            else self.target_type.from_bytes(payload, self.settings)
+        )
         if digest != row["payload_sha256"] or target.target_id != target_id:
             raise ValueError("frozen target hash mismatch")
+        if self.schema_version == 3 and known is None:
+            parent = (
+                None
+                if target.parent_generation is None
+                else self._view(self._parent_bytes(target.parent_generation))
+            )
+            target.bind(parent, self.settings)
         if self._memo is not None:
             self._memo.targets[digest] = target
         return target
@@ -432,7 +478,10 @@ class RollingJournal:
 
     def _view(self, data):
         validated = []
-        view = validate_generation(
+        validator = validate_generation
+        if self.schema_version == 3:
+            from .rolling_delta import validate_generation as validator
+        view = validator(
             data,
             self.store,
             self.session_id,
@@ -461,7 +510,22 @@ class RollingJournal:
                 self._memo.accepted[current.generation_id] = current
         return view
 
+    @property
+    def target_type(self):
+        if self.schema_version == 3:
+            from .rolling_delta import DeltaTarget
+
+            return DeltaTarget
+        return Target
+
+    def encode_target(self, target, parent):
+        if self.schema_version == 3:
+            return self.target_type.from_legacy(target, parent, self.settings)
+        return target
+
     def _validate_target(self, target):
+        if self.schema_version == 3:
+            return self._validate_delta_target(target)
         if (
             type(target) is not Target
             or target.session_id != self.session_id
@@ -514,6 +578,27 @@ class RollingJournal:
             # A root target has no prefix to collide with: no identity sets needed.
             self._memo.record_target(target, ())
         return target
+
+    def _validate_delta_target(self, target):
+        from .rolling_delta import validate_target
+
+        if type(target) is not self.target_type:
+            raise ValueError("mixed rolling storage formats")
+        parent = (
+            None
+            if target.parent_generation is None
+            else self._view(self._parent_bytes(target.parent_generation))
+        )
+        return validate_target(
+            target,
+            parent,
+            self.store,
+            self.session_id,
+            self.settings,
+            policy=self.policy,
+            memo=self._memo,
+            guard=self._check,
+        )
 
     def _validate_known(self, target, parent, recorded, delta):
         """Same verdict as a full validation of a target already validated in scope.
@@ -747,7 +832,7 @@ class RollingJournal:
         return encode_json(
             {
                 "format": FORMAT,
-                "version": VERSION,
+                "version": 2 if self.schema_version == 3 else VERSION,
                 "session_id": self.session_id,
                 "settings_digest": self.settings.digest,
                 "generation_id": view.generation_id,

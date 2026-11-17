@@ -1,7 +1,9 @@
 # Delta-only rolling storage contract (#26)
 
-Status: approved design, implementation in progress. This document specifies
-storage, not provider compatibility, summary accuracy, activation or release.
+Status: implemented experimental storage, subject to development integration
+verification. Maximum-cap cold-open performance remains unmet; activation and
+release are not approved. This document specifies storage, not provider
+compatibility or summary accuracy.
 
 ## Versions and immutable meaning
 

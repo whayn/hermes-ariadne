@@ -11,6 +11,7 @@ import json
 import math
 import threading
 from collections import OrderedDict
+from collections.abc import Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields, replace
@@ -761,6 +762,8 @@ def validate_target_prefix(
 
 @dataclass(frozen=True)
 class RollingView:
+    """Validated view; coverage is a tuple (legacy) or immutable Segments (delta)."""
+
     snapshot_bytes: bytes
     generation_id: str
     session_id: str
@@ -768,8 +771,8 @@ class RollingView:
     sequence: int
     parent_generation: str | None
     parent_summary_sha256: str | None
-    event_ids: tuple[str, ...]
-    message_uids: tuple[str, ...]
+    event_ids: Sequence[str]
+    message_uids: Sequence[str]
     frontier_count: int
     prefix_sha256: str
     delta_start: int
@@ -794,6 +797,11 @@ def generation_bytes(
     target: Target, summary_text: str, *, sequence: int, settings: RollingSettings | None = None
 ) -> bytes:
     settings = settings or RollingSettings()
+    from .rolling_delta import DeltaTarget
+    from .rolling_delta import generation_bytes as delta_bytes
+
+    if type(target) is DeltaTarget:
+        return delta_bytes(target, summary_text, sequence=sequence, settings=settings)
     bounded_text(summary_text, settings.max_summary_bytes)
     if type(sequence) is not int or sequence <= 0:
         raise ValueError("positive generation sequence required")
@@ -835,6 +843,25 @@ def _generation_matches(view, target, summary_text):
     instead of re-encoding the whole prefix. ``summary_text`` must already equal
     ``view.summary_text`` (so generation_bytes' own text bound cannot fail).
     """
+    from .rolling_delta import DeltaTarget
+
+    if type(target) is DeltaTarget:
+        return (
+            view.session_id == target.session_id
+            and view.settings_digest == target.settings_digest
+            and view.parent_generation == target.parent_generation
+            and view.parent_summary_sha256 == target.parent_summary_sha256
+            and getattr(view.event_ids, "delta", None) == target.delta_event_ids
+            and getattr(view.message_uids, "delta", None) == target.delta_message_uids
+            and view.frontier_count == target.delta_stop
+            and view.delta_start == target.delta_start
+            and view.delta_stop == target.delta_stop
+            and view.prefix_sha256 == target.prefix_sha256
+            and view.summary_text == summary_text
+            and view.summary_sha256 == sha256(summary_text.encode())
+            and view.summary_input_sha256 == target.readable_input_digest
+            and view.job_id == target.job_id
+        )
     return (
         view.session_id == target.session_id
         and view.settings_digest == target.settings_digest
@@ -905,8 +932,15 @@ class RollingVerificationCache:
         self._weight = 0
 
     @staticmethod
-    def scope_key(store, session_id, settings_digest, policy):
-        return (str(store.path.absolute()), session_id, settings_digest, type(policy), policy)
+    def scope_key(store, session_id, settings_digest, policy, storage_version=1):
+        return (
+            str(store.path.absolute()),
+            session_id,
+            settings_digest,
+            type(policy),
+            policy,
+            storage_version,
+        )
 
     def _bind(self, scope):
         if scope != self._scope:
@@ -958,6 +992,10 @@ def _share(known, tuples):
     canonical bytes it was parsed from) carries over to the rebuilt object.
     """
     target = known.target
+    from .rolling_delta import DeltaTarget
+
+    if type(target) is DeltaTarget:
+        return known
     shared = {}
     for name in ("event_ids", "message_uids"):
         sequence = getattr(target, name)
@@ -1015,6 +1053,7 @@ class _ValidationMemo:
         self.targets = {}
         # Bound on first validation, or up front by a journal (its settings).
         self.settings_digest: str | None = settings_digest
+        self.storage_version = 1
         # generation_id -> (view, _PrefixState) recorded only by a completed
         # validation of that exact view object; see validate_generation.
         self.prefix_states = {}
@@ -1060,7 +1099,7 @@ class _ValidationMemo:
         if self.cache is None or self.settings_digest is None:
             return None
         return RollingVerificationCache.scope_key(
-            self.store, self.session_id, self.settings_digest, self.policy
+            self.store, self.session_id, self.settings_digest, self.policy, self.storage_version
         )
 
     def known_generation(self, generation_id):
@@ -1412,8 +1451,8 @@ def validate_generation(
         # Equal to tuple(events)/tuple(uids) (the lineage check above compared the
         # prefix with the parent's), but shares the parent's validated strings, so
         # a chain retains each source identity once rather than once per generation.
-        value["event_ids"] = parent.event_ids + tuple(events[start:])
-        value["message_uids"] = parent.message_uids + tuple(uids[start:])
+        value["event_ids"] = tuple(parent.event_ids) + tuple(events[start:])
+        value["message_uids"] = tuple(parent.message_uids) + tuple(uids[start:])
     return accept(value, delta_identities, parent_state, length)
 
 
@@ -1456,7 +1495,11 @@ def revalidate_view(
             return checked
     if type(view) is not RollingView:
         raise ValueError("trusted rolling view required")
-    checked = validate_generation(
+    from .rolling_delta import Segments
+    from .rolling_delta import validate_generation as delta_validate
+
+    validator = delta_validate if isinstance(view.event_ids, Segments) else validate_generation
+    checked = validator(
         view.snapshot_bytes,
         store,
         session_id,

@@ -440,6 +440,7 @@ class RollingAriadneEngine(AriadneEngine):
             policy=scope.policy,
             guard=lambda: self._guard(scope),
             cache=self._verification,
+            storage_version=3,
         ) as journal:
             yield journal
 
@@ -630,6 +631,7 @@ class RollingAriadneEngine(AriadneEngine):
                     if target is None:
                         self._note(logging.INFO, "completion skipped", gate="no_target")
                         return
+                    target = journal.encode_target(target, parent)
                     journal.freeze_target(target)
                 active = self._read(scope, False)
                 self._validate_completion(scope, active, observed, coverage)
