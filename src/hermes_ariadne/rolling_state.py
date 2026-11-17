@@ -518,36 +518,50 @@ class RollingJournal:
     def _view(self, data):
         validated = []
         validator = validate_generation
+        proofs = None
         if self.schema_version == 3:
+            from .rolling_delta import _ProofBatch, _SourceProofs
             from .rolling_delta import validate_generation as validator
-        view = validator(
-            data,
-            self.store,
-            self.session_id,
-            self.settings,
-            policy=self.policy,
-            parent_loader=self._parent_bytes,
-            guard=self._check,
-            _validated=validated,
-            _memo=self._memo,
-        )
-        # Reuse the exact bytes/objects already validated, including all ancestors.
-        for current in validated:
-            job, target = self._job(current.job_id)
-            if (
-                job["state"] not in {"ready", "published"}
-                or job["validated_text"] != current.summary_text
-                # Same verdict as comparing generation_bytes(target, text, ...)
-                # with the snapshot, without re-encoding the whole prefix.
-                or not _generation_matches(current, target, job["validated_text"])
-            ):
-                raise ValueError("unjournaled or mismatching generation")
-            # Only ready/published immutable results are accepted for this open.
-            # Supported writes can only move these ready -> published; reservation,
-            # failure, recovery, campaign and lifecycle checks remain fresh.
+
             if self._memo is not None:
-                self._memo.accepted[current.generation_id] = current
-        return view
+                if self._memo.source_proofs is None:
+                    self._memo.source_proofs = _SourceProofs(self._memo)
+                proofs = _ProofBatch(self._memo.source_proofs)
+        try:
+            view = validator(
+                data,
+                self.store,
+                self.session_id,
+                self.settings,
+                policy=self.policy,
+                parent_loader=self._parent_bytes,
+                guard=self._check,
+                _validated=validated,
+                _memo=self._memo,
+                **({"_proofs": proofs} if proofs is not None else {}),
+            )
+            # Reuse the exact bytes/objects already validated, including all ancestors.
+            for current in validated:
+                job, target = self._job(current.job_id)
+                if (
+                    job["state"] not in {"ready", "published"}
+                    or job["validated_text"] != current.summary_text
+                    # Same verdict as comparing generation_bytes(target, text, ...)
+                    # with the snapshot, without re-encoding the whole prefix.
+                    or not _generation_matches(current, target, job["validated_text"])
+                ):
+                    raise ValueError("unjournaled or mismatching generation")
+                # Only ready/published immutable results are accepted for this open.
+                # Supported writes can only move these ready -> published; reservation,
+                # failure, recovery, campaign and lifecycle checks remain fresh.
+                if self._memo is not None:
+                    self._memo.accepted[current.generation_id] = current
+                    if proofs is not None:
+                        proofs.accept(current, target)
+            return view
+        finally:
+            if proofs is not None:
+                proofs.clear()
 
     @property
     def target_type(self):

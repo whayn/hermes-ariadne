@@ -4,6 +4,7 @@ Storage identities are new. No provider or host imports and no persisted hash st
 """
 
 import hashlib
+import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
 from functools import cached_property
@@ -11,6 +12,148 @@ from functools import cached_property
 from . import rolling as r
 
 VERSION = 2
+
+# Optimization limits, not settings or durable identity inputs. They cover
+# staged AND accepted input bytes/records; pressure only selects full validation.
+_PROOF_BYTES = 16 * 1024 * 1024
+_PROOF_RECORDS = 256
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceProof:
+    view: object
+    parent_state: object
+    readable_input: bytes
+
+
+class _ProofBatch:
+    """One generation walk's candidates, not yet journal-accepted evidence."""
+
+    def __init__(self, owner):
+        self.owner, self.pending = owner, {}
+
+    def stage(self, view, parent_state, readable_input):
+        owner = self.owner
+        if (
+            owner.records >= _PROOF_RECORDS
+            or owner.input_bytes + len(readable_input) > _PROOF_BYTES
+        ):
+            owner.pressure += 1
+            return
+        self.pending[view.generation_id] = _SourceProof(view, parent_state, readable_input)
+        owner.records += 1
+        owner.input_bytes += len(readable_input)
+
+    def accept(self, view, target):
+        proof = self.pending.pop(view.generation_id, None)
+        if proof is None:
+            return
+        owner, memo = self.owner, self.owner.memo()
+        if (
+            memo is not None
+            and owner.in_scope(memo, memo.store, memo.session_id, memo.settings_digest, memo.policy)
+            and memo.accepted.get(view.generation_id) is view
+            and proof.view is view
+            and proof.readable_input == target.readable_input
+        ):
+            previous = owner.accepted.get(target.target_id)
+            if previous is not None:
+                owner.release(previous)
+            # Borrow the already-owned immutable target bytes after exact
+            # comparison, but conservatively keep counting their full length.
+            owner.accepted[target.target_id] = _SourceProof(
+                view, proof.parent_state, target.readable_input
+            )
+        else:
+            owner.release(proof)
+
+    def clear(self):
+        for proof in self.pending.values():
+            self.owner.release(proof)
+        self.pending.clear()
+
+
+class _SourceProofs:
+    """Bounded generation -> target evidence, owned by exactly one open's memo.
+
+    No source payloads, identity sets or full-prefix copies. Parent states and
+    delta segments are borrowed from already-owned views. Not a cross-open cache
+    and never an authority for job state, dispatch, recovery or publication.
+    """
+
+    def __init__(self, memo):
+        self.memo = weakref.ref(memo)
+        self.store, self.session, self.settings, self.policy = (
+            memo.store,
+            memo.session_id,
+            memo.settings_digest,
+            memo.policy,
+        )
+        self.index = memo.identities
+        self.accepted = {}
+        self.records = self.input_bytes = self.hits = self.misses = self.pressure = 0
+
+    def in_scope(self, memo, store, session, settings, policy):
+        return (
+            self.memo() is memo
+            and memo.source_proofs is self
+            and self.store is store is memo.store
+            and self.session == session == memo.session_id
+            and self.settings == settings == memo.settings_digest
+            and self.policy is policy is memo.policy
+            and self.index is memo.identities
+        )
+
+    def release(self, proof):
+        self.records -= 1
+        self.input_bytes -= len(proof.readable_input)
+
+    def find(self, target, parent, memo, store, session, settings, policy):
+        self.misses += 1
+        if not self.in_scope(memo, store, session, settings.digest, policy) or memo.bound is None:
+            return None
+        proof = self.accepted.get(target.target_id)
+        if proof is None:
+            return None
+        view = proof.view
+        recorded = memo.prefix_states.get(view.generation_id)
+        if (
+            memo.accepted.get(view.generation_id) is not view
+            or recorded is None
+            or recorded[0] is not view
+            or not recorded[1].extends(view)
+            or not r._generation_matches(view, target, view.summary_text)
+            or target.readable_input != proof.readable_input
+            or (memo.cache is not None and view.generation_id not in memo.deltas)
+        ):
+            return None
+        if parent is None:
+            if proof.parent_state is not None or view.parent_generation is not None:
+                return None
+        else:
+            state = memo.prefix_states.get(parent.generation_id)
+            if (
+                parent.generation_id not in memo.bound
+                or memo.accepted.get(parent.generation_id) is not parent
+                or state is None
+                or state[0] is not parent
+                or state[1] is not proof.parent_state
+                or not state[1].extends(parent)
+            ):
+                return None
+        self.misses -= 1
+        self.hits += 1
+        return proof
+
+    def stats(self):
+        return {
+            "records": self.records,
+            "input_bytes": self.input_bytes,
+            "accepted": len(self.accepted),
+            "hits": self.hits,
+            "misses": self.misses,
+            "pressure": self.pressure,
+        }
 
 
 class Segments(Sequence):
@@ -313,6 +456,7 @@ def validate_generation(
     _depth=0,
     _validated=None,
     _memo=None,
+    _proofs=None,
 ):
     if _depth >= settings.max_logical_jobs:
         raise ValueError("generation lineage exceeds campaign bound")
@@ -357,6 +501,7 @@ def validate_generation(
             _depth=_depth + 1,
             _validated=_validated,
             _memo=memo,
+            _proofs=_proofs,
         )
         if memo.bound is not None:
             memo.bound.add(parent_id)
@@ -494,12 +639,10 @@ def validate_generation(
         raise ValueError("generation source unavailable or changed")
     identities = r._check_prefix_extension(state, source, delta_uids, payloads, settings)
     readable = r._render_delta(source, delta_events, payloads, settings)
-    if (
-        r.sha256(
-            r._summary_input(None if parent is None else parent.summary_text, readable, settings)
-        )
-        != value["summary_input_sha256"]
-    ):
+    expected_input = r._summary_input(
+        None if parent is None else parent.summary_text, readable, settings
+    )
+    if r.sha256(expected_input) != value["summary_input_sha256"]:
         raise ValueError("summary input hash mismatch")
     if r.encode_json(value, settings.max_checkpoint_bytes) != snapshot_bytes:
         raise ValueError("noncanonical generation bytes")
@@ -517,6 +660,8 @@ def validate_generation(
         memo.deltas[digest] = identities
     if _validated is not None:
         _validated.append(view)
+    if _proofs is not None:
+        _proofs.stage(view, None if parent is None else state, expected_input)
     return view
 
 
@@ -535,6 +680,21 @@ def validate_target(target, parent, store, session_id, settings, *, policy, memo
         )
         r._check_known_extension(state, len(target.delta_event_ids), known.delta, settings)
         memo.record_target(target, known.delta)
+        return target
+    proof = (
+        None
+        if memo.source_proofs is None
+        else memo.source_proofs.find(target, parent, memo, store, session_id, settings, policy)
+    )
+    if proof is not None:
+        # Same capture cadence as source traversal; no new source copy or
+        # canonicalization. Parent binding was independently refreshed above.
+        for _ in target.delta_event_ids:
+            guard()
+            guard()
+        target.to_bytes(settings)
+        if memo.cache is not None:
+            memo.record_target(target, memo.deltas[proof.view.generation_id])
         return target
     source = []
     for event in target.delta_event_ids:

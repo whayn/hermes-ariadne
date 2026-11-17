@@ -1011,9 +1011,12 @@ class _ValidationMemo:
 
     Scoped to one (store, session, reasoning policy); validate_generation rejects
     a memo whose scope differs from the call's. ``rows`` is a snapshot of the
-    insert-only archive for this open and only avoids repeated reads: every row
-    use still re-verifies its hash, message_uid and session, and callers receive
-    independent copies. Direct archive mutation within an open is unsupported;
+    insert-only archive for this open and avoids repeated reads: row fetches
+    re-verify hash, message_uid and session and return independent copies.
+    Schema-3 journals may reuse a completed generation's canonical source verdict
+    for its exact frozen target and identical parent state (``source_proofs``),
+    within explicit byte/record bounds and never across opens.
+    Direct archive mutation within an open is unsupported;
     the next open (a new memo) rereads and detects it. Settings bind on first use.
     ``accepted`` holds views the journal itself already cross-checked (see
     RollingJournal._view); validate_generation only reads it. Keys are the SHA-256
@@ -1048,6 +1051,9 @@ class _ValidationMemo:
         # this open. The payload is still reread and hashed on every use; only the
         # decode/canonical/identity work on bytes already verified is reused.
         self.targets = {}
+        # Schema-3 journal-owned source evidence for this open only. Never
+        # promoted; raw validators do not create it. See rolling_delta.
+        self.source_proofs = None
         # Bound on first validation, or up front by a journal (its settings).
         self.settings_digest: str | None = settings_digest
         self.storage_version = 1

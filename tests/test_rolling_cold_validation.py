@@ -1,4 +1,4 @@
-"""Cold delta startup must not repeat ancestor walks (#19, slices A/B only)."""
+"""Cold delta startup bounds ancestor walks and completed source validation (#19)."""
 
 from collections import Counter
 from contextlib import contextmanager
@@ -129,5 +129,5 @@ def test_cold_delta_startup_binds_each_ancestor_once_per_audit(
     assert costs["owned"] and all(costs["owned"])
     assert set(costs["sources"]) == set(successor.event_ids)
     assert set(costs["sources"].values()) == {1}
-    # Canonical-delta sharing is deliberately NOT part of this slice.
-    assert sum(costs["canonical"].values()) == 4 * count + 2
+    # Completed generation -> target sharing; the pending delta is checked once.
+    assert sum(costs["canonical"].values()) == 2 * (count + 1)
