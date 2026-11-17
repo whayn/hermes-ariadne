@@ -29,7 +29,16 @@ The completed generation's extension verdict is reused only against that identic
 validated lineage and delta. This is not a generic row cache, a dispatch permission,
 or a replacement for journal accounting/recovery checks. Every generation artifact
 is still enumerated; every new open still verifies all referenced archive sources.
-Supported source writes remain insert-only. Direct SQL mutation during an open
+Target-source validation does not attest the target's own generated output file:
+neither the old full checker nor this shortcut reads that file just to validate
+the unchanged frozen source target. Loading the generated view, binding it as a
+descendant's parent, and startup enumeration retain their existing fresh artifact
+checks. Completed source evidence does not make a changed output artifact usable.
+The [public-boundary full/optimized reproduction](https://github.com/whayn/hermes-ariadne/pull/40#discussion_r4601164896)
+confirms both accept the unchanged frozen target, deny another reservation for its
+published job, and refuse the changed generation on load or a new open with the
+same exception. Its actual output is also in the machine evidence.
+Supported source writes remain insert-only. Direct SQL mutation within an open
 remains outside the existing snapshot contract; the next open detects it.
 
 No serializer, schema/artifact version, settings digest, durable identity, source
@@ -89,8 +98,39 @@ Affected validation/storage/identity/recovery/migration and benchmark suites:
 **337 passed in 115.37 s**. Ruff check/format and diff checks passed. Eight isolated
 mutants were killed: acceptance, exact input, parent state, scope, record bound,
 byte bound, capture and pending cleanup. Mutant imports were verified to use their
-isolated source copies; the real runtime source remained unchanged. Final pinned
-suite/installed-host/package evidence is tracked separately in the PR.
+isolated source copies; the real runtime source remained unchanged.
+
+### Final frozen integration and packaging
+
+The canonical pinned-host suite on `69aae948eff478a83141f7032781b0282e661ffe`
+(the evidence-doc commit, with runtime/tests unchanged from `2dc3357`) returned
+**3,830 passed, 2 skipped in 908.84 s**. The skips were HTTPX's optional zstandard
+coverage (dependency absent) and the opt-in native tracer. The tracer was then
+exercised separately from a wheel installed outside the checkout:
+
+- Native schema-3 installed restart: **1 passed in 27.01 s**.
+- Actual old-wheel publication -> explicit offline migration -> newly installed
+  plugin -> fresh-process restart: **1 passed in 27.00 s**.
+
+Both routes use the pinned Hermes source and disposable OpenAI 2.24.0 / HTTPX
+0.28.1 SDK environment, exercise two automatic advances and restart, and verify
+canonical originals/accounting through the independent native tracer. They are
+synthetic scripted-provider mechanics, not real-model recall evidence. The
+optional zstandard branch remains unexercised.
+
+Wheel and sdist builds passed. Byte audits matched all **26 source Python modules**
+against the wheel, sdist and installed package, all **19 runtime files** in each
+native/migrated installed profile, and LICENSE/NOTICE against frozen source.
+The first scratch audit runner failed because it assumed the runtime allowlist
+was an AST literal; after handling its inspected static dict comprehension, the
+audit passed without production changes. That runner failure is not counted as
+a successful audit or a failed plugin test.
+
+Hosted CI run [44104073400](https://github.com/whayn/hermes-ariadne/actions/runs/44104073400)
+passed on the same frozen head: Quality, Secrets, Hermes integration and archive
+Python 3.11/3.14. PR conventions were skipped on manual stacked dispatch. Later
+review-clarification documentation does not change the measured/tested runtime;
+the tested SHA above remains explicit.
 
 ## Sequential checkpoint campaign
 
@@ -117,6 +157,13 @@ Every cold and warm source-check count equals the fixture's event count.
 ### Three-repetition native checkpoints
 
 Seconds; cold cells are median [minimum–maximum], warm cells are medians.
+
+**Fixed-order limitation:** every repetition and control ran baseline before
+sharing. Identical fixtures and sequential execution do not control OS-cache,
+thermal or clock-frequency order effects. These samples do not establish whether
+that order biased the timings or in which direction. A future comparison should
+alternate or randomize variant order and record it; the historical launcher and
+observed timings below are unchanged.
 
 | Events | Baseline cold | Sharing cold | Baseline warm | Sharing warm |
 | ---: | ---: | ---: | ---: | ---: |

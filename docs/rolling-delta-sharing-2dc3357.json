@@ -26,6 +26,57 @@
       ""
     ]
   },
+  "final_verification": {
+    "complete": true,
+    "head": "69aae948eff478a83141f7032781b0282e661ffe",
+    "package_audit": {
+      "license_notice_match": true,
+      "module_sha256": {
+        "__init__.py": "beb8fb68c691ee94807d8ff4ff87cf9098c0eeda5d597e938cdcbad7d0fe989f",
+        "_host_site.py": "86e1424d82e2384ef9da4589adafa5febf91317b1a5f0bba2fd5808b82cb4ac8",
+        "compaction.py": "864f926292124306a9b5f8867a3158c34687d4c7d6fd1844e3a6e34034c444c3",
+        "compactor_demo.py": "b01d00215ff65ae4da43faad07f76d70d98bcb550b80087a72c7e4ab02a41956",
+        "demo.py": "a74fcc2eaede86db3e95cb2cfb06e7d5db736d6537699a260f7b9d4962b926d7",
+        "engine.py": "11ba39e7dfa9f565a318eeeab8431aae66be8b1af2f88c0f5abf2e5cb6ec26fa",
+        "install.py": "eb8849b24aa7795e838238360c9b54c447c254909b1358cfece487fb36fd779a",
+        "kernel.py": "a800fd864650fc1c4e750fa7b1b1f1a80954caad9aacd7ec8e0577f37677721b",
+        "live_engine.py": "3687c165726961bbbcfa8c37bc6261e8a00c1f5428ed813c5c9023bb37b7080f",
+        "native_compactor.py": "afb57ba18345014151d1f29135ba84a695dfe6b4d975e9a0e5f7c9e643f0ac52",
+        "prepared.py": "f178614da40f7291b28950783be70867b1640484daf6bd07be7d65b8815bace2",
+        "prepared_entry.py": "746f2e2e7f9646c9f84a88ee7afdd03aa15f9a1ee2a1690748858c2faec96485",
+        "receipts.py": "447382aada9350aeff5915639c90094fa5da4fa768ac1988c43d5953a0c26bf3",
+        "retrieval.py": "f2ef2e289243ce81e1164a5ca97807ce70e89b514dcff5fd330d8a2cc0ea9f6a",
+        "rolling.py": "ffd7d7d4d1d3453db0638ff0b0019eab2b3586918cac2f8331bd5b619d97deba",
+        "rolling_delta.py": "1970c0a56f7e17322fab7b1c5d7b75f1560a2dd56b186220cceea4d7fd4e72ce",
+        "rolling_engine.py": "c8b88a27ea5e80eaabfbeba62f860e0ec5f50e33f51e3bcd00dfd6ee654278cc",
+        "rolling_entry.py": "f2b4873276006fb6476ce018df6c1ba76472843106ab91ebd4913c40a624d709",
+        "rolling_migrate.py": "6147224d7fde3f925431ceb1bab66fa5f3b0924aec810546f311258ce9fc671b",
+        "rolling_retrieval.py": "d3b35df997e12c171a511442ff350f496a6f7181d4eaeedfab7d3a20a41b4924",
+        "rolling_selection.py": "e79401cb9391be4187fea916b58eb5e2f8fd31083d2d3d0102be8d054fbdbb81",
+        "rolling_state.py": "39499c8a3ac55bfee7c6f635543fa1e4635abd6b5217088dab9164287fcc1103",
+        "simulation.py": "52113d00d51ad927e17f34e37bb0aadf833f810b27ec53cfc9124f2b406e41d8",
+        "sources.py": "ab78ff05fae27df4ab87c34f65fd2584a0db0b0af289bb14afd154329946d940",
+        "store.py": "b55fdd123ecdfffec172752fe55a58a29a2b2563d9ae40444b9c84dab0857c22",
+        "tree.py": "bcb507082ce5e6dac33553f095ddf61f947814f237529c1694b644edaf258e63"
+      },
+      "profiles": {
+        "migrated": [
+          "/opt/data/cache/scratch/ariadne-19-sharing/installed-migrated/test_two_automatic_advances_an0/synthetic-profile/isolated-home/plugins/ariadne-rolling-plugin"
+        ],
+        "native": [
+          "/opt/data/cache/scratch/ariadne-19-sharing/installed-native/test_two_automatic_advances_an0/synthetic-profile/isolated-home/plugins/ariadne-rolling-plugin"
+        ]
+      },
+      "runtime_file_count": 19,
+      "source_modules": 26,
+      "wheel_sdist_install_source_match": true
+    },
+    "summaries": {
+      "full": "3830 passed, 2 skipped in 908.84s (0:15:08)",
+      "migrated": "1 passed in 27.00s",
+      "native": "1 passed in 27.01s"
+    }
+  },
   "fixtures": {
     "legacy-256": {
       "inventory": {
@@ -731,6 +782,42 @@
     },
     "complete": true,
     "fixture_unchanged": true
+  },
+  "review_reproduction": {
+    "artifact_case": {
+      "baseline": {
+        "canonical_calls_during_freeze": 1,
+        "freeze_unchanged_target": "accepted",
+        "load_view": {
+          "message": "generation parent lineage mismatch",
+          "type": "ValueError"
+        },
+        "new_dispatch_permission": false,
+        "new_open": {
+          "message": "generation parent lineage mismatch",
+          "type": "ValueError"
+        },
+        "own_artifact_read_during_freeze": false
+      },
+      "candidate": {
+        "canonical_calls_during_freeze": 0,
+        "freeze_unchanged_target": "accepted",
+        "load_view": {
+          "message": "generation parent lineage mismatch",
+          "type": "ValueError"
+        },
+        "new_dispatch_permission": false,
+        "new_open": {
+          "message": "generation parent lineage mismatch",
+          "type": "ValueError"
+        },
+        "own_artifact_read_during_freeze": false
+      },
+      "conclusion": "Target validation never attested its own generated artifact in the full checker; source evidence does not make the changed artifact usable. Loading it or reopening still refuses.",
+      "same_public_verdicts": true
+    },
+    "public_reproduction": "https://github.com/whayn/hermes-ariadne/pull/40#discussion_r4601164896",
+    "script_sha256": "b020072a90cc4ea3bd237edc9abb8180c48e695b6ec3cd77df7117677067bb09"
   },
   "runs": [
     {
@@ -2040,5 +2127,6 @@
       "size": 256
     }
   ],
-  "schema": 1
+  "schema": 1,
+  "timing_order_limit": "Fixed baseline-first order for every repetition and control; unknown order-dependent bias/direction; future comparisons should alternate or randomize. Historical launchers unchanged."
 }
