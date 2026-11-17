@@ -487,6 +487,17 @@ small-source/deep-generation cases, but its native cap smoke still took 140.416 
 cold. These single-run cap controls do not replace the earlier matrix medians;
 the cold usability gate remains unmet.
 
+A further [completed-delta sharing checkpoint](rolling-delta-sharing.md), runtime
+`2dc3357`, reuses a completed generation's source verdict only for its exact frozen
+target and identical accepted parent state within the same open. Staged/accepted
+evidence is limited to 16 MiB of input payload and 256 records; pressure selects
+the full checker, and no proof is promoted across opens. At 64 generations,
+canonical/render/input-builder calls fell from 128 to 65 while source checks and
+artifact reads stayed unchanged. The native cap cold control was
+139.837 -> 107.999 s, warm 2.330 -> 2.295 s; these are single-run controls, not
+medians or statistical speedup proof. The <=5 s first-open gate still fails.
+There is no serializer/format/identity, reservation/recovery or activation change.
+
 ## Installed-host pilot (#17)
 
 `scripts/rolling_host_pilot.py` drives a long synthetic conversation through real
