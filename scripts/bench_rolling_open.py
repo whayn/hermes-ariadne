@@ -301,6 +301,35 @@ def measure(directory, profile, in_place=False, cache=False):
         reads = {"count": 0, "bytes": 0}
         encoded = {"calls": 0, "bytes": 0}
         read, encode = rolling_state._read, rolling.encode_json
+        work = {
+            "canonical_calls": 0,
+            "canonical_rows": 0,
+            "render_calls": 0,
+            "summary_input_calls": 0,
+        }
+        canonical, render, summary_input = (
+            rolling._canonical_rows,
+            rolling._render_delta,
+            rolling._summary_input,
+        )
+
+        def counting_canonical(rows, **kwargs):
+            work["canonical_calls"] += 1
+            work["canonical_rows"] += len(rows)
+            return canonical(rows, **kwargs)
+
+        def counting_render(*args, **kwargs):
+            work["render_calls"] += 1
+            return render(*args, **kwargs)
+
+        def counting_input(*args, **kwargs):
+            work["summary_input_calls"] += 1
+            return summary_input(*args, **kwargs)
+
+        def proof_stats(journal):
+            # One common harness also runs unchanged older runtime trees.
+            proofs = getattr(journal._memo, "source_proofs", None)
+            return {} if proofs is None else proofs.stats()
 
         def counting_read(path, limit):
             data = read(path, limit)
@@ -317,6 +346,11 @@ def measure(directory, profile, in_place=False, cache=False):
 
         rolling_state._read = counting_read
         rolling.encode_json = rolling_state.encode_json = counting_encode
+        rolling._canonical_rows, rolling._render_delta, rolling._summary_input = (
+            counting_canonical,
+            counting_render,
+            counting_input,
+        )
         try:
             started = time.perf_counter()
             journal = rolling_state.RollingJournal(
@@ -325,6 +359,7 @@ def measure(directory, profile, in_place=False, cache=False):
             open_s = time.perf_counter() - started
             open_reads, open_encoded = dict(reads), dict(encoded)
             open_source_checks = source_checks["count"]
+            open_work, open_proofs = dict(work), proof_stats(journal)
             try:
                 started = time.perf_counter()
                 view = journal.load_view()
@@ -335,12 +370,14 @@ def measure(directory, profile, in_place=False, cache=False):
                 reads.update(count=0, bytes=0)
                 source_checks["count"] = 0
                 encoded.update(calls=0, bytes=0)
+                work.update(dict.fromkeys(work, 0))
                 started = time.perf_counter()
                 journal = rolling_state.RollingJournal(
                     home, SESSION, config, store=store, policy=POLICY, **extra
                 )
                 warm_open_s = time.perf_counter() - started
                 warm_reads, warm_encoded = dict(reads), dict(encoded)
+                warm_work, warm_proofs = dict(work), proof_stats(journal)
                 try:
                     started = time.perf_counter()
                     assert journal.load_view() == view
@@ -350,6 +387,11 @@ def measure(directory, profile, in_place=False, cache=False):
         finally:
             rolling_state._read, rolling.encode_json = read, encode
             rolling_state.encode_json = encode
+            rolling._canonical_rows, rolling._render_delta, rolling._summary_input = (
+                canonical,
+                render,
+                summary_input,
+            )
         result = {
             "command": "measure",
             "source": str(Path(hermes_ariadne.__file__).resolve().parent),
@@ -358,6 +400,8 @@ def measure(directory, profile, in_place=False, cache=False):
             "generations": view.sequence,
             "open_s": round(open_s, 3),
             "open_source_checks": open_source_checks,
+            **{"open_" + key: value for key, value in open_work.items()},
+            "open_source_proofs": open_proofs,
             **stored,
             "open_artifact_reads": open_reads["count"],
             "open_artifact_mib": round(open_reads["bytes"] / 2**20, 2),
@@ -370,6 +414,8 @@ def measure(directory, profile, in_place=False, cache=False):
             result.update(
                 warm_open_s=round(warm_open_s, 3),
                 warm_source_checks=source_checks["count"],
+                **{"warm_" + key: value for key, value in warm_work.items()},
+                warm_source_proofs=warm_proofs,
                 warm_open_artifact_reads=warm_reads["count"],
                 warm_open_encode_json_mib=round(warm_encoded["bytes"] / 2**20, 2),
                 warm_load_view_s=round(warm_load_s, 3),
