@@ -464,7 +464,11 @@ Repeating a completed conversion re-audits the selected schema-3 journal, source
 and artifacts without running startup recovery or changing lifecycle state. Valid
 post-conversion advances remain valid; the original conversion fingerprint is a
 rollback boundary, not a freeze of later activity. Corruption refuses rather than
-reporting a successful conversion.
+reporting a successful conversion. Completed rollback retries likewise audit the
+current schema-2 state without recovering or overwriting valid later activity.
+After rollback, ordinary runtime opens may perform normal SQLite crash recovery,
+but only after rollback metadata and private paths/companions are admitted. Offline
+conversion/rollback audits still refuse nonempty recovery companions.
 
 Rollback streams, hash-checks and fsyncs a private restoration copy before it
 removes the selector. Explicit offline recovery cleans up interrupted `.rollback-*`

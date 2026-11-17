@@ -108,6 +108,60 @@ def test_completed_migration_retry_preserves_valid_later_activity(tmp_path):
     assert inventory(directory) == before
 
 
+def test_completed_rollback_runtime_recovers_a_later_hot_sqlite_journal(tmp_path):
+    import os
+
+    store, settings = setup(tmp_path)
+    with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
+        first = target(store, settings, 1)
+        ready(journal, first, "one")
+        journal.publish_ready(
+            first.job_id, rolling.generation_bytes(first, "one", sequence=1, settings=settings)
+        )
+        directory = journal.directory
+    (tmp_path / ".ariadne-offline-migration").touch(mode=0o600)
+    migration.migrate(tmp_path, "s", settings, store=store)
+    migration.rollback(tmp_path, "s", settings, store=store)
+    before = migration.fingerprint(directory)
+    database = directory / "journal.sqlite3"
+    companion = directory / "journal.sqlite3-journal"
+    pid = os.fork()
+    if pid == 0:
+        try:
+            connection = sqlite3.connect(database)
+            connection.execute("PRAGMA cache_size=1")
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("UPDATE campaign SET logical_reservations=42")
+            connection.execute("CREATE TABLE crash_spill(payload BLOB)")
+            connection.execute("INSERT INTO crash_spill VALUES(zeroblob(1048576))")
+            if companion.stat().st_size <= 512 or companion.read_bytes()[:8] == b"\0" * 8:
+                os._exit(74)
+            os._exit(73)
+        except BaseException:
+            os._exit(75)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 73, "real hot-journal boundary not reached"
+    assert companion.stat().st_size > 512
+    with pytest.raises(ValueError, match="checkpointed"):
+        migration.rollback(tmp_path, "s", settings, store=store)
+    hot_bytes = companion.read_bytes()
+    marker = directory / "rollback.json"
+    held_marker = directory / "held-rollback.json"
+    marker.rename(held_marker)
+    try:
+        with pytest.raises(FileNotFoundError):
+            with rolling_state.RollingJournal(tmp_path, "s", settings, store=store):
+                pass
+        assert companion.read_bytes() == hot_bytes  # No recovery before metadata admission.
+    finally:
+        held_marker.rename(marker)
+    with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
+        assert journal.schema_version == 2
+        assert journal.report()["logical_reservations"] == 1
+    assert migration.fingerprint(directory) == before
+
+
 def test_schema_probe_connection_is_explicitly_closed(tmp_path, monkeypatch):
     store, settings = setup(tmp_path)
     with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:

@@ -173,7 +173,9 @@ class RollingJournal:
                 raise ValueError("rolling session already has a writer") from exc
             from .rolling_migrate import resolve_storage
 
-            selected = resolve_storage(self.directory, self.session_id, self.settings)
+            selected = resolve_storage(
+                self.directory, self.session_id, self.settings, recover_rollback=True
+            )
             if selected != self.directory:
                 self.directory = selected
                 self.path = selected / "journal.sqlite3"

@@ -37,20 +37,24 @@ def _json(path, limit):
     return value, data
 
 
-def _read_db(path):
+def _read_db(path, *, recover=False):
     s._path_check(path, regular=True)
     for suffix in ("-wal", "-shm", "-journal"):
         companion = Path(str(path) + suffix)
         s._path_check(companion, regular=True)
         # The journal writes DELETE-mode transactions. An active recovery journal
         # is not safe for this read-only offline snapshot protocol.
-        if companion.exists() and companion.stat().st_size:
+        if not recover and companion.exists() and companion.stat().st_size:
             raise ValueError("offline migration requires checkpointed journal companions")
     if not path.is_file():
         raise ValueError("missing migration database")
-    conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0)
+    # Only the completed-rollback runtime probe opts into normal SQLite recovery.
+    # Every offline audit keeps the strict read-only, checkpointed default.
+    mode = "rw" if recover else "ro"
+    conn = sqlite3.connect(path.as_uri() + "?mode=" + mode, uri=True, timeout=0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA query_only=ON")
+    if not recover:
+        conn.execute("PRAGMA query_only=ON")
     return conn
 
 
@@ -142,7 +146,7 @@ def _immutable_metadata(path, value):
         s._atomic(path, data)
 
 
-def resolve_storage(root, session_id, settings):
+def resolve_storage(root, session_id, settings, *, recover_rollback=False):
     """Caller owns ROOT/writer.lock. Never initializes or resumes migration."""
     markers = (
         "v3",
@@ -169,7 +173,7 @@ def resolve_storage(root, session_id, settings):
         _require_metadata(root / "rollback.json", _rollback_marker(session_id, settings, digest))
         if (root / "storage.json").exists():
             raise ValueError("incomplete rollback")
-        with closing(_read_db(root / "journal.sqlite3")) as conn:
+        with closing(_read_db(root / "journal.sqlite3", recover=recover_rollback)) as conn:
             if conn.execute("PRAGMA user_version").fetchone()[0] != 2:
                 raise ValueError("incomplete rollback schema fence")
         return root
