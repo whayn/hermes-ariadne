@@ -11,6 +11,7 @@ import json
 import math
 import threading
 from collections import OrderedDict
+from collections.abc import Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields, replace
@@ -761,6 +762,8 @@ def validate_target_prefix(
 
 @dataclass(frozen=True)
 class RollingView:
+    """Validated view; coverage is a tuple (legacy) or immutable Segments (delta)."""
+
     snapshot_bytes: bytes
     generation_id: str
     session_id: str
@@ -768,8 +771,8 @@ class RollingView:
     sequence: int
     parent_generation: str | None
     parent_summary_sha256: str | None
-    event_ids: tuple[str, ...]
-    message_uids: tuple[str, ...]
+    event_ids: Sequence[str]
+    message_uids: Sequence[str]
     frontier_count: int
     prefix_sha256: str
     delta_start: int
@@ -1448,8 +1451,8 @@ def validate_generation(
         # Equal to tuple(events)/tuple(uids) (the lineage check above compared the
         # prefix with the parent's), but shares the parent's validated strings, so
         # a chain retains each source identity once rather than once per generation.
-        value["event_ids"] = parent.event_ids + tuple(events[start:])
-        value["message_uids"] = parent.message_uids + tuple(uids[start:])
+        value["event_ids"] = tuple(parent.event_ids) + tuple(events[start:])
+        value["message_uids"] = tuple(parent.message_uids) + tuple(uids[start:])
     return accept(value, delta_identities, parent_state, length)
 
 

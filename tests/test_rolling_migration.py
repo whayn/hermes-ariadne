@@ -444,7 +444,11 @@ def test_cli_conversion_uses_an_explicit_existing_home(tmp_path):
     import os
     import subprocess
     import sys
+    from pathlib import Path
 
+    package_site = str(Path(rolling.__file__).resolve().parent.parent)
+    child_env = dict(os.environ)
+    child_env["PYTHONPATH"] = os.pathsep.join([package_site, child_env.get("PYTHONPATH", "")])
     store, settings = setup(tmp_path)
     with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
         old = target(store, settings, 1)
@@ -465,7 +469,7 @@ def test_cli_conversion_uses_an_explicit_existing_home(tmp_path):
         ],
         capture_output=True,
         text=True,
-        env=dict(os.environ),
+        env=child_env,
     )
     assert run.returncode == 0, run.stderr
     assert (directory / "storage.json").is_file(), run.stdout

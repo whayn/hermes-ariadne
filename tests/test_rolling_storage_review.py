@@ -40,8 +40,9 @@ def test_uncached_pending_delta_returns_bound_coverage(tmp_path, with_parent, af
         assert pending.request_bytes == expected.request_bytes
 
 
+@pytest.mark.parametrize("action", ["migrate", "rollback"])
 @pytest.mark.parametrize("damage", ["accounting", "source", "artifact"])
-def test_completed_migration_retry_reaudits_selected_state(tmp_path, damage):
+def test_completed_migration_retry_reaudits_selected_state(tmp_path, damage, action):
     from test_rolling_storage_legacy import inventory
 
     store, settings = setup(tmp_path)
@@ -54,8 +55,11 @@ def test_completed_migration_retry_reaudits_selected_state(tmp_path, damage):
         directory = journal.directory
     (tmp_path / ".ariadne-offline-migration").touch(mode=0o600)
     receipt = migration.migrate(tmp_path, "s", settings, store=store)
+    if action == "rollback":
+        migration.rollback(tmp_path, "s", settings, store=store)
+    selected = directory / "v3" if action == "migrate" else directory
     if damage == "accounting":
-        with closing(sqlite3.connect(directory / "v3" / "journal.sqlite3")) as connection:
+        with closing(sqlite3.connect(selected / "journal.sqlite3")) as connection:
             with connection:
                 connection.execute("UPDATE campaign SET logical_reservations=42")
     elif damage == "source":
@@ -66,16 +70,16 @@ def test_completed_migration_retry_reaudits_selected_state(tmp_path, damage):
                     (b"{}", first.event_ids[0]),
                 )
     else:
-        path = (
-            directory
-            / "v3"
-            / "generations"
-            / (receipt["generations"][view.generation_id] + ".json")
+        generation = (
+            receipt["generations"][view.generation_id]
+            if action == "migrate"
+            else view.generation_id
         )
+        path = selected / "generations" / (generation + ".json")
         path.write_bytes(b"{}")
     before = inventory(directory)
     with pytest.raises(ValueError):
-        migration.migrate(tmp_path, "s", settings, store=store)
+        getattr(migration, action)(tmp_path, "s", settings, store=store)
     assert inventory(directory) == before
 
 

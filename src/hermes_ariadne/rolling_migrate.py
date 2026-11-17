@@ -625,6 +625,8 @@ def rollback(home, session_id, settings, *, store, policy=None):
             )
             if (root / "rollback.json").exists() and version == 2:
                 resolve_storage(root, session_id, settings)
+                with audit(root, root_home, session_id, settings, store, policy):
+                    pass
                 _sync(root)
                 return receipt  # Already restored; never overwrite subsequent legacy activity.
         else:

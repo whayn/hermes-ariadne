@@ -201,7 +201,9 @@ re-test before re-enabling; the installer deliberately has no force-overwrite.
 The wheel environment can be removed independently; the installed directory is
 self-contained and has only Hermes/stdlib runtime imports. Archive backups must
 use SQLite's backup API or be made with all writers stopped (do not copy only the
-main DB while WAL writes are active). No backup/export/migration CLI is shipped.
+main DB while WAL writes are active). No archive backup/export/migration CLI is
+shipped. The separate rolling journal has an explicit offline schema conversion
+and rollback command; see [rolling storage](docs/rolling-context.md#delta-only-storage-and-explicit-conversion-26).
 
 ## Reliability, privacy and limitations
 
