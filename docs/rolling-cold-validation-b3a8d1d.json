@@ -1,0 +1,1539 @@
+{
+  "aggregate": [
+    {
+      "cache_retained_mib": {
+        "maximum": 0.6,
+        "median": 0.6,
+        "minimum": 0.6
+      },
+      "events": 256,
+      "kind": "legacy",
+      "maxrss_mib": {
+        "maximum": 37.0,
+        "median": 37.0,
+        "minimum": 37.0
+      },
+      "mode": "baseline",
+      "open_artifact_mib": {
+        "maximum": 1.95,
+        "median": 1.95,
+        "minimum": 1.95
+      },
+      "open_artifact_reads": {
+        "maximum": 191,
+        "median": 191,
+        "minimum": 191
+      },
+      "open_encode_json_calls": {
+        "maximum": 2184,
+        "median": 2184,
+        "minimum": 2184
+      },
+      "open_encode_json_mib": {
+        "maximum": 2.44,
+        "median": 2.44,
+        "minimum": 2.44
+      },
+      "open_s": {
+        "maximum": 0.677,
+        "median": 0.677,
+        "minimum": 0.677
+      },
+      "repetitions": 1,
+      "warm_open_artifact_reads": {
+        "maximum": 191,
+        "median": 191,
+        "minimum": 191
+      },
+      "warm_open_s": {
+        "maximum": 0.188,
+        "median": 0.188,
+        "minimum": 0.188
+      }
+    },
+    {
+      "cache_retained_mib": {
+        "maximum": 0.6,
+        "median": 0.6,
+        "minimum": 0.6
+      },
+      "events": 256,
+      "kind": "legacy",
+      "maxrss_mib": {
+        "maximum": 36.8,
+        "median": 36.8,
+        "minimum": 36.8
+      },
+      "mode": "binding",
+      "open_artifact_mib": {
+        "maximum": 1.95,
+        "median": 1.95,
+        "minimum": 1.95
+      },
+      "open_artifact_reads": {
+        "maximum": 191,
+        "median": 191,
+        "minimum": 191
+      },
+      "open_encode_json_calls": {
+        "maximum": 2184,
+        "median": 2184,
+        "minimum": 2184
+      },
+      "open_encode_json_mib": {
+        "maximum": 2.44,
+        "median": 2.44,
+        "minimum": 2.44
+      },
+      "open_s": {
+        "maximum": 0.664,
+        "median": 0.664,
+        "minimum": 0.664
+      },
+      "repetitions": 1,
+      "warm_open_artifact_reads": {
+        "maximum": 191,
+        "median": 191,
+        "minimum": 191
+      },
+      "warm_open_s": {
+        "maximum": 0.174,
+        "median": 0.174,
+        "minimum": 0.174
+      }
+    },
+    {
+      "cache_retained_mib": {
+        "maximum": 103.8,
+        "median": 103.8,
+        "minimum": 103.8
+      },
+      "events": 100000,
+      "kind": "migrated",
+      "maxrss_mib": {
+        "maximum": 419.3,
+        "median": 419.3,
+        "minimum": 419.3
+      },
+      "mode": "baseline",
+      "open_artifact_mib": {
+        "maximum": 256.87,
+        "median": 256.87,
+        "minimum": 256.87
+      },
+      "open_artifact_reads": {
+        "maximum": 2207,
+        "median": 2207,
+        "minimum": 2207
+      },
+      "open_encode_json_calls": {
+        "maximum": 307791,
+        "median": 307791,
+        "minimum": 307791
+      },
+      "open_encode_json_mib": {
+        "maximum": 418.57,
+        "median": 418.57,
+        "minimum": 418.57
+      },
+      "open_s": {
+        "maximum": 142.135,
+        "median": 142.135,
+        "minimum": 142.135
+      },
+      "repetitions": 1,
+      "warm_open_artifact_reads": {
+        "maximum": 191,
+        "median": 191,
+        "minimum": 191
+      },
+      "warm_open_s": {
+        "maximum": 2.43,
+        "median": 2.43,
+        "minimum": 2.43
+      }
+    },
+    {
+      "cache_retained_mib": {
+        "maximum": 103.8,
+        "median": 103.8,
+        "minimum": 103.8
+      },
+      "events": 100000,
+      "kind": "migrated",
+      "maxrss_mib": {
+        "maximum": 418.6,
+        "median": 418.6,
+        "minimum": 418.6
+      },
+      "mode": "binding",
+      "open_artifact_mib": {
+        "maximum": 22.25,
+        "median": 22.25,
+        "minimum": 22.25
+      },
+      "open_artifact_reads": {
+        "maximum": 191,
+        "median": 191,
+        "minimum": 191
+      },
+      "open_encode_json_calls": {
+        "maximum": 301857,
+        "median": 301857,
+        "minimum": 301857
+      },
+      "open_encode_json_mib": {
+        "maximum": 415.44,
+        "median": 415.44,
+        "minimum": 415.44
+      },
+      "open_s": {
+        "maximum": 137.609,
+        "median": 137.609,
+        "minimum": 137.609
+      },
+      "repetitions": 1,
+      "warm_open_artifact_reads": {
+        "maximum": 128,
+        "median": 128,
+        "minimum": 128
+      },
+      "warm_open_s": {
+        "maximum": 2.279,
+        "median": 2.279,
+        "minimum": 2.279
+      }
+    },
+    {
+      "cache_retained_mib": {
+        "maximum": 0.5,
+        "median": 0.5,
+        "minimum": 0.5
+      },
+      "events": 256,
+      "kind": "native",
+      "maxrss_mib": {
+        "maximum": 34.0,
+        "median": 34.0,
+        "minimum": 33.9
+      },
+      "mode": "baseline",
+      "open_artifact_mib": {
+        "maximum": 2.59,
+        "median": 2.59,
+        "minimum": 2.59
+      },
+      "open_artifact_reads": {
+        "maximum": 2207,
+        "median": 2207,
+        "minimum": 2207
+      },
+      "open_encode_json_calls": {
+        "maximum": 8548,
+        "median": 8548,
+        "minimum": 8548
+      },
+      "open_encode_json_mib": {
+        "maximum": 4.88,
+        "median": 4.88,
+        "minimum": 4.88
+      },
+      "open_s": {
+        "maximum": 1.899,
+        "median": 1.806,
+        "minimum": 1.75
+      },
+      "repetitions": 3,
+      "warm_open_artifact_reads": {
+        "maximum": 191,
+        "median": 191,
+        "minimum": 191
+      },
+      "warm_open_s": {
+        "maximum": 0.186,
+        "median": 0.182,
+        "minimum": 0.18
+      }
+    },
+    {
+      "cache_retained_mib": {
+        "maximum": 0.5,
+        "median": 0.5,
+        "minimum": 0.5
+      },
+      "events": 256,
+      "kind": "native",
+      "maxrss_mib": {
+        "maximum": 34.2,
+        "median": 34.1,
+        "minimum": 34.1
+      },
+      "mode": "binding",
+      "open_artifact_mib": {
+        "maximum": 0.22,
+        "median": 0.22,
+        "minimum": 0.22
+      },
+      "open_artifact_reads": {
+        "maximum": 191,
+        "median": 191,
+        "minimum": 191
+      },
+      "open_encode_json_calls": {
+        "maximum": 2618,
+        "median": 2618,
+        "minimum": 2618
+      },
+      "open_encode_json_mib": {
+        "maximum": 1.75,
+        "median": 1.75,
+        "minimum": 1.75
+      },
+      "open_s": {
+        "maximum": 0.616,
+        "median": 0.592,
+        "minimum": 0.574
+      },
+      "repetitions": 3,
+      "warm_open_artifact_reads": {
+        "maximum": 128,
+        "median": 128,
+        "minimum": 128
+      },
+      "warm_open_s": {
+        "maximum": 0.157,
+        "median": 0.153,
+        "minimum": 0.147
+      }
+    },
+    {
+      "cache_retained_mib": {
+        "maximum": 4.3,
+        "median": 4.3,
+        "minimum": 4.3
+      },
+      "events": 4096,
+      "kind": "native",
+      "maxrss_mib": {
+        "maximum": 46.8,
+        "median": 46.8,
+        "minimum": 46.7
+      },
+      "mode": "baseline",
+      "open_artifact_mib": {
+        "maximum": 12.21,
+        "median": 12.21,
+        "minimum": 12.21
+      },
+      "open_artifact_reads": {
+        "maximum": 2207,
+        "median": 2207,
+        "minimum": 2207
+      },
+      "open_encode_json_calls": {
+        "maximum": 20068,
+        "median": 20068,
+        "minimum": 20068
+      },
+      "open_encode_json_mib": {
+        "maximum": 20.65,
+        "median": 20.65,
+        "minimum": 20.65
+      },
+      "open_s": {
+        "maximum": 6.989,
+        "median": 6.979,
+        "minimum": 6.914
+      },
+      "repetitions": 3,
+      "warm_open_artifact_reads": {
+        "maximum": 191,
+        "median": 191,
+        "minimum": 191
+      },
+      "warm_open_s": {
+        "maximum": 0.282,
+        "median": 0.254,
+        "minimum": 0.253
+      }
+    },
+    {
+      "cache_retained_mib": {
+        "maximum": 4.3,
+        "median": 4.3,
+        "minimum": 4.3
+      },
+      "events": 4096,
+      "kind": "native",
+      "maxrss_mib": {
+        "maximum": 46.9,
+        "median": 46.9,
+        "minimum": 46.8
+      },
+      "mode": "binding",
+      "open_artifact_mib": {
+        "maximum": 1.06,
+        "median": 1.06,
+        "minimum": 1.06
+      },
+      "open_artifact_reads": {
+        "maximum": 191,
+        "median": 191,
+        "minimum": 191
+      },
+      "open_encode_json_calls": {
+        "maximum": 14136,
+        "median": 14136,
+        "minimum": 14136
+      },
+      "open_encode_json_mib": {
+        "maximum": 17.52,
+        "median": 17.52,
+        "minimum": 17.52
+      },
+      "open_s": {
+        "maximum": 5.968,
+        "median": 5.765,
+        "minimum": 5.656
+      },
+      "repetitions": 3,
+      "warm_open_artifact_reads": {
+        "maximum": 128,
+        "median": 128,
+        "minimum": 128
+      },
+      "warm_open_s": {
+        "maximum": 0.237,
+        "median": 0.232,
+        "minimum": 0.221
+      }
+    },
+    {
+      "cache_retained_mib": {
+        "maximum": 16.5,
+        "median": 16.5,
+        "minimum": 16.5
+      },
+      "events": 16384,
+      "kind": "native",
+      "maxrss_mib": {
+        "maximum": 93.6,
+        "median": 93.6,
+        "minimum": 93.4
+      },
+      "mode": "baseline",
+      "open_artifact_mib": {
+        "maximum": 43.23,
+        "median": 43.23,
+        "minimum": 43.23
+      },
+      "open_artifact_reads": {
+        "maximum": 2207,
+        "median": 2207,
+        "minimum": 2207
+      },
+      "open_encode_json_calls": {
+        "maximum": 56932,
+        "median": 56932,
+        "minimum": 56932
+      },
+      "open_encode_json_mib": {
+        "maximum": 71.32,
+        "median": 71.32,
+        "minimum": 71.32
+      },
+      "open_s": {
+        "maximum": 23.766,
+        "median": 23.466,
+        "minimum": 23.35
+      },
+      "repetitions": 3,
+      "warm_open_artifact_reads": {
+        "maximum": 191,
+        "median": 191,
+        "minimum": 191
+      },
+      "warm_open_s": {
+        "maximum": 0.528,
+        "median": 0.515,
+        "minimum": 0.485
+      }
+    },
+    {
+      "cache_retained_mib": {
+        "maximum": 16.5,
+        "median": 16.5,
+        "minimum": 16.5
+      },
+      "events": 16384,
+      "kind": "native",
+      "maxrss_mib": {
+        "maximum": 94.1,
+        "median": 94.1,
+        "minimum": 94.1
+      },
+      "mode": "binding",
+      "open_artifact_mib": {
+        "maximum": 3.75,
+        "median": 3.75,
+        "minimum": 3.75
+      },
+      "open_artifact_reads": {
+        "maximum": 191,
+        "median": 191,
+        "minimum": 191
+      },
+      "open_encode_json_calls": {
+        "maximum": 50998,
+        "median": 50998,
+        "minimum": 50998
+      },
+      "open_encode_json_mib": {
+        "maximum": 68.19,
+        "median": 68.19,
+        "minimum": 68.19
+      },
+      "open_s": {
+        "maximum": 22.717,
+        "median": 22.503,
+        "minimum": 22.37
+      },
+      "repetitions": 3,
+      "warm_open_artifact_reads": {
+        "maximum": 128,
+        "median": 128,
+        "minimum": 128
+      },
+      "warm_open_s": {
+        "maximum": 0.544,
+        "median": 0.507,
+        "minimum": 0.486
+      }
+    },
+    {
+      "cache_retained_mib": {
+        "maximum": 103.8,
+        "median": 103.8,
+        "minimum": 103.8
+      },
+      "events": 100000,
+      "kind": "native",
+      "maxrss_mib": {
+        "maximum": 418.7,
+        "median": 418.7,
+        "minimum": 418.7
+      },
+      "mode": "baseline",
+      "open_artifact_mib": {
+        "maximum": 256.87,
+        "median": 256.87,
+        "minimum": 256.87
+      },
+      "open_artifact_reads": {
+        "maximum": 2207,
+        "median": 2207,
+        "minimum": 2207
+      },
+      "open_encode_json_calls": {
+        "maximum": 307780,
+        "median": 307780,
+        "minimum": 307780
+      },
+      "open_encode_json_mib": {
+        "maximum": 418.5,
+        "median": 418.5,
+        "minimum": 418.5
+      },
+      "open_s": {
+        "maximum": 141.406,
+        "median": 141.406,
+        "minimum": 141.406
+      },
+      "repetitions": 1,
+      "warm_open_artifact_reads": {
+        "maximum": 191,
+        "median": 191,
+        "minimum": 191
+      },
+      "warm_open_s": {
+        "maximum": 2.378,
+        "median": 2.378,
+        "minimum": 2.378
+      }
+    },
+    {
+      "cache_retained_mib": {
+        "maximum": 103.8,
+        "median": 103.8,
+        "minimum": 103.8
+      },
+      "events": 100000,
+      "kind": "native",
+      "maxrss_mib": {
+        "maximum": 418.1,
+        "median": 418.1,
+        "minimum": 418.1
+      },
+      "mode": "binding",
+      "open_artifact_mib": {
+        "maximum": 22.25,
+        "median": 22.25,
+        "minimum": 22.25
+      },
+      "open_artifact_reads": {
+        "maximum": 191,
+        "median": 191,
+        "minimum": 191
+      },
+      "open_encode_json_calls": {
+        "maximum": 301846,
+        "median": 301846,
+        "minimum": 301846
+      },
+      "open_encode_json_mib": {
+        "maximum": 415.37,
+        "median": 415.37,
+        "minimum": 415.37
+      },
+      "open_s": {
+        "maximum": 140.416,
+        "median": 140.416,
+        "minimum": 140.416
+      },
+      "repetitions": 1,
+      "warm_open_artifact_reads": {
+        "maximum": 128,
+        "median": 128,
+        "minimum": 128
+      },
+      "warm_open_s": {
+        "maximum": 2.221,
+        "median": 2.221,
+        "minimum": 2.221
+      }
+    }
+  ],
+  "baseline_revision": "eeb5e0c8b3b8ab37ff5769151efb2d17be7c6fa6",
+  "candidate_revision": "b3a8d1dab1f18607ee84383e0180a7ef809c83f7",
+  "cold_cap_gate_passed": false,
+  "complete": true,
+  "format": "ariadne-cold-binding-checkpoints",
+  "groups": 12,
+  "method": "sequential; empty verification cache for cold, not cold OS cache; low-RSS launcher; fingerprints in separate subprocesses",
+  "pairs": 24,
+  "pairs_data": [
+    {
+      "active_logical_fingerprint": "9339a3deafd8c6ea07c6da21071e25c0ea0dddeccb4b8971e7a5e07d01d98e57",
+      "after_inventory_sha256": "34c046b1c2f016ff6e5915996cc0d5519565838ca4aed69f21a315c28e589309",
+      "archive_sha256": "558d627027515ca228002c125256ad3759c16791eb81abd26ef2296c05ed61db",
+      "before_inventory_sha256": "34c046b1c2f016ff6e5915996cc0d5519565838ca4aed69f21a315c28e589309",
+      "kind": "native",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 16640
+        },
+        "cache_retained_mib": 0.5,
+        "command": "measure",
+        "events": 256,
+        "generations": 64,
+        "load_view_s": 0.038,
+        "maxrss_mib": 33.9,
+        "open_artifact_mib": 2.59,
+        "open_artifact_reads": 2207,
+        "open_encode_json_calls": 8548,
+        "open_encode_json_mib": 4.88,
+        "open_s": 1.806,
+        "open_source_checks": 256,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-26/final-sync/src/hermes_ariadne",
+        "stored_artifact_bytes": 78846,
+        "stored_identity_references": 512,
+        "stored_target_bytes": 105826,
+        "warm_load_view_s": 0.038,
+        "warm_open_artifact_reads": 191,
+        "warm_open_encode_json_mib": 0.31,
+        "warm_open_s": 0.182,
+        "warm_source_checks": 256
+      },
+      "mode": "baseline",
+      "repeat": 1,
+      "size": 256
+    },
+    {
+      "active_logical_fingerprint": "9339a3deafd8c6ea07c6da21071e25c0ea0dddeccb4b8971e7a5e07d01d98e57",
+      "after_inventory_sha256": "34c046b1c2f016ff6e5915996cc0d5519565838ca4aed69f21a315c28e589309",
+      "archive_sha256": "558d627027515ca228002c125256ad3759c16791eb81abd26ef2296c05ed61db",
+      "before_inventory_sha256": "34c046b1c2f016ff6e5915996cc0d5519565838ca4aed69f21a315c28e589309",
+      "kind": "native",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 16640
+        },
+        "cache_retained_mib": 0.5,
+        "command": "measure",
+        "events": 256,
+        "generations": 64,
+        "load_view_s": 0.037,
+        "maxrss_mib": 34.2,
+        "open_artifact_mib": 0.22,
+        "open_artifact_reads": 191,
+        "open_encode_json_calls": 2618,
+        "open_encode_json_mib": 1.75,
+        "open_s": 0.616,
+        "open_source_checks": 256,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-19-cold/frozen-binding/src/hermes_ariadne",
+        "stored_artifact_bytes": 78846,
+        "stored_identity_references": 512,
+        "stored_target_bytes": 105826,
+        "warm_load_view_s": 0.039,
+        "warm_open_artifact_reads": 128,
+        "warm_open_encode_json_mib": 0.25,
+        "warm_open_s": 0.153,
+        "warm_source_checks": 256
+      },
+      "mode": "binding",
+      "repeat": 1,
+      "size": 256
+    },
+    {
+      "active_logical_fingerprint": "9339a3deafd8c6ea07c6da21071e25c0ea0dddeccb4b8971e7a5e07d01d98e57",
+      "after_inventory_sha256": "34c046b1c2f016ff6e5915996cc0d5519565838ca4aed69f21a315c28e589309",
+      "archive_sha256": "558d627027515ca228002c125256ad3759c16791eb81abd26ef2296c05ed61db",
+      "before_inventory_sha256": "34c046b1c2f016ff6e5915996cc0d5519565838ca4aed69f21a315c28e589309",
+      "kind": "native",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 16640
+        },
+        "cache_retained_mib": 0.5,
+        "command": "measure",
+        "events": 256,
+        "generations": 64,
+        "load_view_s": 0.039,
+        "maxrss_mib": 34.0,
+        "open_artifact_mib": 2.59,
+        "open_artifact_reads": 2207,
+        "open_encode_json_calls": 8548,
+        "open_encode_json_mib": 4.88,
+        "open_s": 1.899,
+        "open_source_checks": 256,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-26/final-sync/src/hermes_ariadne",
+        "stored_artifact_bytes": 78846,
+        "stored_identity_references": 512,
+        "stored_target_bytes": 105826,
+        "warm_load_view_s": 0.038,
+        "warm_open_artifact_reads": 191,
+        "warm_open_encode_json_mib": 0.31,
+        "warm_open_s": 0.18,
+        "warm_source_checks": 256
+      },
+      "mode": "baseline",
+      "repeat": 2,
+      "size": 256
+    },
+    {
+      "active_logical_fingerprint": "9339a3deafd8c6ea07c6da21071e25c0ea0dddeccb4b8971e7a5e07d01d98e57",
+      "after_inventory_sha256": "34c046b1c2f016ff6e5915996cc0d5519565838ca4aed69f21a315c28e589309",
+      "archive_sha256": "558d627027515ca228002c125256ad3759c16791eb81abd26ef2296c05ed61db",
+      "before_inventory_sha256": "34c046b1c2f016ff6e5915996cc0d5519565838ca4aed69f21a315c28e589309",
+      "kind": "native",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 16640
+        },
+        "cache_retained_mib": 0.5,
+        "command": "measure",
+        "events": 256,
+        "generations": 64,
+        "load_view_s": 0.04,
+        "maxrss_mib": 34.1,
+        "open_artifact_mib": 0.22,
+        "open_artifact_reads": 191,
+        "open_encode_json_calls": 2618,
+        "open_encode_json_mib": 1.75,
+        "open_s": 0.574,
+        "open_source_checks": 256,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-19-cold/frozen-binding/src/hermes_ariadne",
+        "stored_artifact_bytes": 78846,
+        "stored_identity_references": 512,
+        "stored_target_bytes": 105826,
+        "warm_load_view_s": 0.038,
+        "warm_open_artifact_reads": 128,
+        "warm_open_encode_json_mib": 0.25,
+        "warm_open_s": 0.147,
+        "warm_source_checks": 256
+      },
+      "mode": "binding",
+      "repeat": 2,
+      "size": 256
+    },
+    {
+      "active_logical_fingerprint": "9339a3deafd8c6ea07c6da21071e25c0ea0dddeccb4b8971e7a5e07d01d98e57",
+      "after_inventory_sha256": "34c046b1c2f016ff6e5915996cc0d5519565838ca4aed69f21a315c28e589309",
+      "archive_sha256": "558d627027515ca228002c125256ad3759c16791eb81abd26ef2296c05ed61db",
+      "before_inventory_sha256": "34c046b1c2f016ff6e5915996cc0d5519565838ca4aed69f21a315c28e589309",
+      "kind": "native",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 16640
+        },
+        "cache_retained_mib": 0.5,
+        "command": "measure",
+        "events": 256,
+        "generations": 64,
+        "load_view_s": 0.039,
+        "maxrss_mib": 34.0,
+        "open_artifact_mib": 2.59,
+        "open_artifact_reads": 2207,
+        "open_encode_json_calls": 8548,
+        "open_encode_json_mib": 4.88,
+        "open_s": 1.75,
+        "open_source_checks": 256,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-26/final-sync/src/hermes_ariadne",
+        "stored_artifact_bytes": 78846,
+        "stored_identity_references": 512,
+        "stored_target_bytes": 105826,
+        "warm_load_view_s": 0.037,
+        "warm_open_artifact_reads": 191,
+        "warm_open_encode_json_mib": 0.31,
+        "warm_open_s": 0.186,
+        "warm_source_checks": 256
+      },
+      "mode": "baseline",
+      "repeat": 3,
+      "size": 256
+    },
+    {
+      "active_logical_fingerprint": "9339a3deafd8c6ea07c6da21071e25c0ea0dddeccb4b8971e7a5e07d01d98e57",
+      "after_inventory_sha256": "34c046b1c2f016ff6e5915996cc0d5519565838ca4aed69f21a315c28e589309",
+      "archive_sha256": "558d627027515ca228002c125256ad3759c16791eb81abd26ef2296c05ed61db",
+      "before_inventory_sha256": "34c046b1c2f016ff6e5915996cc0d5519565838ca4aed69f21a315c28e589309",
+      "kind": "native",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 16640
+        },
+        "cache_retained_mib": 0.5,
+        "command": "measure",
+        "events": 256,
+        "generations": 64,
+        "load_view_s": 0.037,
+        "maxrss_mib": 34.1,
+        "open_artifact_mib": 0.22,
+        "open_artifact_reads": 191,
+        "open_encode_json_calls": 2618,
+        "open_encode_json_mib": 1.75,
+        "open_s": 0.592,
+        "open_source_checks": 256,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-19-cold/frozen-binding/src/hermes_ariadne",
+        "stored_artifact_bytes": 78846,
+        "stored_identity_references": 512,
+        "stored_target_bytes": 105826,
+        "warm_load_view_s": 0.04,
+        "warm_open_artifact_reads": 128,
+        "warm_open_encode_json_mib": 0.25,
+        "warm_open_s": 0.157,
+        "warm_source_checks": 256
+      },
+      "mode": "binding",
+      "repeat": 3,
+      "size": 256
+    },
+    {
+      "active_logical_fingerprint": "67477460af98b7dd08ba9e52e274943355fa350d45f1c737493882bf33d2b9da",
+      "after_inventory_sha256": "90406790976002e7590a99153b339b4b58facf55104d8803f5a94ad26f83dd84",
+      "archive_sha256": "bdd56c3fa627536f06558ac572abf41b7d8f287fefe3d8169ec52aaf9e3ffe8b",
+      "before_inventory_sha256": "90406790976002e7590a99153b339b4b58facf55104d8803f5a94ad26f83dd84",
+      "kind": "native",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 266240
+        },
+        "cache_retained_mib": 4.3,
+        "command": "measure",
+        "events": 4096,
+        "generations": 64,
+        "load_view_s": 0.038,
+        "maxrss_mib": 46.7,
+        "open_artifact_mib": 12.21,
+        "open_artifact_reads": 2207,
+        "open_encode_json_calls": 20068,
+        "open_encode_json_mib": 20.65,
+        "open_s": 6.989,
+        "open_source_checks": 4096,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-26/final-sync/src/hermes_ariadne",
+        "stored_artifact_bytes": 371903,
+        "stored_identity_references": 8192,
+        "stored_target_bytes": 1038990,
+        "warm_load_view_s": 0.04,
+        "warm_open_artifact_reads": 191,
+        "warm_open_encode_json_mib": 0.31,
+        "warm_open_s": 0.254,
+        "warm_source_checks": 4096
+      },
+      "mode": "baseline",
+      "repeat": 1,
+      "size": 4096
+    },
+    {
+      "active_logical_fingerprint": "67477460af98b7dd08ba9e52e274943355fa350d45f1c737493882bf33d2b9da",
+      "after_inventory_sha256": "90406790976002e7590a99153b339b4b58facf55104d8803f5a94ad26f83dd84",
+      "archive_sha256": "bdd56c3fa627536f06558ac572abf41b7d8f287fefe3d8169ec52aaf9e3ffe8b",
+      "before_inventory_sha256": "90406790976002e7590a99153b339b4b58facf55104d8803f5a94ad26f83dd84",
+      "kind": "native",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 266240
+        },
+        "cache_retained_mib": 4.3,
+        "command": "measure",
+        "events": 4096,
+        "generations": 64,
+        "load_view_s": 0.039,
+        "maxrss_mib": 46.9,
+        "open_artifact_mib": 1.06,
+        "open_artifact_reads": 191,
+        "open_encode_json_calls": 14136,
+        "open_encode_json_mib": 17.52,
+        "open_s": 5.968,
+        "open_source_checks": 4096,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-19-cold/frozen-binding/src/hermes_ariadne",
+        "stored_artifact_bytes": 371903,
+        "stored_identity_references": 8192,
+        "stored_target_bytes": 1038990,
+        "warm_load_view_s": 0.04,
+        "warm_open_artifact_reads": 128,
+        "warm_open_encode_json_mib": 0.24,
+        "warm_open_s": 0.237,
+        "warm_source_checks": 4096
+      },
+      "mode": "binding",
+      "repeat": 1,
+      "size": 4096
+    },
+    {
+      "active_logical_fingerprint": "67477460af98b7dd08ba9e52e274943355fa350d45f1c737493882bf33d2b9da",
+      "after_inventory_sha256": "90406790976002e7590a99153b339b4b58facf55104d8803f5a94ad26f83dd84",
+      "archive_sha256": "bdd56c3fa627536f06558ac572abf41b7d8f287fefe3d8169ec52aaf9e3ffe8b",
+      "before_inventory_sha256": "90406790976002e7590a99153b339b4b58facf55104d8803f5a94ad26f83dd84",
+      "kind": "native",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 266240
+        },
+        "cache_retained_mib": 4.3,
+        "command": "measure",
+        "events": 4096,
+        "generations": 64,
+        "load_view_s": 0.038,
+        "maxrss_mib": 46.8,
+        "open_artifact_mib": 12.21,
+        "open_artifact_reads": 2207,
+        "open_encode_json_calls": 20068,
+        "open_encode_json_mib": 20.65,
+        "open_s": 6.914,
+        "open_source_checks": 4096,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-26/final-sync/src/hermes_ariadne",
+        "stored_artifact_bytes": 371903,
+        "stored_identity_references": 8192,
+        "stored_target_bytes": 1038990,
+        "warm_load_view_s": 0.04,
+        "warm_open_artifact_reads": 191,
+        "warm_open_encode_json_mib": 0.31,
+        "warm_open_s": 0.253,
+        "warm_source_checks": 4096
+      },
+      "mode": "baseline",
+      "repeat": 2,
+      "size": 4096
+    },
+    {
+      "active_logical_fingerprint": "67477460af98b7dd08ba9e52e274943355fa350d45f1c737493882bf33d2b9da",
+      "after_inventory_sha256": "90406790976002e7590a99153b339b4b58facf55104d8803f5a94ad26f83dd84",
+      "archive_sha256": "bdd56c3fa627536f06558ac572abf41b7d8f287fefe3d8169ec52aaf9e3ffe8b",
+      "before_inventory_sha256": "90406790976002e7590a99153b339b4b58facf55104d8803f5a94ad26f83dd84",
+      "kind": "native",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 266240
+        },
+        "cache_retained_mib": 4.3,
+        "command": "measure",
+        "events": 4096,
+        "generations": 64,
+        "load_view_s": 0.038,
+        "maxrss_mib": 46.8,
+        "open_artifact_mib": 1.06,
+        "open_artifact_reads": 191,
+        "open_encode_json_calls": 14136,
+        "open_encode_json_mib": 17.52,
+        "open_s": 5.656,
+        "open_source_checks": 4096,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-19-cold/frozen-binding/src/hermes_ariadne",
+        "stored_artifact_bytes": 371903,
+        "stored_identity_references": 8192,
+        "stored_target_bytes": 1038990,
+        "warm_load_view_s": 0.04,
+        "warm_open_artifact_reads": 128,
+        "warm_open_encode_json_mib": 0.24,
+        "warm_open_s": 0.221,
+        "warm_source_checks": 4096
+      },
+      "mode": "binding",
+      "repeat": 2,
+      "size": 4096
+    },
+    {
+      "active_logical_fingerprint": "67477460af98b7dd08ba9e52e274943355fa350d45f1c737493882bf33d2b9da",
+      "after_inventory_sha256": "90406790976002e7590a99153b339b4b58facf55104d8803f5a94ad26f83dd84",
+      "archive_sha256": "bdd56c3fa627536f06558ac572abf41b7d8f287fefe3d8169ec52aaf9e3ffe8b",
+      "before_inventory_sha256": "90406790976002e7590a99153b339b4b58facf55104d8803f5a94ad26f83dd84",
+      "kind": "native",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 266240
+        },
+        "cache_retained_mib": 4.3,
+        "command": "measure",
+        "events": 4096,
+        "generations": 64,
+        "load_view_s": 0.048,
+        "maxrss_mib": 46.8,
+        "open_artifact_mib": 12.21,
+        "open_artifact_reads": 2207,
+        "open_encode_json_calls": 20068,
+        "open_encode_json_mib": 20.65,
+        "open_s": 6.979,
+        "open_source_checks": 4096,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-26/final-sync/src/hermes_ariadne",
+        "stored_artifact_bytes": 371903,
+        "stored_identity_references": 8192,
+        "stored_target_bytes": 1038990,
+        "warm_load_view_s": 0.042,
+        "warm_open_artifact_reads": 191,
+        "warm_open_encode_json_mib": 0.31,
+        "warm_open_s": 0.282,
+        "warm_source_checks": 4096
+      },
+      "mode": "baseline",
+      "repeat": 3,
+      "size": 4096
+    },
+    {
+      "active_logical_fingerprint": "67477460af98b7dd08ba9e52e274943355fa350d45f1c737493882bf33d2b9da",
+      "after_inventory_sha256": "90406790976002e7590a99153b339b4b58facf55104d8803f5a94ad26f83dd84",
+      "archive_sha256": "bdd56c3fa627536f06558ac572abf41b7d8f287fefe3d8169ec52aaf9e3ffe8b",
+      "before_inventory_sha256": "90406790976002e7590a99153b339b4b58facf55104d8803f5a94ad26f83dd84",
+      "kind": "native",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 266240
+        },
+        "cache_retained_mib": 4.3,
+        "command": "measure",
+        "events": 4096,
+        "generations": 64,
+        "load_view_s": 0.041,
+        "maxrss_mib": 46.9,
+        "open_artifact_mib": 1.06,
+        "open_artifact_reads": 191,
+        "open_encode_json_calls": 14136,
+        "open_encode_json_mib": 17.52,
+        "open_s": 5.765,
+        "open_source_checks": 4096,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-19-cold/frozen-binding/src/hermes_ariadne",
+        "stored_artifact_bytes": 371903,
+        "stored_identity_references": 8192,
+        "stored_target_bytes": 1038990,
+        "warm_load_view_s": 0.042,
+        "warm_open_artifact_reads": 128,
+        "warm_open_encode_json_mib": 0.24,
+        "warm_open_s": 0.232,
+        "warm_source_checks": 4096
+      },
+      "mode": "binding",
+      "repeat": 3,
+      "size": 4096
+    },
+    {
+      "active_logical_fingerprint": "75986f1a4ea98bf1d95159f61def9f94ccb2885245ff1bd916b4f8c1fc41dba0",
+      "after_inventory_sha256": "c187acb08035014d939df1638d86d1dd46434f644aa90e557caa4bec29eaff21",
+      "archive_sha256": "da9fe2044b6f03456b7c444fedf56d4faede467bee415bd50151c0b6349f185a",
+      "before_inventory_sha256": "c187acb08035014d939df1638d86d1dd46434f644aa90e557caa4bec29eaff21",
+      "kind": "native",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 1064960
+        },
+        "cache_retained_mib": 16.5,
+        "command": "measure",
+        "events": 16384,
+        "generations": 64,
+        "load_view_s": 0.042,
+        "maxrss_mib": 93.6,
+        "open_artifact_mib": 43.23,
+        "open_artifact_reads": 2207,
+        "open_encode_json_calls": 56932,
+        "open_encode_json_mib": 71.32,
+        "open_s": 23.766,
+        "open_source_checks": 16384,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-26/final-sync/src/hermes_ariadne",
+        "stored_artifact_bytes": 1316464,
+        "stored_identity_references": 32768,
+        "stored_target_bytes": 4037423,
+        "warm_load_view_s": 0.046,
+        "warm_open_artifact_reads": 191,
+        "warm_open_encode_json_mib": 0.31,
+        "warm_open_s": 0.515,
+        "warm_source_checks": 16384
+      },
+      "mode": "baseline",
+      "repeat": 1,
+      "size": 16384
+    },
+    {
+      "active_logical_fingerprint": "75986f1a4ea98bf1d95159f61def9f94ccb2885245ff1bd916b4f8c1fc41dba0",
+      "after_inventory_sha256": "c187acb08035014d939df1638d86d1dd46434f644aa90e557caa4bec29eaff21",
+      "archive_sha256": "da9fe2044b6f03456b7c444fedf56d4faede467bee415bd50151c0b6349f185a",
+      "before_inventory_sha256": "c187acb08035014d939df1638d86d1dd46434f644aa90e557caa4bec29eaff21",
+      "kind": "native",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 1064960
+        },
+        "cache_retained_mib": 16.5,
+        "command": "measure",
+        "events": 16384,
+        "generations": 64,
+        "load_view_s": 0.043,
+        "maxrss_mib": 94.1,
+        "open_artifact_mib": 3.75,
+        "open_artifact_reads": 191,
+        "open_encode_json_calls": 50998,
+        "open_encode_json_mib": 68.19,
+        "open_s": 22.717,
+        "open_source_checks": 16384,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-19-cold/frozen-binding/src/hermes_ariadne",
+        "stored_artifact_bytes": 1316464,
+        "stored_identity_references": 32768,
+        "stored_target_bytes": 4037423,
+        "warm_load_view_s": 0.047,
+        "warm_open_artifact_reads": 128,
+        "warm_open_encode_json_mib": 0.24,
+        "warm_open_s": 0.544,
+        "warm_source_checks": 16384
+      },
+      "mode": "binding",
+      "repeat": 1,
+      "size": 16384
+    },
+    {
+      "active_logical_fingerprint": "75986f1a4ea98bf1d95159f61def9f94ccb2885245ff1bd916b4f8c1fc41dba0",
+      "after_inventory_sha256": "c187acb08035014d939df1638d86d1dd46434f644aa90e557caa4bec29eaff21",
+      "archive_sha256": "da9fe2044b6f03456b7c444fedf56d4faede467bee415bd50151c0b6349f185a",
+      "before_inventory_sha256": "c187acb08035014d939df1638d86d1dd46434f644aa90e557caa4bec29eaff21",
+      "kind": "native",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 1064960
+        },
+        "cache_retained_mib": 16.5,
+        "command": "measure",
+        "events": 16384,
+        "generations": 64,
+        "load_view_s": 0.04,
+        "maxrss_mib": 93.4,
+        "open_artifact_mib": 43.23,
+        "open_artifact_reads": 2207,
+        "open_encode_json_calls": 56932,
+        "open_encode_json_mib": 71.32,
+        "open_s": 23.466,
+        "open_source_checks": 16384,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-26/final-sync/src/hermes_ariadne",
+        "stored_artifact_bytes": 1316464,
+        "stored_identity_references": 32768,
+        "stored_target_bytes": 4037423,
+        "warm_load_view_s": 0.045,
+        "warm_open_artifact_reads": 191,
+        "warm_open_encode_json_mib": 0.31,
+        "warm_open_s": 0.485,
+        "warm_source_checks": 16384
+      },
+      "mode": "baseline",
+      "repeat": 2,
+      "size": 16384
+    },
+    {
+      "active_logical_fingerprint": "75986f1a4ea98bf1d95159f61def9f94ccb2885245ff1bd916b4f8c1fc41dba0",
+      "after_inventory_sha256": "c187acb08035014d939df1638d86d1dd46434f644aa90e557caa4bec29eaff21",
+      "archive_sha256": "da9fe2044b6f03456b7c444fedf56d4faede467bee415bd50151c0b6349f185a",
+      "before_inventory_sha256": "c187acb08035014d939df1638d86d1dd46434f644aa90e557caa4bec29eaff21",
+      "kind": "native",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 1064960
+        },
+        "cache_retained_mib": 16.5,
+        "command": "measure",
+        "events": 16384,
+        "generations": 64,
+        "load_view_s": 0.041,
+        "maxrss_mib": 94.1,
+        "open_artifact_mib": 3.75,
+        "open_artifact_reads": 191,
+        "open_encode_json_calls": 50998,
+        "open_encode_json_mib": 68.19,
+        "open_s": 22.37,
+        "open_source_checks": 16384,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-19-cold/frozen-binding/src/hermes_ariadne",
+        "stored_artifact_bytes": 1316464,
+        "stored_identity_references": 32768,
+        "stored_target_bytes": 4037423,
+        "warm_load_view_s": 0.045,
+        "warm_open_artifact_reads": 128,
+        "warm_open_encode_json_mib": 0.24,
+        "warm_open_s": 0.486,
+        "warm_source_checks": 16384
+      },
+      "mode": "binding",
+      "repeat": 2,
+      "size": 16384
+    },
+    {
+      "active_logical_fingerprint": "75986f1a4ea98bf1d95159f61def9f94ccb2885245ff1bd916b4f8c1fc41dba0",
+      "after_inventory_sha256": "c187acb08035014d939df1638d86d1dd46434f644aa90e557caa4bec29eaff21",
+      "archive_sha256": "da9fe2044b6f03456b7c444fedf56d4faede467bee415bd50151c0b6349f185a",
+      "before_inventory_sha256": "c187acb08035014d939df1638d86d1dd46434f644aa90e557caa4bec29eaff21",
+      "kind": "native",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 1064960
+        },
+        "cache_retained_mib": 16.5,
+        "command": "measure",
+        "events": 16384,
+        "generations": 64,
+        "load_view_s": 0.043,
+        "maxrss_mib": 93.6,
+        "open_artifact_mib": 43.23,
+        "open_artifact_reads": 2207,
+        "open_encode_json_calls": 56932,
+        "open_encode_json_mib": 71.32,
+        "open_s": 23.35,
+        "open_source_checks": 16384,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-26/final-sync/src/hermes_ariadne",
+        "stored_artifact_bytes": 1316464,
+        "stored_identity_references": 32768,
+        "stored_target_bytes": 4037423,
+        "warm_load_view_s": 0.052,
+        "warm_open_artifact_reads": 191,
+        "warm_open_encode_json_mib": 0.31,
+        "warm_open_s": 0.528,
+        "warm_source_checks": 16384
+      },
+      "mode": "baseline",
+      "repeat": 3,
+      "size": 16384
+    },
+    {
+      "active_logical_fingerprint": "75986f1a4ea98bf1d95159f61def9f94ccb2885245ff1bd916b4f8c1fc41dba0",
+      "after_inventory_sha256": "c187acb08035014d939df1638d86d1dd46434f644aa90e557caa4bec29eaff21",
+      "archive_sha256": "da9fe2044b6f03456b7c444fedf56d4faede467bee415bd50151c0b6349f185a",
+      "before_inventory_sha256": "c187acb08035014d939df1638d86d1dd46434f644aa90e557caa4bec29eaff21",
+      "kind": "native",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 1064960
+        },
+        "cache_retained_mib": 16.5,
+        "command": "measure",
+        "events": 16384,
+        "generations": 64,
+        "load_view_s": 0.045,
+        "maxrss_mib": 94.1,
+        "open_artifact_mib": 3.75,
+        "open_artifact_reads": 191,
+        "open_encode_json_calls": 50998,
+        "open_encode_json_mib": 68.19,
+        "open_s": 22.503,
+        "open_source_checks": 16384,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-19-cold/frozen-binding/src/hermes_ariadne",
+        "stored_artifact_bytes": 1316464,
+        "stored_identity_references": 32768,
+        "stored_target_bytes": 4037423,
+        "warm_load_view_s": 0.048,
+        "warm_open_artifact_reads": 128,
+        "warm_open_encode_json_mib": 0.24,
+        "warm_open_s": 0.507,
+        "warm_source_checks": 16384
+      },
+      "mode": "binding",
+      "repeat": 3,
+      "size": 16384
+    },
+    {
+      "active_logical_fingerprint": "30d2645007ee3ba0e310c0fa97b4c692676b13fc6ffc0c29f96354e4f5a0657e",
+      "after_inventory_sha256": "14045f179787e083c2ca3329b21da3aed7d3ad2c846907fe0b83986415599872",
+      "archive_sha256": "b5783be9db7c410f6bb35eb93e0f8b70f4b80ab0b6452f6d6ff169c42b119631",
+      "before_inventory_sha256": "14045f179787e083c2ca3329b21da3aed7d3ad2c846907fe0b83986415599872",
+      "kind": "native",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 6503840
+        },
+        "cache_retained_mib": 103.8,
+        "command": "measure",
+        "events": 100000,
+        "generations": 64,
+        "load_view_s": 0.055,
+        "maxrss_mib": 418.7,
+        "open_artifact_mib": 256.87,
+        "open_artifact_reads": 2207,
+        "open_encode_json_calls": 307780,
+        "open_encode_json_mib": 418.5,
+        "open_s": 141.406,
+        "open_source_checks": 100000,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-26/final-sync/src/hermes_ariadne",
+        "stored_artifact_bytes": 7817634,
+        "stored_identity_references": 200000,
+        "stored_target_bytes": 24570340,
+        "warm_load_view_s": 0.08,
+        "warm_open_artifact_reads": 191,
+        "warm_open_encode_json_mib": 0.31,
+        "warm_open_s": 2.378,
+        "warm_source_checks": 100000
+      },
+      "mode": "baseline",
+      "repeat": 1,
+      "size": 100000
+    },
+    {
+      "active_logical_fingerprint": "30d2645007ee3ba0e310c0fa97b4c692676b13fc6ffc0c29f96354e4f5a0657e",
+      "after_inventory_sha256": "14045f179787e083c2ca3329b21da3aed7d3ad2c846907fe0b83986415599872",
+      "archive_sha256": "b5783be9db7c410f6bb35eb93e0f8b70f4b80ab0b6452f6d6ff169c42b119631",
+      "before_inventory_sha256": "14045f179787e083c2ca3329b21da3aed7d3ad2c846907fe0b83986415599872",
+      "kind": "native",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 6503840
+        },
+        "cache_retained_mib": 103.8,
+        "command": "measure",
+        "events": 100000,
+        "generations": 64,
+        "load_view_s": 0.058,
+        "maxrss_mib": 418.1,
+        "open_artifact_mib": 22.25,
+        "open_artifact_reads": 191,
+        "open_encode_json_calls": 301846,
+        "open_encode_json_mib": 415.37,
+        "open_s": 140.416,
+        "open_source_checks": 100000,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-19-cold/frozen-binding/src/hermes_ariadne",
+        "stored_artifact_bytes": 7817634,
+        "stored_identity_references": 200000,
+        "stored_target_bytes": 24570340,
+        "warm_load_view_s": 0.079,
+        "warm_open_artifact_reads": 128,
+        "warm_open_encode_json_mib": 0.24,
+        "warm_open_s": 2.221,
+        "warm_source_checks": 100000
+      },
+      "mode": "binding",
+      "repeat": 1,
+      "size": 100000
+    },
+    {
+      "active_logical_fingerprint": "30d2645007ee3ba0e310c0fa97b4c692676b13fc6ffc0c29f96354e4f5a0657e",
+      "after_inventory_sha256": "daa2960ae9617cc2158f9b7c113a85bcd4355252535d848923c80a3f3969fa3b",
+      "archive_sha256": "b5783be9db7c410f6bb35eb93e0f8b70f4b80ab0b6452f6d6ff169c42b119631",
+      "before_inventory_sha256": "daa2960ae9617cc2158f9b7c113a85bcd4355252535d848923c80a3f3969fa3b",
+      "kind": "migrated",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 6503840
+        },
+        "cache_retained_mib": 103.8,
+        "command": "measure",
+        "events": 100000,
+        "generations": 64,
+        "load_view_s": 0.057,
+        "maxrss_mib": 419.3,
+        "open_artifact_mib": 256.87,
+        "open_artifact_reads": 2207,
+        "open_encode_json_calls": 307791,
+        "open_encode_json_mib": 418.57,
+        "open_s": 142.135,
+        "open_source_checks": 100000,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-26/final-sync/src/hermes_ariadne",
+        "stored_artifact_bytes": 7817634,
+        "stored_identity_references": 200000,
+        "stored_target_bytes": 24570340,
+        "warm_load_view_s": 0.081,
+        "warm_open_artifact_reads": 191,
+        "warm_open_encode_json_mib": 0.39,
+        "warm_open_s": 2.43,
+        "warm_source_checks": 100000
+      },
+      "mode": "baseline",
+      "repeat": 1,
+      "size": 100000
+    },
+    {
+      "active_logical_fingerprint": "30d2645007ee3ba0e310c0fa97b4c692676b13fc6ffc0c29f96354e4f5a0657e",
+      "after_inventory_sha256": "daa2960ae9617cc2158f9b7c113a85bcd4355252535d848923c80a3f3969fa3b",
+      "archive_sha256": "b5783be9db7c410f6bb35eb93e0f8b70f4b80ab0b6452f6d6ff169c42b119631",
+      "before_inventory_sha256": "daa2960ae9617cc2158f9b7c113a85bcd4355252535d848923c80a3f3969fa3b",
+      "kind": "migrated",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 6503840
+        },
+        "cache_retained_mib": 103.8,
+        "command": "measure",
+        "events": 100000,
+        "generations": 64,
+        "load_view_s": 0.062,
+        "maxrss_mib": 418.6,
+        "open_artifact_mib": 22.25,
+        "open_artifact_reads": 191,
+        "open_encode_json_calls": 301857,
+        "open_encode_json_mib": 415.44,
+        "open_s": 137.609,
+        "open_source_checks": 100000,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-19-cold/frozen-binding/src/hermes_ariadne",
+        "stored_artifact_bytes": 7817634,
+        "stored_identity_references": 200000,
+        "stored_target_bytes": 24570340,
+        "warm_load_view_s": 0.085,
+        "warm_open_artifact_reads": 128,
+        "warm_open_encode_json_mib": 0.32,
+        "warm_open_s": 2.279,
+        "warm_source_checks": 100000
+      },
+      "mode": "binding",
+      "repeat": 1,
+      "size": 100000
+    },
+    {
+      "active_logical_fingerprint": "2db031b01f92230cf4377dd34437a17bfee951bebf1f95a955f78117bdb8cd80",
+      "after_inventory_sha256": "22220ed2cced29014881e946de6779e81a1d4373be60c29e88cec24f5c68cbd4",
+      "archive_sha256": "558d627027515ca228002c125256ad3759c16791eb81abd26ef2296c05ed61db",
+      "before_inventory_sha256": "22220ed2cced29014881e946de6779e81a1d4373be60c29e88cec24f5c68cbd4",
+      "kind": "legacy",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 16640
+        },
+        "cache_retained_mib": 0.6,
+        "command": "measure",
+        "events": 256,
+        "generations": 64,
+        "load_view_s": 0.046,
+        "maxrss_mib": 37.0,
+        "open_artifact_mib": 1.95,
+        "open_artifact_reads": 191,
+        "open_encode_json_calls": 2184,
+        "open_encode_json_mib": 2.44,
+        "open_s": 0.677,
+        "open_source_checks": 256,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-26/final-sync/src/hermes_ariadne",
+        "stored_artifact_bytes": 688818,
+        "stored_identity_references": 16640,
+        "stored_target_bytes": 706224,
+        "warm_load_view_s": 0.035,
+        "warm_open_artifact_reads": 191,
+        "warm_open_encode_json_mib": 0.22,
+        "warm_open_s": 0.188,
+        "warm_source_checks": 256
+      },
+      "mode": "baseline",
+      "repeat": 1,
+      "size": 256
+    },
+    {
+      "active_logical_fingerprint": "2db031b01f92230cf4377dd34437a17bfee951bebf1f95a955f78117bdb8cd80",
+      "after_inventory_sha256": "22220ed2cced29014881e946de6779e81a1d4373be60c29e88cec24f5c68cbd4",
+      "archive_sha256": "558d627027515ca228002c125256ad3759c16791eb81abd26ef2296c05ed61db",
+      "before_inventory_sha256": "22220ed2cced29014881e946de6779e81a1d4373be60c29e88cec24f5c68cbd4",
+      "kind": "legacy",
+      "measurement": {
+        "cache": {
+          "entries": 128,
+          "source_ids": 16640
+        },
+        "cache_retained_mib": 0.6,
+        "command": "measure",
+        "events": 256,
+        "generations": 64,
+        "load_view_s": 0.034,
+        "maxrss_mib": 36.8,
+        "open_artifact_mib": 1.95,
+        "open_artifact_reads": 191,
+        "open_encode_json_calls": 2184,
+        "open_encode_json_mib": 2.44,
+        "open_s": 0.664,
+        "open_source_checks": 256,
+        "python": "3.14.9",
+        "source": "/opt/data/cache/scratch/ariadne-19-cold/frozen-binding/src/hermes_ariadne",
+        "stored_artifact_bytes": 688818,
+        "stored_identity_references": 16640,
+        "stored_target_bytes": 706224,
+        "warm_load_view_s": 0.032,
+        "warm_open_artifact_reads": 191,
+        "warm_open_encode_json_mib": 0.22,
+        "warm_open_s": 0.174,
+        "warm_source_checks": 256
+      },
+      "mode": "binding",
+      "repeat": 1,
+      "size": 256
+    }
+  ],
+  "version": 1
+}

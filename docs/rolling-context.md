@@ -480,6 +480,13 @@ ancestor work remain profiling concerns; #19/#26 acceptance stays open. See the
 cost, retained-backup disk, depth scaling and memory caveats. The earlier benchmark
 table above this section describes legacy schema-2 storage, not schema 3.
 
+A subsequent [cold ancestor-binding checkpoint](rolling-cold-validation.md),
+runtime `b3a8d1d`, reduces native/migrated cold artifact reads from 2,207 to 191
+without changing source canonicalization counts or stored identities. It helps
+small-source/deep-generation cases, but its native cap smoke still took 140.416 s
+cold. These single-run cap controls do not replace the earlier matrix medians;
+the cold usability gate remains unmet.
+
 ## Installed-host pilot (#17)
 
 `scripts/rolling_host_pilot.py` drives a long synthetic conversation through real
