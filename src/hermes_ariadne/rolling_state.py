@@ -211,7 +211,13 @@ class RollingJournal:
             self._conn.execute("PRAGMA synchronous=FULL")
             with self._transaction():
                 self._validate_schema()
-                self._validate_records()
+                if self.schema_version == 3:
+                    # Own delta target/parent binding, without publishing facts
+                    # from startup before recovery/reconciliation succeeds.
+                    with self._operation(promote=False):
+                        self._validate_records()
+                else:
+                    self._validate_records()
                 had_reserved = self._conn.execute(
                     "SELECT 1 FROM jobs WHERE state='reserved'"
                 ).fetchone()
@@ -251,7 +257,7 @@ class RollingJournal:
                 guard()
 
     @contextmanager
-    def _operation(self):
+    def _operation(self, *, promote=True):
         # Refuse nested entry before taking ownership: a caught reentry error must
         # not clear the active caller's memo or busy flag. If it escapes, that
         # caller's operation boundary performs the failure cleanup instead.
@@ -272,7 +278,8 @@ class RollingJournal:
                 yield
                 self._check()
             # Only a completed operation's verdicts reach the cross-open cache.
-            self._memo.promote()
+            if promote:
+                self._memo.promote()
         except BaseException:
             # A failed operation must not leave partially accepted validation state.
             self._memo = None
@@ -431,7 +438,7 @@ class RollingJournal:
             parent = (
                 None
                 if target.parent_generation is None
-                else self._view(self._parent_bytes(target.parent_generation))
+                else self._parent_view(target.parent_generation)
             )
             target.bind(parent, self.settings)
         if self._memo is not None:
@@ -473,6 +480,40 @@ class RollingJournal:
         data = _read(self.generations / (digest + ".json"), self.settings.max_checkpoint_bytes)
         self._check()
         return data
+
+    def _parent_view(self, digest):
+        """Reuse only a journal-accepted parent bound in THIS operation.
+
+        Outside an owned scope keep the conservative exact-byte path. A wrong
+        filename binding follows the original validator/bind refusal path and
+        never establishes a reusable binding.
+        """
+        require_digest(digest)
+        memo = self._memo
+        if memo is not None and memo.bound is not None and digest in memo.bound:
+            view = memo.accepted.get(digest)
+            recorded = memo.prefix_states.get(digest)
+            if (
+                view is not None
+                and view.generation_id == digest
+                and recorded is not None
+                and recorded[0] is view
+                and recorded[1].extends(view)
+                and memo.store is self.store
+                and memo.session_id == self.session_id
+                and memo.policy is self.policy
+                and memo.settings_digest == self.settings.digest
+            ):
+                # Keep both capture checks from the exact-byte loader path.
+                self._check()
+                self._check()
+                return view
+        view = self._view(self._parent_bytes(digest))
+        if memo is not None and memo.bound is not None and view.generation_id == digest:
+            recorded = memo.prefix_states.get(digest)
+            if memo.accepted.get(digest) is view and recorded is not None and recorded[0] is view:
+                memo.bound.add(digest)
+        return view
 
     def _view(self, data):
         validated = []
@@ -585,7 +626,7 @@ class RollingJournal:
         parent = (
             None
             if target.parent_generation is None
-            else self._view(self._parent_bytes(target.parent_generation))
+            else self._parent_view(target.parent_generation)
         )
         return validate_target(
             target,
