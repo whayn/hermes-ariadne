@@ -497,8 +497,13 @@ def migrate(home, session_id, settings, *, store, policy=None):
         if (root / "rollback-intent.json").exists() or (root / "rollback.json").exists():
             raise ValueError("session already entered rollback; use explicit rollback recovery")
         if (root / "storage.json").exists():
-            resolve_storage(root, session_id, settings)
+            selected = resolve_storage(root, session_id, settings)
             receipt = _receipt(root, session_id, settings)[0]
+            # A selected journal may have advanced legitimately since conversion.
+            # Audit its current state without recovery; the conversion fingerprint
+            # is a rollback boundary, not a permanent freeze of the live ledger.
+            with audit(selected, root_home, session_id, settings, store, policy, schema=3):
+                pass
             _cleanup_rollback_copies(root, receipt)
             _sync(root)
             return receipt

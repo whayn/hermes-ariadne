@@ -40,6 +40,70 @@ def test_uncached_pending_delta_returns_bound_coverage(tmp_path, with_parent, af
         assert pending.request_bytes == expected.request_bytes
 
 
+@pytest.mark.parametrize("damage", ["accounting", "source", "artifact"])
+def test_completed_migration_retry_reaudits_selected_state(tmp_path, damage):
+    from test_rolling_storage_legacy import inventory
+
+    store, settings = setup(tmp_path)
+    with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
+        first = target(store, settings, 1)
+        ready(journal, first, "one")
+        view = journal.publish_ready(
+            first.job_id, rolling.generation_bytes(first, "one", sequence=1, settings=settings)
+        )
+        directory = journal.directory
+    (tmp_path / ".ariadne-offline-migration").touch(mode=0o600)
+    receipt = migration.migrate(tmp_path, "s", settings, store=store)
+    if damage == "accounting":
+        with closing(sqlite3.connect(directory / "v3" / "journal.sqlite3")) as connection:
+            with connection:
+                connection.execute("UPDATE campaign SET logical_reservations=42")
+    elif damage == "source":
+        with closing(sqlite3.connect(store.path)) as connection:
+            with connection:
+                connection.execute(
+                    "UPDATE events SET payload_json=? WHERE event_id=?",
+                    (b"{}", first.event_ids[0]),
+                )
+    else:
+        path = (
+            directory
+            / "v3"
+            / "generations"
+            / (receipt["generations"][view.generation_id] + ".json")
+        )
+        path.write_bytes(b"{}")
+    before = inventory(directory)
+    with pytest.raises(ValueError):
+        migration.migrate(tmp_path, "s", settings, store=store)
+    assert inventory(directory) == before
+
+
+def test_completed_migration_retry_preserves_valid_later_activity(tmp_path):
+    from test_rolling_storage_legacy import inventory
+
+    store, settings = setup(tmp_path)
+    with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
+        first = target(store, settings, 1)
+        ready(journal, first, "one")
+        journal.publish_ready(
+            first.job_id, rolling.generation_bytes(first, "one", sequence=1, settings=settings)
+        )
+        directory = journal.directory
+    (tmp_path / ".ariadne-offline-migration").touch(mode=0o600)
+    receipt = migration.migrate(tmp_path, "s", settings, store=store)
+    with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:
+        parent = journal.load_view()
+        second = journal.encode_target(target(store, settings, 2, parent), parent)
+        ready(journal, second, "two")
+        journal.publish_ready(
+            second.job_id, rolling.generation_bytes(second, "two", sequence=2, settings=settings)
+        )
+    before = inventory(directory)
+    assert migration.migrate(tmp_path, "s", settings, store=store) == receipt
+    assert inventory(directory) == before
+
+
 def test_schema_probe_connection_is_explicitly_closed(tmp_path, monkeypatch):
     store, settings = setup(tmp_path)
     with rolling_state.RollingJournal(tmp_path, "s", settings, store=store) as journal:

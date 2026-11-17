@@ -61,6 +61,9 @@ def test_migration_preserves_every_legacy_lifecycle_field(tmp_path, monkeypatch,
     (tmp_path / ".ariadne-offline-migration").touch(mode=0o600)
     receipt = migrator().migrate(tmp_path, "s", settings, store=store)
     after = inspect_readonly(directory / "v3")
+    converted_files = inventory(directory)
+    assert migrator().migrate(tmp_path, "s", settings, store=store) == receipt
+    assert inventory(directory) == converted_files  # Retry audits without lifecycle recovery.
     old_job, new_job = before["jobs"][0], after["jobs"][0]
     for key in old_job:
         if key not in {"job_id", "target_id", "generation_id"}:

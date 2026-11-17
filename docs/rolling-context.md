@@ -460,6 +460,12 @@ including reserved→uncertain recovery or another logical reservation. No live-
 activation, installer overwrite/upgrade or managed-environment modification is
 part of this command.
 
+Repeating a completed conversion re-audits the selected schema-3 journal, sources
+and artifacts without running startup recovery or changing lifecycle state. Valid
+post-conversion advances remain valid; the original conversion fingerprint is a
+rollback boundary, not a freeze of later activity. Corruption refuses rather than
+reporting a successful conversion.
+
 Rollback streams, hash-checks and fsyncs a private restoration copy before it
 removes the selector. Explicit offline recovery cleans up interrupted `.rollback-*`
 copies only when they are private, regular, single-link files with the exact

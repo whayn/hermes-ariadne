@@ -94,10 +94,20 @@ def test_delta_warm_open_reuses_only_hash_bound_work(tmp_path, monkeypatch):
         calls.append(len(rows))
         return original(rows, **kwargs)
 
+    verified = []
+    verify = store.verify_events
+
+    def counted_verify(event_ids, *, session_id):
+        found = verify(event_ids, session_id=session_id)
+        verified.extend(found)
+        return found
+
     monkeypatch.setattr(rolling, "_canonical_rows", counted)
+    monkeypatch.setattr(store, "verify_events", counted_verify)
     with RollingJournal(tmp_path, "s", settings, store=store, cache=cache) as journal:
         assert journal.load_view().frontier_count == len(old.event_ids)
-    assert calls == [], "warm open must still hash sources but not recanonicalize them"
+    assert calls == [], "warm open must not recanonicalize sources"
+    assert sorted(verified) == sorted(old.event_ids), "every source must be reverified once"
 
 
 @pytest.mark.parametrize(
