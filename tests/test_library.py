@@ -212,6 +212,63 @@ def test_search_verifies_shared_source_once_per_transaction(tmp_path, monkeypatc
     assert len(reads) == 2
 
 
+def test_schema_rejects_unexpected_sqlite_like_names(tmp_path):
+    store, proposal, _, _ = prepared(tmp_path)
+    with sqlite3.connect(store.path) as db:
+        db.execute("CREATE TABLE sqliteXextra (value TEXT)")
+    with pytest.raises(ValueError, match="unsupported memory library schema"):
+        store.approve(proposal["proposal_ref"])
+
+
+def test_interrupted_first_initialization_leaves_retryable_state(tmp_path, monkeypatch):
+    module = importlib.import_module("hermes_ariadne.library")
+    store = library(tmp_path)
+    supplied = source(tmp_path / "input.txt", b"source")
+    note = {"title": "A", "text": "source", "kind": "quotation", "tags": [], "sources": [0]}
+    original = module._sync
+
+    def interrupted(path):
+        if path == store.directory:
+            raise OSError("synthetic initialization sync failure")
+        original(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module, "_sync", interrupted)
+        with pytest.raises(OSError, match="initialization sync failure"):
+            store.prepare(sources=[supplied], notes=[note])
+    # An absent or fully initialized DB is safe. A blank final DB is not.
+    assert store.prepare(sources=[supplied], notes=[note])["status"] == "draft"
+
+
+def test_approval_has_no_fallible_directory_sync_after_commit(tmp_path, monkeypatch):
+    store, proposal, _, _ = prepared(tmp_path)
+    module = importlib.import_module("hermes_ariadne.library")
+
+    def interrupted(path):
+        raise OSError("synthetic unexpected directory sync")
+
+    monkeypatch.setattr(module, "_sync", interrupted)
+    receipt = store.approve(proposal["proposal_ref"])
+    assert store.read(receipt["note_refs"][0])["text"] == "A café\nstatement"
+
+
+def test_source_path_cannot_alias_the_library(tmp_path):
+    store, _, _, notes = prepared(tmp_path)
+    sibling = tmp_path / "sibling"
+    sibling.mkdir()
+    raw = store.path.read_bytes()[:16]
+    spec = {
+        "path": str(sibling / ".." / store.directory.name / store.path.name),
+        "start_bytes": 0,
+        "length_bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "label": "Not an external source",
+    }
+    notes[0]["kind"] = "summary"
+    with pytest.raises(ValueError, match="external absolute path"):
+        store.prepare(sources=[spec], notes=notes)
+
+
 @pytest.mark.parametrize("target", ["home", "directory", "database", "wal", "shm", "journal"])
 def test_unsafe_destination_permissions_refuse_before_source_capture(tmp_path, monkeypatch, target):
     home = tmp_path / "home"

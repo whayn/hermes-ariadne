@@ -12,10 +12,11 @@ Use a private, existing development profile on Linux (profile directory mode
 `0700`). Use a Hermes build that supports native general plugins, plugin skills and
 slash commands; the integration test exercises the pinned host in the CI workflow.
 Review the Ariadne revision before installing native plugin code. In that profile,
-use the normal Hermes Git plugin installer with the reviewed revision:
+set `ARIADNE_REVISION` to the reviewed commit SHA, then use the normal Hermes Git
+plugin installer:
 
 ```sh
-HERMES_HOME=/absolute/dev-profile hermes plugins install whayn/hermes-ariadne --ref <commit-sha>
+HERMES_HOME=/absolute/dev-profile hermes plugins install whayn/hermes-ariadne --ref "$ARIADNE_REVISION"
 HERMES_HOME=/absolute/dev-profile hermes plugins enable ariadne-library
 ```
 
@@ -62,6 +63,9 @@ this experiment.
   reach its configured model. Source text and derived notes are untrusted. This
   plugin does not certify sanitization, restriction compliance or prompt-injection
   resistance for arbitrary files.
+- Use source and profile directories you control. Symlinks are refused, but
+  hostile concurrent replacement of parent directories is outside this trial's
+  threat model.
 
 The scripted native integration test exercises Git installation, skill discovery,
 Hermes tool dispatch, the registered approval handler, and read-back from a new

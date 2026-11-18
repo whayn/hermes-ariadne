@@ -62,7 +62,7 @@ text. Never place private sources in a code repository or a world-readable temp 
    context, not guessed latest-wins replacements. Completion: no knowingly redundant
    paraphrase or silent contradiction overwrite.
 4. **Select exact evidence bytes.** For each relevant file span, use `terminal` to run
-   `python "<this-skill-directory>/scripts/source_range.py" "/absolute/source/path" --start-bytes START --length-bytes COUNT --label "Source label"`.
+   `python "<this-skill-directory>/scripts/source_range.py" "/absolute/source/path" --start-bytes START --length-bytes COUNT --label="Source label"`.
    The stdlib helper returns a source descriptor (path, byte range and SHA-256),
    not the source's contents. Compute byte offsets from the actual file, not displayed
    line numbers or Unicode character positions. Minimize unrelated personal data.

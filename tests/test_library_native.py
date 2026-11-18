@@ -42,6 +42,8 @@ def test_normal_git_install_agent_ingestion_new_conversation_restart(tmp_path):
         target = fixture / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
+    git_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    git_env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
     for args in (
         ["init", "-q"],
         ["add", "."],
@@ -55,9 +57,14 @@ def test_normal_git_install_agent_ingestion_new_conversation_restart(tmp_path):
             "synthetic plugin snapshot",
         ],
     ):
-        subprocess.run(["git", *args], cwd=fixture, check=True, capture_output=True)
+        subprocess.run(["git", *args], cwd=fixture, env=git_env, check=True, capture_output=True)
     sha = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=fixture, check=True, capture_output=True, text=True
+        ["git", "rev-parse", "HEAD"],
+        cwd=fixture,
+        env=git_env,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     raw = b'{"arbitrary_app": {"message": "I prefer jasmine tea", "excluded": "DO_NOT_RETURN_RAW_METADATA"}}'
     path = tmp_path / "supplied.json"
@@ -144,14 +151,14 @@ def test_normal_git_install_agent_ingestion_new_conversation_restart(tmp_path):
                     "ariadne_memory_read",
                     "ariadne_memory_review",
                 }
-                deferred = not names <= available
-                if deferred:
-                    assert {"tool_describe", "tool_call", "tool_search"} <= available
-                    assert all(name in json.dumps(body["tools"]) for name in names)
+                # This tracer intentionally covers the pinned host's deferred path.
+                assert names.isdisjoint(available)
+                assert {"tool_describe", "tool_call", "tool_search"} <= available
+                assert all(name in json.dumps(body["tools"]) for name in names)
                 assert "ariadne_memory_approve" not in available
                 tools = [msg for msg in body["messages"] if msg["role"] == "tool"]
-                step = len(tools) - int(deferred)
-                if deferred and len(tools) == 0:
+                step = len(tools) - 1
+                if not tools:
                     tool_name, args = "tool_describe", {"names": sorted(names)}
                 elif mode[0] == "prepare" and step == 0:
                     tool_name, args = (
@@ -176,6 +183,10 @@ def test_normal_git_install_agent_ingestion_new_conversation_restart(tmp_path):
                     )
                 else:
                     assert step == 2 and "DO_NOT_RETURN_RAW_METADATA" not in json.dumps(tools)
+                    if mode[0] == "prepare":
+                        review = json.loads(tools[-1]["content"])
+                        assert review["ok"]
+                        assert review["result"]["note"]["text"] == note["text"]
                     tool_name = None
                 if tool_name:
                     if tool_name not in available:

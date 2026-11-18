@@ -4,12 +4,14 @@ No source application parsers, model calls, host DB writes or automatic context
 changes. Raw source ranges stay private; model tools retrieve approved notes.
 """
 
+import fcntl
 import hashlib
 import json
 import os
 import re
 import sqlite3
 import stat
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -90,7 +92,7 @@ def _sync(path):
 
 def _schema(conn):
     actual = conn.execute(
-        "SELECT sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name"
+        "SELECT sql FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' ORDER BY name"
     ).fetchall()
     expected = sorted(SCHEMA, key=lambda sql: sql.split()[2])
     if (
@@ -136,49 +138,62 @@ class Library:
     @contextmanager
     def _connection(self, *, write=False, create=False):
         self._admit()
-        fresh = False
-        if not self.path.is_file() and not create:
+        if create and not self.path.exists():
+            self._initialize()
+        if not self.path.is_file():
             raise ValueError("memory library is not initialized")
-        if create:
-            if not self.directory.exists():
-                self.directory.mkdir(mode=0o700)
-                _sync(self.home)
-            try:
-                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-            except FileExistsError:
-                pass
-            else:
-                os.close(fd)
-                fresh = True
-                _sync(self.directory)
         mode = "rw" if write else "ro"
         conn = sqlite3.connect(self.path.as_uri() + "?mode=" + mode, uri=True)
         try:
             conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("PRAGMA synchronous=EXTRA")
             conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-            if fresh:
-                if (
-                    conn.execute("PRAGMA application_id").fetchone()[0] != 0
-                    or conn.execute("PRAGMA user_version").fetchone()[0] != 0
-                ):
-                    raise ValueError("foreign memory library")
-                for sql in SCHEMA:
-                    conn.execute(sql)
-                conn.execute(f"PRAGMA application_id={APPLICATION_ID}")
-                conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             if not write:
                 conn.execute("PRAGMA query_only=ON")
             _schema(conn)
             yield conn
             if write:
                 conn.commit()
-                _sync(self.directory)
         except BaseException:
             conn.rollback()
             raise
         finally:
             conn.close()
+
+    def _initialize(self):
+        self.directory.mkdir(mode=0o700, exist_ok=True)
+        self._admit()
+        lock = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            # Cooperating initializers share this lock. The private directory is
+            # not a sandbox against a competing process of the same OS user.
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self._admit()
+            if self.path.exists():
+                return
+            _sync(self.home)
+            _sync(self.directory)
+            with tempfile.TemporaryDirectory(prefix=".initialize-", dir=self.directory) as staging:
+                path = Path(staging) / self.path.name
+                path.touch(mode=0o600, exist_ok=False)
+                conn = sqlite3.connect(path)
+                try:
+                    conn.execute("PRAGMA synchronous=EXTRA")
+                    conn.execute("BEGIN IMMEDIATE")
+                    for sql in SCHEMA:
+                        conn.execute(sql)
+                    conn.execute(f"PRAGMA application_id={APPLICATION_ID}")
+                    conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                    _schema(conn)
+                    conn.commit()
+                finally:
+                    conn.close()
+                if self.path.exists() or self.path.is_symlink():
+                    raise ValueError("memory library appeared during initialization")
+                path.rename(self.path)
+                _sync(self.directory)
+        finally:
+            os.close(lock)
 
     def _capture(self, spec):
         if type(spec) is not dict or set(spec) != {
@@ -190,7 +205,7 @@ class Library:
         }:
             raise ValueError("invalid source range schema")
         path = Path(_text(spec["path"], 4096))
-        if not path.is_absolute() or path.is_relative_to(self.directory):
+        if not path.is_absolute() or ".." in path.parts or path.is_relative_to(self.directory):
             raise ValueError("source requires an explicit external absolute path")
         for parent in (path, *path.parents):
             if parent.is_symlink():
