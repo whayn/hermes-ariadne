@@ -192,6 +192,26 @@ def test_unicode_character_pages_and_search_pagination(tmp_path):
     assert store.search("CAFÉ")["results"] == []
 
 
+def test_search_verifies_shared_source_once_per_transaction(tmp_path, monkeypatch):
+    store, proposal, _, _ = prepared(tmp_path, count=7)
+    store.approve(proposal["proposal_ref"])
+    reads = []
+    original = store._source
+
+    def capture(conn, ref):
+        reads.append(ref)
+        return original(conn, ref)
+
+    monkeypatch.setattr(store, "_source", capture)
+    assert store.search("not present", limit=1)["results"] == []
+    assert len(reads) == 1
+    with sqlite3.connect(store.path) as db:
+        db.execute("UPDATE sources SET data=?", (b"changed",))
+    with pytest.raises(ValueError, match="source changed"):
+        store.search("café", limit=1)
+    assert len(reads) == 2
+
+
 @pytest.mark.parametrize("target", ["home", "directory", "database", "wal", "shm", "journal"])
 def test_unsafe_destination_permissions_refuse_before_source_capture(tmp_path, monkeypatch, target):
     home = tmp_path / "home"

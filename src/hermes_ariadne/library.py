@@ -251,8 +251,10 @@ class Library:
             raise ValueError("memory source changed")
         return data
 
-    def _validate_note(self, conn, note):
+    def _validate_note(self, conn, note, *, load_source=None):
         _note(note)
+        if load_source is None:
+            load_source = self._source
         data = []
         for source in note["sources"]:
             if type(source) is not dict or set(source) != {
@@ -265,7 +267,7 @@ class Library:
                 raise ValueError("invalid stored provenance")
             _text(source["label"], 160)
             _text(source["path"], 4096)
-            raw = self._source(conn, source["ref"])
+            raw = load_source(conn, source["ref"])
             if (
                 type(source["start_bytes"]) is not int
                 or source["start_bytes"] < 0
@@ -427,6 +429,22 @@ class Library:
             return {"results": [], "next_offset": None, "trust": TRUST}
         hits = []
         with self._connection() as conn:
+            # Reuse verified bytes only within this SQLite read snapshot. Never
+            # let corrupt or oversized state grow the cache past the library cap.
+            verified = {}
+            verified_bytes = 0
+
+            def load_source(conn, ref):
+                nonlocal verified_bytes
+                _ref(ref, "source")
+                if ref not in verified:
+                    raw = self._source(conn, ref)
+                    verified_bytes += len(raw)
+                    if verified_bytes > MAX_LIBRARY_BYTES:
+                        raise ValueError("memory library capacity exceeded")
+                    verified[ref] = raw
+                return verified[ref]
+
             keys = conn.execute(
                 "SELECT DISTINCT n.ref FROM notes n JOIN publications p ON p.note_ref=n.ref JOIN approvals a ON a.proposal_ref=p.proposal_ref ORDER BY n.ref LIMIT ?",
                 (MAX_NOTES + 1,),
@@ -434,7 +452,9 @@ class Library:
             if len(keys) > MAX_NOTES:
                 raise ValueError("memory note capacity exceeded")
             for (key,) in keys:
-                note = self._validate_note(conn, self._payload(conn, "notes", key))
+                note = self._validate_note(
+                    conn, self._payload(conn, "notes", key), load_source=load_source
+                )
                 if (
                     query in note["title"]
                     or query in note["text"]
