@@ -66,6 +66,14 @@ this experiment.
 - Use source and profile directories you control. Symlinks are refused, but
   hostile concurrent replacement of parent directories is outside this trial's
   threat model.
+- The agent must select only files you explicitly supplied. The prepare tool
+  does not independently enforce that consent: it can read and retain bounded
+  ranges from other local files that Hermes can read. Approval controls note
+  publication, not filesystem access or draft retention. Do not enable this
+  draft in a profile with access to sensitive files.
+- Quotations must occur as literal UTF-8 bytes in the selected range. Use a
+  labeled summary rather than a quotation for decoded or escaped text that
+  does not occur verbatim in the source bytes.
 
 The scripted native integration test exercises Git installation, skill discovery,
 Hermes tool dispatch, the registered approval handler, and read-back from a new
