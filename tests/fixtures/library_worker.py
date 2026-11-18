@@ -23,6 +23,18 @@ def report_failure(exc_type, exc, tb):
     print(f"library fixture: stage={stage} error={exc_type.__name__}", file=sys.stderr)
     for frame in traceback.extract_tb(tb)[-6:]:
         print(f"library fixture: {Path(frame.filename).name}:{frame.lineno}", file=sys.stderr)
+    # The installer wraps PM failures; surface the typed cause and its origin
+    # without dumping arbitrary exception messages, environment or credentials.
+    cause = exc.__cause__
+    if cause is not None:
+        print(f"library fixture: cause={type(cause).__name__}", file=sys.stderr)
+        if isinstance(cause, OSError):
+            print(f"library fixture: errno={cause.errno!r}", file=sys.stderr)
+        for frame in traceback.extract_tb(cause.__traceback__)[-4:]:
+            print(
+                f"library fixture: cause at {Path(frame.filename).name}:{frame.lineno}",
+                file=sys.stderr,
+            )
 
 
 sys.excepthook = report_failure
