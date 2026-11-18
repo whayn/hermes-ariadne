@@ -15,6 +15,11 @@ provider) is recorded in its docs, with the failure modes it hit. All three
 displace the built-in compressor; long chats or selection fallback can hit
 provider limits. This is not yet a production long-horizon memory engine.
 
+For a separate experiment that **does not replace the context engine**, see
+[agent-driven memory ingestion](docs/memory-library.md). Hermes can interpret
+user-supplied files, draft source-linked notes for review, and retrieve approved
+notes in a new chat in the same profile. There is no app-specific importer.
+
 ## Passive engine (`ariadne`)
 
 - Exact JSON-value snapshots: Unicode, whitespace, structured content, nulls,

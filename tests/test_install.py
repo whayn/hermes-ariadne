@@ -346,4 +346,6 @@ def test_package_data_includes_all_opt_in_manifests():
         "plugin.yaml",
         "prepared_plugin.yaml",
         "rolling_plugin.yaml",
+        "skills/ariadne-import/SKILL.md",
+        "skills/ariadne-import/scripts/*.py",
     ]

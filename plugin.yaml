@@ -1,0 +1,12 @@
+name: ariadne-library
+version: "0.1.0"
+description: Agent-driven, source-linked profile memory with reviewed publication.
+author: Whayn
+license: Apache-2.0
+homepage: https://github.com/whayn/hermes-ariadne
+kind: standalone
+provides_tools:
+  - ariadne_memory_prepare
+  - ariadne_memory_review
+  - ariadne_memory_search
+  - ariadne_memory_read
