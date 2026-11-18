@@ -48,7 +48,10 @@ def guard(event, args):
             if not allowed:
                 violations.append(path.name)
             assert allowed, "shared credential/config read forbidden"
-    if event == "socket.connect":
+    # The real Git installer can bootstrap Hermes' checksum-pinned PM tools
+    # on a cold runner. Only this setup phase needs download access; the
+    # source-selection and conversation phases remain loopback-only.
+    if event == "socket.connect" and stage != "install":
         address = args[1]
         # UNIX-domain sockets need no network access; TCP must stay on loopback.
         if isinstance(address, tuple):
