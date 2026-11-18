@@ -38,6 +38,10 @@ def _sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def _source_identity(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
 def _ref(value, prefix):
     if type(value) is not str or not re.fullmatch(prefix + r":[0-9a-f]{64}", value):
         raise ValueError("invalid memory reference")
@@ -121,7 +125,10 @@ def _note(note):
 
 
 class Library:
-    def __init__(self, home):
+    def __init__(self, home, *, source_authority=None):
+        # Direct operator callers are trusted. Model-facing registration always
+        # supplies an authority populated exclusively by the user command.
+        self._source_authority = source_authority
         self.home = Path(home).absolute()
         self.directory = self.home / "ariadne-library"
         self.path = self.directory / "memory.sqlite3"
@@ -195,6 +202,33 @@ class Library:
         finally:
             os.close(lock)
 
+    def _source_path(self, value):
+        path = Path(_text(value, 4096))
+        if path.anchor != "/" or ".." in path.parts or path.is_relative_to(self.directory):
+            raise ValueError("source requires an explicit external absolute path")
+        for parent in (path, *path.parents):
+            if parent.is_symlink():
+                raise ValueError("source paths must not traverse symlinks")
+        return path
+
+    @contextmanager
+    def _open_source(self, path):
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError("source must be a regular single-link file")
+            yield fd, info
+        finally:
+            os.close(fd)
+
+    def select_source(self, value):
+        """Trusted operator selection: bind metadata without reading source bytes."""
+        self._admit()
+        path = self._source_path(value)
+        with self._open_source(path) as (_, info):
+            return str(path), _source_identity(info)
+
     def _capture(self, spec):
         if type(spec) is not dict or set(spec) != {
             "path",
@@ -204,12 +238,12 @@ class Library:
             "label",
         }:
             raise ValueError("invalid source range schema")
-        path = Path(_text(spec["path"], 4096))
-        if not path.is_absolute() or ".." in path.parts or path.is_relative_to(self.directory):
-            raise ValueError("source requires an explicit external absolute path")
-        for parent in (path, *path.parents):
-            if parent.is_symlink():
-                raise ValueError("source paths must not traverse symlinks")
+        path = self._source_path(spec["path"])
+        expected = None
+        if self._source_authority is not None:
+            expected = self._source_authority.get(str(path))
+            if expected is None:
+                raise ValueError("source not selected by operator")
         start, size = spec["start_bytes"], spec["length_bytes"]
         if (
             type(start) is not int
@@ -220,20 +254,18 @@ class Library:
             raise ValueError("invalid source byte range")
         _ref("source:" + spec["sha256"], "source")
         _text(spec["label"], 160)
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or start + size > info.st_size:
-                raise ValueError(
-                    "source must be a regular single-link file with the selected range"
-                )
+        with self._open_source(path) as (fd, info):
+            if expected is not None and _source_identity(info) != expected:
+                raise ValueError("selected source changed")
+            if start + size > info.st_size:
+                raise ValueError("source does not contain the selected range")
             with os.fdopen(fd, "rb", closefd=False) as stream:
                 stream.seek(start)
                 data = stream.read(size)
             if len(data) != size or _sha(data) != spec["sha256"]:
                 raise ValueError("source hash mismatch")
-        finally:
-            os.close(fd)
+            if expected is not None and _source_identity(os.fstat(fd)) != expected:
+                raise ValueError("selected source changed during read")
         manifest = {
             "ref": "source:" + _sha(data),
             "label": spec["label"],

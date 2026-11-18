@@ -48,31 +48,54 @@ def test_profile_bound_registration_preparation_and_user_approval(tmp_path, monk
     path.write_bytes(raw)
     import hashlib
 
-    response = json.loads(
-        ctx.tools["ariadne_memory_prepare"]["handler"](
+    prepare = ctx.tools["ariadne_memory_prepare"]["handler"]
+    params = {
+        "sources": [
             {
-                "sources": [
-                    {
-                        "path": str(path),
-                        "label": "Test",
-                        "start_bytes": 0,
-                        "length_bytes": len(raw),
-                        "sha256": hashlib.sha256(raw).hexdigest(),
-                    }
-                ],
-                "notes": [
-                    {
-                        "title": "A",
-                        "text": "portable source",
-                        "kind": "quotation",
-                        "tags": [],
-                        "sources": [0],
-                    }
-                ],
+                "path": str(path),
+                "label": "Test",
+                "start_bytes": 0,
+                "length_bytes": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
             }
-        )
-    )
+        ],
+        "notes": [
+            {
+                "title": "A",
+                "text": "portable source",
+                "kind": "quotation",
+                "tags": [],
+                "sources": [0],
+            }
+        ],
+    }
+    assert not json.loads(prepare(params))["ok"]
+    assert not (first / "ariadne-library").exists()
+    select = ctx.commands["ariadne-source"]
+    assert json.loads(select(str(path)))["ok"]
+    assert not (first / "ariadne-library").exists()
+    unselected = tmp_path / "unselected.txt"
+    unselected.write_bytes(raw)
+    other_params = {**params, "sources": [{**params["sources"][0], "path": str(unselected)}]}
+    assert not json.loads(prepare(other_params))["ok"]
+    restarted = Context()
+    plugin.register(restarted)
+    assert not json.loads(restarted.tools["ariadne_memory_prepare"]["handler"](params))["ok"]
+    replacement = tmp_path / "replacement.txt"
+    replacement.write_bytes(raw)
+    replacement.replace(path)
+    assert not json.loads(prepare(params))["ok"]
+    assert not (first / "ariadne-library").exists()
+    assert json.loads(select(str(path)))["ok"]
+    path.write_bytes(raw + b" edited")
+    assert not json.loads(prepare(params))["ok"]
+    assert not (first / "ariadne-library").exists()
+    path.write_bytes(raw)
+    assert json.loads(select(str(path)))["ok"]
+    response = json.loads(prepare(params))
     assert response["ok"]
+    assert json.loads(select("--clear"))["ok"]
+    assert not json.loads(prepare(params))["ok"]
     ref = response["result"]["proposal_ref"]
     assert not (other / "ariadne-library").exists()
     approved = json.loads(ctx.commands["ariadne-approve"](ref))

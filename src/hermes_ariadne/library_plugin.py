@@ -3,6 +3,7 @@
 import json
 import sqlite3
 from pathlib import Path
+from threading import Lock
 
 from .library import Library
 from .store import canonical_json
@@ -133,7 +134,32 @@ def register(ctx):
     # registration does not construct/open a DB or read any source/model.
     from hermes_constants import get_hermes_home
 
-    library = Library(get_hermes_home())
+    selected = {}
+    selection_lock = Lock()
+    library = Library(get_hermes_home(), source_authority=selected)
+
+    def select_source(value):
+        with selection_lock:
+            if value == "--clear":
+                selected.clear()
+                return {"selected_count": 0}
+            path, identity = library.select_source(value)
+            if path not in selected and len(selected) >= 8:
+                raise ValueError("source selection limit reached")
+            selected[path] = identity
+            return {"selected_count": len(selected)}
+
+    def prepare(sources, notes):
+        with selection_lock:
+            return library.prepare(sources=sources, notes=notes)
+
+    select = _handler(select_source, {"properties": {"value": {}}, "required": ["value"]})
+    ctx.register_command(
+        "ariadne-source",
+        lambda raw_args: select({"value": raw_args}),
+        description="Select a local file for memory drafting, or clear the selection.",
+        args_hint="<absolute path | --clear>",
+    )
     ctx.register_skill(
         "ariadne-import",
         Path(__file__).with_name("skills") / "ariadne-import" / "SKILL.md",
@@ -154,7 +180,9 @@ def register(ctx):
                 "description": definition["description"],
                 "parameters": parameters,
             },
-            handler=_handler(getattr(library, method), definition),
+            handler=_handler(
+                prepare if method == "prepare" else getattr(library, method), definition
+            ),
         )
     approve = _handler(library.approve, {"properties": {"ref": {}}, "required": ["ref"]})
     ctx.register_command(

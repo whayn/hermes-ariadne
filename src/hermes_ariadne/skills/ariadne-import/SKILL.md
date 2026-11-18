@@ -27,8 +27,8 @@ a complete conversation migration or an automatic background summarizer.
 ## Prerequisites
 
 The `ariadne-library` general plugin must be enabled in the intended Hermes profile.
-Its four `ariadne_memory_*` tools and the `/ariadne-approve` user command must be
-available. The host chooses the destination; never substitute another profile or
+Its four `ariadne_memory_*` tools and the `/ariadne-source` and `/ariadne-approve`
+user commands must be available. The host chooses the destination; never substitute another profile or
 manually write its database. This workflow does not switch the context engine.
 
 Sources must be explicit local regular single-link files (no symlinks). The MVP
@@ -39,8 +39,10 @@ text. Never place private sources in a code repository or a world-readable temp 
 
 ## Procedure
 
-1. **Establish scope.** Identify the user-supplied files and the desired knowledge,
-   not just an application's name. For large archives, first inspect bounded chunks
+1. **Establish scope.** Identify the files and the desired knowledge. Ask the user
+   to enter `/ariadne-source /absolute/path/to/file` for each source before drafting.
+   Do not invoke or simulate this command for them. If the file changes, ask them
+   to reselect it. For large archives, first inspect bounded chunks
    with `read_file` or relevant document tools. Ask only about consequential ambiguity
    (which conversations/branches, subjects or people). Don't invent missing dates,
    speakers or attachments. Completion: selected content and excluded material are

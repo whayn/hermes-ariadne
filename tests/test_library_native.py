@@ -155,7 +155,7 @@ def test_normal_git_install_agent_ingestion_new_conversation_restart(tmp_path):
                 assert names.isdisjoint(available)
                 assert {"tool_describe", "tool_call", "tool_search"} <= available
                 assert all(name in json.dumps(body["tools"]) for name in names)
-                assert "ariadne_memory_approve" not in available
+                assert {"ariadne_memory_approve", "ariadne-source"}.isdisjoint(available)
                 tools = [msg for msg in body["messages"] if msg["role"] == "tool"]
                 step = len(tools) - 1
                 if not tools:
@@ -288,7 +288,13 @@ def test_normal_git_install_agent_ingestion_new_conversation_restart(tmp_path):
                     timeout=180,
                 )
             code = process.returncode
-            assert code == 0, f"library worker {phase} failed (exit {code}); see {stderr}"
+            if code:
+                diagnostics = [
+                    line
+                    for line in stderr.read_text(errors="replace").splitlines()
+                    if line.startswith("library fixture: ")
+                ]
+                pytest.fail(f"library worker {phase} failed (exit {code}): {diagnostics[-8:]}")
             receipts.append(json.loads(process.stdout.decode().splitlines()[-1]))
     finally:
         server.shutdown()

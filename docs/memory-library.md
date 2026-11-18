@@ -27,8 +27,10 @@ in tests; Desktop installation and host isolation mode are not verified. Do not
 change an existing profile's isolation policy or switch its context engine for
 this experiment.
 
-1. Supply a small local file and ask Hermes: “Use the Ariadne import skill to
-   remember the decisions and preferences in this file. Show me what you'd keep.”
+1. In the disposable profile, enter `/ariadne-source /absolute/path/to/file`
+   yourself, then ask Hermes: “Use the Ariadne import skill to remember the
+   decisions and preferences in this file. Show me what you'd keep.” Select
+   files one at a time; the command does not copy any bytes.
 2. Hermes inspects the file and proposes notes tagged as quotations, summaries or
    inferences. Check what's retained, what's skipped, and which ranges back each
    note. A draft already stores the selected bytes privately on disk, but no draft
@@ -66,11 +68,12 @@ this experiment.
 - Use source and profile directories you control. Symlinks are refused, but
   hostile concurrent replacement of parent directories is outside this trial's
   threat model.
-- The agent must select only files you explicitly supplied. The prepare tool
-  does not independently enforce that consent: it can read and retain bounded
-  ranges from other local files that Hermes can read. Approval controls note
-  publication, not filesystem access or draft retention. Do not enable this
-  draft in a profile with access to sensitive files.
+- The prepare tool only captures ranges from files selected through the user
+  command. It refuses replaced or edited files until you reselect them. Up to
+  eight selections are shared by the running plugin instance in that profile;
+  a restart/reload drops them. `/ariadne-source --clear` drops all selections
+  without deleting drafts or published notes. This does not restrict ordinary
+  Hermes tools or another process with filesystem access.
 - Quotations must occur as literal UTF-8 bytes in the selected range. Use a
   labeled summary rather than a quotation for decoded or escaped text that
   does not occur verbatim in the source bytes.

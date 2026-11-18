@@ -6,6 +6,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 HOME = Path(os.environ["HERMES_HOME"])
@@ -15,6 +16,16 @@ assert Path(os.environ["HERMES_MANAGED_DIR"]).is_relative_to(HOME.parent)
 MODE, BASE_URL, PLAN_PATH = sys.argv[1:]
 PLAN = json.loads(Path(PLAN_PATH).read_bytes())
 violations = []
+stage = "bootstrap"
+
+
+def report_failure(exc_type, exc, tb):
+    print(f"library fixture: stage={stage} error={exc_type.__name__}", file=sys.stderr)
+    for frame in traceback.extract_tb(tb)[-6:]:
+        print(f"library fixture: {Path(frame.filename).name}:{frame.lineno}", file=sys.stderr)
+
+
+sys.excepthook = report_failure
 
 
 def guard(event, args):
@@ -38,6 +49,7 @@ import httpx  # noqa: E402,F401
 import openai  # noqa: E402,F401
 
 if MODE == "prepare":
+    stage = "install"
     from hermes_cli.plugins_cmd_install import _install_plugin_core
 
     target, _, name = _install_plugin_core(
@@ -54,6 +66,7 @@ if MODE == "prepare":
     ).stdout.strip()
     assert revision == PLAN["git_sha"]
 
+stage = "discovery"
 from hermes_cli.plugins import get_plugin_command_handler, get_plugin_manager  # noqa: E402
 from hermes_state import SessionDB  # noqa: E402
 from run_agent import AIAgent  # noqa: E402
@@ -67,6 +80,13 @@ skill = manager.find_plugin_skill("ariadne-library:ariadne-import")
 assert skill and skill.is_relative_to(HOME / "plugins" / "ariadne-library")
 assert (skill.parent / "scripts" / "source_range.py").is_file()
 
+stage = "source-selection"
+if MODE == "prepare":
+    select = get_plugin_command_handler("ariadne-source")
+    assert callable(select)
+    assert json.loads(select(PLAN["source"]["path"]))["ok"]
+
+stage = "conversation"
 session = "synthetic-library-" + MODE
 db = SessionDB(db_path=HOME / "state.db")
 db.create_session(session, source="cli", model="synthetic/library")
