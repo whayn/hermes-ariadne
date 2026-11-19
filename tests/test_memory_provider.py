@@ -34,9 +34,9 @@ def test_satisfies_abc_and_name():
     assert p.get_config_schema() == []
 
 
-def test_one_tool_schema():
+def test_tool_schemas():
     schemas = AriadneMemoryProvider().get_tool_schemas()
-    assert [s["name"] for s in schemas] == ["ariadne_notes"]
+    assert [s["name"] for s in schemas] == ["ariadne_notes", "ariadne_conversations"]
     actions = schemas[0]["parameters"]["properties"]["action"]["enum"]
     assert set(actions) == {"add", "edit", "delete", "list", "search", "get"}
 

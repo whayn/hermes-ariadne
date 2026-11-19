@@ -4,12 +4,12 @@ One Hermes plugin, `ariadne`, that you select in **both** settings slots:
 
 | Slot | Setting | What it does now |
 |---|---|---|
-| Memory provider | `memory.provider: ariadne` | Profile notes (`ariadne_notes` tool), one-way mirror of built-in memory writes, relevant notes recalled each turn |
-| Context engine | `context.engine: ariadne` | The rolling engine (automatic summaries of older turns through Hermes's LLM facade, page/search tools) |
+| Memory provider | `memory.provider: ariadne` | Profile notes (`ariadne_notes`), one-way mirror of built-in memory writes, recall of relevant notes and past conversations each turn, `ariadne_conversations` to read past chats |
+| Context engine | `context.engine: ariadne` | The rolling engine (automatic summary of older turns through Hermes's LLM facade, page/search/zoom tools) plus the conversation index |
 
-Status: **experimental; use a dedicated development profile**. Phase 1 of the
-plan in #41. Not yet implemented: the UniiChat summary tree and zoom for the
-engine (phase 2), the past-conversation index in new chats (phase 3), and the
+Status: **experimental; use a dedicated development profile**. Phases 1 and 3
+of #41. The MVP keeps rolling's single cumulative summary with exact zoom; the
+UniiChat summary tree is deferred until after the MVP. Not yet implemented: the
 import skill (phase 4).
 
 ## Install (development profile)
@@ -65,3 +65,35 @@ installed host source and exercised by `tests/test_mvp_native.py`):
 - Recall is literal word overlap between the user's message and note text/tags,
   capped at 2,000 characters, labelled as stored data rather than instructions.
   It is not semantic search.
+
+## Past conversations
+
+The engine keeps a small index in the same private store
+(`conversations` table): each archived conversation's first user message as a
+preview, its Hermes title when available, and the latest summary rolling
+published. It is derived navigation data; the exact messages stay in
+`$HERMES_HOME/ariadne/events.sqlite3`, and index failures never affect the chat.
+
+- **First turn of a chat:** recall adds the 8 most recently updated other
+  conversations. **Every turn:** up to 3 other conversations whose title,
+  preview or summary shares words with the message (searched among the 50 most
+  recent). Capped at 1,500 characters, labelled as historical data.
+- **`ariadne_conversations`:** `list`, `search` (literal, over the index and
+  every archived message of other conversations), `open` (summary/metadata),
+  `read` (exact archived messages in first-observed order, 4,000 characters per
+  message) and `zoom` (one full message, paged by characters). The archive is
+  opened read-only and never created by these tools; payloads are rehashed
+  against their ids and reasoning/replay fields are left out of results.
+- Edited messages appear as separate versions with the same `message_uid`.
+- Every chat that runs with the engine is indexed, including delegated
+  subagent and cron sessions. Conversations from before the plugin was
+  installed are not indexed.
+
+Evidence: `tests/test_mvp_native.py` installs the plugin with the real
+installer, runs chat A (the agent saves a note through the real tool loop),
+then a new chat B in another process against a loopback provider. Chat B's
+request contains the note and chat A's index entry, and its
+`ariadne_conversations` read returns chat A's exact original message. The tools
+were exposed directly in that configuration; the deferred `tool_call` path is
+not exercised. This is plumbing evidence with a scripted provider, not a claim
+about how well a real model uses the recall.
