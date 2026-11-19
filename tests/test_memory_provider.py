@@ -121,3 +121,8 @@ def test_store_is_profile_scoped(tmp_path):
         homes.append((home, p))
     call(homes[0][1], action="add", text="only in a")
     assert NoteStore(homes[1][0]).list()["total"] == 0
+
+
+def test_multiword_tags_match_query_words(provider):
+    call(provider, action="add", text="Prefers short examples", tags=["machine learning"])
+    assert "short examples" in provider.prefetch("Explain machine learning")
