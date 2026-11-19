@@ -349,3 +349,28 @@ def test_preview_skips_restricted_first_message():
 
     assert _first_user_text([{"role": "user", "content": "ok"}]) == "ok"
     assert _first_user_text([{"role": "user", "content": "x", "data_use": ["no_training"]}]) is None
+
+
+@needs_host
+def test_engine_index_ignores_completion_from_a_replaced_session(tmp_path, monkeypatch):
+    from test_rolling_engine import DB, Facade, complete
+    from test_rolling_selection import POLICY, exchange
+
+    from hermes_ariadne import rolling
+    from hermes_ariadne.mvp_engine import AriadneEngine
+
+    monkeypatch.setattr(AriadneEngine, "_bound_reasoning_policy", staticmethod(lambda *a: POLICY))
+    facade, db = Facade(), DB()
+    engine = AriadneEngine(llm=facade, settings=rolling.RollingSettings(trigger_bytes=1))
+    engine.update_model("gpt-test", 100000, "https://invalid.test", "", "fixture", "fixture")
+    engine.bind_session_state(db, "s")
+    engine.on_session_start("s", hermes_home=tmp_path)
+    db.rows = exchange("A") + exchange("B")
+
+    def rebind():
+        engine.on_session_reset()
+        engine.bind_session_state(DB(), "other")
+
+    facade.hook = rebind  # session replaced while the summary call is in flight
+    complete(engine, db, "B")
+    assert NoteStore(tmp_path).get_conversation("other") is None
