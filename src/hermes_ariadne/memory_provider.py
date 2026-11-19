@@ -13,7 +13,7 @@ from agent.memory_provider import MemoryProvider
 
 from .conversations import ArchiveReader
 from .importer import MAX_BATCH, Importer
-from .notes import MAX_PAGE, NoteStore
+from .notes import MAX_PAGE, NoteStore, StorageRefused
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +220,9 @@ class AriadneMemoryProvider(MemoryProvider):
             return _err("invalid_argument")
         except KeyError:
             return _err("not_found")
+        except StorageRefused as exc:
+            logger.warning("ariadne storage refused: %s", exc)
+            return _err("storage_refused")
         except (ValueError, TypeError):
             return _err("invalid_argument")
         except Exception as exc:  # sqlite/OS failures: never echo paths or text
@@ -263,6 +266,9 @@ class AriadneMemoryProvider(MemoryProvider):
                 )
                 return _ok(**found) if found else _err("not_found")
             return _err("invalid_argument")
+        except StorageRefused as exc:
+            logger.warning("ariadne storage refused: %s", exc)
+            return _err("storage_refused")
         except (ValueError, TypeError):
             return _err("invalid_argument")
         except Exception as exc:
@@ -283,6 +289,9 @@ class AriadneMemoryProvider(MemoryProvider):
                     source=args.get("source"),
                 )
             )
+        except StorageRefused as exc:
+            logger.warning("ariadne storage refused: %s", exc)
+            return _err("storage_refused")
         except (ValueError, TypeError):
             return _err("invalid_argument")
         except Exception as exc:

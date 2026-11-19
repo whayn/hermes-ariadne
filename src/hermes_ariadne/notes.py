@@ -50,6 +50,10 @@ MAX_SUMMARY_CHARS = 8000
 CONVERSATION_ORIGINS = ("live", "import")
 
 
+class StorageRefused(ValueError):
+    """Ariadne's private storage failed admission (links, permissions, foreign files)."""
+
+
 def _text(value):
     if not isinstance(value, str) or not value.strip():
         raise ValueError("note text must be a non-empty string")
@@ -84,13 +88,13 @@ def _check_private(path, *, regular):
     """Refuse links, shared permissions and non-regular files before any open."""
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode):
-        raise ValueError("ariadne paths must not be symlinks")
+        raise StorageRefused("ariadne paths must not be symlinks")
     if regular and (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
-        raise ValueError("ariadne store must be a regular single-link file")
+        raise StorageRefused("ariadne store must be a regular single-link file")
     if not regular and not stat.S_ISDIR(info.st_mode):
-        raise ValueError("ariadne directory is not a directory")
+        raise StorageRefused("ariadne directory is not a directory")
     if info.st_mode & 0o077:
-        raise ValueError("ariadne paths must be private")
+        raise StorageRefused("ariadne paths must be private")
 
 
 def _fsync_dir(path):
@@ -145,10 +149,10 @@ class NoteStore:
 
     def _admit(self, *, create):
         if not self.home.is_absolute():
-            raise ValueError("hermes home must be absolute")
+            raise StorageRefused("hermes home must be absolute")
         for parent in (self.home, *self.home.parents):
             if parent.is_symlink():
-                raise ValueError("hermes home must not traverse symlinks")
+                raise StorageRefused("hermes home must not traverse symlinks")
         if not (self.directory.exists() or self.directory.is_symlink()):
             if not create:
                 return False
@@ -203,7 +207,7 @@ class NoteStore:
                 conn.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID
                 or conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
             ):
-                raise ValueError("not an ariadne note store")
+                raise StorageRefused("not an ariadne note store")
             conn.execute("PRAGMA foreign_keys=ON")
             if write:
                 conn.execute("PRAGMA synchronous=FULL")

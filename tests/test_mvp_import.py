@@ -145,3 +145,23 @@ def test_skill_is_registered_and_bundled():
     assert name == "import" and path.is_file()
     text = path.read_text()
     assert text.startswith("---\nname: import\n") and "ariadne_import" in text
+
+
+def test_shared_home_permissions_report_storage_refused_not_bad_argument(tmp_path):
+    # `hermes profile create` makes 0755 homes; the archive admission refuses them.
+    home = tmp_path / "shared-home"
+    home.mkdir()
+    os.chmod(home, 0o755)
+    provider = AriadneMemoryProvider()
+    provider.initialize("s", hermes_home=str(home))
+    batch = {"key": "k", "messages": [{"role": "user", "content": "hi"}]}
+    assert json.loads(provider.handle_tool_call("ariadne_import", batch)) == {
+        "ok": False,
+        "error": "storage_refused",
+    }
+    read = {"action": "read", "id": "import-x"}
+    assert json.loads(provider.handle_tool_call("ariadne_conversations", read)) == {
+        "ok": False,
+        "error": "storage_refused",
+    }
+    assert not (home / "ariadne" / "events.sqlite3").exists()

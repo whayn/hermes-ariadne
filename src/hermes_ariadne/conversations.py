@@ -12,6 +12,7 @@ import json
 import sqlite3
 from pathlib import Path
 
+from .notes import StorageRefused
 from .rolling_engine import _archive_path
 from .store import APPLICATION_ID, carrier_free, search_text
 
@@ -46,13 +47,16 @@ class ArchiveReader:
         self.home = Path(home)
 
     def _connect(self):
-        archive = _archive_path(self.home)  # metadata-only admission, no creation
+        try:
+            archive = _archive_path(self.home)  # metadata-only admission, no creation
+        except ValueError as exc:
+            raise StorageRefused(str(exc)) from exc
         if not archive.is_file():
             return None
         conn = sqlite3.connect(f"file:{archive}?mode=ro", uri=True, timeout=10)
         if conn.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID:
             conn.close()
-            raise ValueError("not an ariadne archive")
+            raise StorageRefused("not an ariadne archive")
         return conn
 
     def _rows(self, sql, params):

@@ -11,7 +11,7 @@ summary is index data labelled as such, never canonical.
 
 import hashlib
 
-from .notes import NoteStore
+from .notes import NoteStore, StorageRefused
 from .receipts import _mkdir_private
 from .rolling_engine import _archive_path
 from .store import EventStore
@@ -70,9 +70,12 @@ class Importer:
         conv_id = conversation_id(key)
         rows = _messages(messages, conv_id, offset)
         notes = NoteStore(self.home)
-        archive = _archive_path(self.home)  # admission before any file is created
-        _mkdir_private(archive.parent)
-        archive = _archive_path(self.home)
+        try:
+            archive = _archive_path(self.home)  # admission before any file is created
+            _mkdir_private(archive.parent)
+            archive = _archive_path(self.home)
+        except ValueError as exc:
+            raise StorageRefused(str(exc)) from exc
         outcome = EventStore(archive).ingest(conv_id, rows, origin="import", start=offset)
         preview = next((r["content"] for r in rows if r["role"] == "user"), None)
         notes.upsert_conversation(
