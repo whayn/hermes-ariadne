@@ -30,7 +30,12 @@ import time
 import traceback
 from pathlib import Path
 
-SESSIONS = {"import": "gate-import", "long": "gate-long", "newchat": "gate-newchat"}
+SESSIONS = {
+    "import": "gate-import",
+    "long": "gate-long",
+    "newchat": "gate-newchat",
+    "probe": "gate-probe",
+}
 
 EXPORT = [
     {
@@ -237,6 +242,28 @@ def main():
     for name in ("select_context", "on_turn_complete", "handle_tool_call"):
         observe(name)
 
+    def observe_failure(name):
+        method = getattr(engine_class, name)
+
+        def wrapper(self, *args, **kwargs):
+            etype, exc, tb = sys.exc_info()
+            record = {"failure": name}
+            if exc is not None:
+                frames = [
+                    f"{Path(f.filename).name}:{f.lineno}:{f.name}"
+                    for f in traceback.extract_tb(tb)
+                    if str(plugin) in f.filename
+                ]
+                record.update(type=etype.__name__, message=str(exc)[:300], frames=frames[-6:])
+            events.append(record)
+            return method(self, *args, **kwargs)
+
+        setattr(engine_class, name, wrapper)
+
+    for name in ("_decline", "_unavailable", "_refuse_archive"):
+        if hasattr(engine_class, name):
+            observe_failure(name)
+
     db = SessionDB(db_path=home / "state.db")
     runtime = resolve_runtime_provider(requested=provider, target_model=model)
     run = os.environ.get("GATE_RUN", "r1")
@@ -279,6 +306,8 @@ def main():
         prompts = LONG_TURNS
     elif phase == "restart":
         prompts = [RESTART_TURN]
+    elif phase == "probe":
+        prompts = ["Say hi in five words."]
     else:
         prompts = NEWCHAT_TURNS
 
@@ -305,6 +334,7 @@ def main():
                 "tools": tool_names(messages, len(history)),
                 "answer": (result.get("final_response") or "")[:1500],
                 "hooks": list(events),
+                "status": json.loads(json.dumps(status, default=str)),
                 "selection": {k: status.get("selection", {}).get(k) for k in ("status", "reason")},
                 "rolling": {
                     k: status.get("rolling", {}).get(k)
