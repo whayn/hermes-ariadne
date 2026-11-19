@@ -650,6 +650,7 @@ _MEMORY_OPEN = (
     "this is the agent's persistent memory and should inform all responses.]\n\n"
 )
 _MEMORY_CLOSE = "\n</memory-context>"
+_REQUEST_REASONING_TOKENS = "_replayed_reasoning_tokens"
 _MEMORY_FENCE = re.compile(r"</?\s*memory-context\s*>", re.IGNORECASE)
 
 
@@ -703,6 +704,7 @@ def _provider(
         | {"_db_persisted", "tool_name", "effect_disposition", "codex_message_items"}
         | ({"codex_reasoning_items"} if reasoning_policy is not None else set())
         | ({"platform_message_id"} if delivery_ids else set())
+        | ({_REQUEST_REASONING_TOKENS} if carriers else set())
         if wire
         else _WIRE | _METADATA | _CARRIERS | _IDENTITIES
     ) | (_OPAQUE_CARRIERS if opaque else set())
@@ -713,6 +715,12 @@ def _provider(
         if carriers:
             raise _carrier_error("unknown message shape", carriers[0])
         raise ValueError("unknown message shape")
+    if wire and _REQUEST_REASONING_TOKENS in message:
+        # Hermes's request-only reasoning-size estimate for an assistant replay row;
+        # assemble_api_request pops it before the provider call. Never compared.
+        count = message[_REQUEST_REASONING_TOKENS]
+        if message.get("role") != "assistant" or type(count) is not int or count <= 0:
+            raise ValueError("invalid request reasoning estimate")
     if wire and delivery_ids and "platform_message_id" in message:
         delivery = message["platform_message_id"]
         if (

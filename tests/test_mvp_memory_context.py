@@ -58,6 +58,23 @@ def test_provider_compares_sent_text_only_when_enabled():
         _provider(assistant, memory_context=True)
 
 
+def test_wire_reasoning_estimate_is_bookkeeping_for_rolling_only():
+    message = {"role": "assistant", "content": "ok", "_replayed_reasoning_tokens": 120}
+    assert _provider(message, wire=True, carriers=True) == {"role": "assistant", "content": "ok"}
+    with pytest.raises(ValueError, match="unknown message shape"):
+        _provider(message, wire=True)  # prepared engine: unchanged
+    for value in (0, -1, True, "12"):
+        bad = {"role": "assistant", "content": "x", "_replayed_reasoning_tokens": value}
+        with pytest.raises(ValueError):
+            _provider(bad, wire=True, carriers=True)
+    with pytest.raises(ValueError):
+        _provider(
+            {"role": "user", "content": "x", "_replayed_reasoning_tokens": 5},
+            wire=True,
+            carriers=True,
+        )
+
+
 # -- engine end to end ---------------------------------------------------------------
 
 

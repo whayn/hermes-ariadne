@@ -219,6 +219,20 @@ def main():
         def wrapper(self, *args, **kwargs):
             start = time.perf_counter()
             outcome = "ok"
+            if name == "select_context" and os.environ.get("GATE_DUMP_KEYS"):
+                request = args[0] if args else kwargs.get("request_messages") or []
+                events.append(
+                    {
+                        "request_keys": [
+                            [m.get("role"), sorted(m)] for m in request if isinstance(m, dict)
+                        ],
+                        "history_keys": [
+                            [m.get("role"), sorted(m)]
+                            for m in kwargs.get("conversation_messages") or []
+                            if isinstance(m, dict)
+                        ],
+                    }
+                )
             try:
                 result = method(self, *args, **kwargs)
                 if name == "select_context":
