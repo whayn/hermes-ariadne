@@ -374,3 +374,28 @@ def test_engine_index_ignores_completion_from_a_replaced_session(tmp_path, monke
     facade.hook = rebind  # session replaced while the summary call is in flight
     complete(engine, db, "B")
     assert NoteStore(tmp_path).get_conversation("other") is None
+
+
+@needs_host
+def test_read_and_zoom_keep_tool_result_linkage(home):
+    from hermes_ariadne.conversations import ArchiveReader
+
+    calls = [
+        {"id": f"c{i}", "type": "function", "function": {"name": "t", "arguments": "{}"}}
+        for i in (1, 2)
+    ]
+    _archive(
+        home,
+        {
+            "old": [
+                _msg("a1", "assistant", None, tool_calls=calls),
+                _msg("t1", "tool", "first result", tool_call_id="c1", name="t"),
+                _msg("t2", "tool", "second result", tool_call_id="c2", name="t"),
+            ]
+        },
+    )
+    reader = ArchiveReader(home)
+    rows = reader.page("old")["messages"]
+    assert [(r.get("tool_call_id"), r.get("name")) for r in rows[1:]] == [("c1", "t"), ("c2", "t")]
+    zoom = reader.event("old", rows[2]["event_id"])
+    assert (zoom["tool_call_id"], zoom["name"]) == ("c2", "t")
