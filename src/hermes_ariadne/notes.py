@@ -8,6 +8,7 @@ database. Mirrored built-in memory entries carry ``origin='mirror:<target>'``
 and are only ever changed by mirroring, never by agent note tools.
 """
 
+import fcntl
 import json
 import os
 import sqlite3
@@ -19,7 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 APPLICATION_ID = 0x41524E54  # "ARNT"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_NOTE_CHARS = 4000
 MAX_TAGS = 16
 MAX_TAG_CHARS = 64
@@ -44,6 +45,10 @@ SCHEMA = (
         origin TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL, source TEXT
     )""",
 )
+# Upgrades for stores written by earlier revisions: {from_version: statements}.
+MIGRATIONS = {
+    1: (SCHEMA[3],),  # add the conversations index
+}
 MAX_TITLE_CHARS = 200
 MAX_PREVIEW_CHARS = 300
 MAX_SUMMARY_CHARS = 8000
@@ -158,20 +163,58 @@ class NoteStore:
                 return False
             self.directory.mkdir(mode=0o700, exist_ok=True)
         _check_private(self.directory, regular=False)
-        for leftover in self.directory.glob(".notes-init-*"):
-            _check_private(leftover, regular=True)
-            leftover.unlink()
-        if self.path.exists() or self.path.is_symlink():
-            _check_private(self.path, regular=True)
-            for suffix in ("-journal", "-wal", "-shm"):
-                companion = Path(str(self.path) + suffix)
-                if companion.exists() or companion.is_symlink():
-                    _check_private(companion, regular=True)
+        with self._init_lock():
+            self._remove_leftovers()
+            if self.path.exists() or self.path.is_symlink():
+                _check_private(self.path, regular=True)
+                for suffix in ("-journal", "-wal", "-shm"):
+                    companion = Path(str(self.path) + suffix)
+                    if companion.exists() or companion.is_symlink():
+                        _check_private(companion, regular=True)
+                return True
+            if not create:
+                return False
+            self._initialize()
             return True
-        if not create:
-            return False
-        self._initialize()
-        return True
+
+    @contextmanager
+    def _init_lock(self):
+        """Serialize initialization and leftover cleanup across threads and processes."""
+        lock = self.directory / ".notes.lock"
+        if lock.is_symlink():
+            raise ValueError("ariadne paths must not be symlinks")
+        fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o077:
+                raise ValueError("invalid ariadne lock file")
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)  # releases the lock
+
+    def _remove_leftovers(self):
+        """Under the init lock: drop temporaries an interrupted initializer left behind.
+
+        A crash between publishing the store (``os.link``) and removing the temporary
+        leaves a second name for the store's own inode; that residual link is ours and
+        is removed before the store's single-link admission. Anything else is refused.
+        """
+        try:
+            published = os.lstat(self.path)
+        except FileNotFoundError:
+            published = None
+        for leftover in self.directory.glob(".notes-init-*"):
+            info = leftover.lstat()
+            residual = (
+                published is not None
+                and stat.S_ISREG(info.st_mode)
+                and (info.st_dev, info.st_ino) == (published.st_dev, published.st_ino)
+                and not info.st_mode & 0o077
+            )
+            if not residual:
+                _check_private(leftover, regular=True)
+            leftover.unlink()
 
     def _initialize(self):
         fd, name = tempfile.mkstemp(prefix=".notes-init-", dir=self.directory)
@@ -203,15 +246,17 @@ class NoteStore:
             return
         conn = sqlite3.connect(self.path, timeout=10)
         try:
-            if (
-                conn.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID
-                or conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
-            ):
+            if conn.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID:
                 raise StorageRefused("not an ariadne note store")
+            if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                self._migrate(conn)
             conn.execute("PRAGMA foreign_keys=ON")
             if write:
                 conn.execute("PRAGMA synchronous=FULL")
                 conn.execute("BEGIN IMMEDIATE")
+            else:
+                conn.execute("BEGIN")  # one snapshot for multi-query reads (count + page)
+                conn.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchall()
             yield conn
             if write:
                 conn.commit()
@@ -220,6 +265,24 @@ class NoteStore:
             raise
         finally:
             conn.close()
+
+    @staticmethod
+    def _migrate(conn):
+        """Upgrade an older Ariadne store in one transaction; unknown versions refuse."""
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            while version != SCHEMA_VERSION:
+                if version not in MIGRATIONS:
+                    raise StorageRefused("not an ariadne note store")
+                for sql in MIGRATIONS[version]:
+                    conn.execute(sql)
+                version += 1
+                conn.execute(f"PRAGMA user_version={version}")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
     # -- writes ------------------------------------------------------------------------
 
@@ -230,7 +293,7 @@ class NoteStore:
         note_id = uuid.uuid4().hex
         conn.execute(
             "INSERT INTO notes VALUES(?,?,?,?,?,?,?)",
-            (note_id, text, json.dumps(tags), source, origin, now, now),
+            (note_id, text, json.dumps(tags, ensure_ascii=False), source, origin, now, now),
         )
         conn.execute("INSERT INTO revisions VALUES(?,?,?,?)", (note_id, 1, text, now))
         return note_id
@@ -262,7 +325,8 @@ class NoteStore:
             self._update(conn, note_id, text)
             if tags is not None:
                 conn.execute(
-                    "UPDATE notes SET tags=? WHERE id=?", (json.dumps(_tags(tags)), note_id)
+                    "UPDATE notes SET tags=? WHERE id=?",
+                    (json.dumps(_tags(tags), ensure_ascii=False), note_id),
                 )
         return {"id": note_id}
 
@@ -358,7 +422,9 @@ class NoteStore:
                 return []
             rows = conn.execute(
                 f"SELECT {_COLUMNS} FROM notes WHERE (text LIKE ? ESCAPE '\\' "
-                f"OR tags LIKE ? ESCAPE '\\') {clause} ORDER BY updated DESC LIMIT ?",
+                "OR EXISTS (SELECT 1 FROM json_each(notes.tags) "
+                "WHERE json_each.value LIKE ? ESCAPE '\\')) "
+                f"{clause} ORDER BY updated DESC LIMIT ?",
                 (f"%{escaped}%", f"%{escaped}%", limit),
             ).fetchall()
             return [_row(r) for r in rows]
