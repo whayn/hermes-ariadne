@@ -13,6 +13,7 @@ import sqlite3
 from pathlib import Path
 
 from .notes import StorageRefused
+from .retrieval import _require_supported_data_use, _UnsupportedDataUse
 from .rolling_engine import _archive_path
 from .store import APPLICATION_ID, carrier_free, search_text
 
@@ -31,10 +32,30 @@ def _text_of(message):
     return json.dumps(content, ensure_ascii=False, sort_keys=True)
 
 
+class RestrictedEvidence(ValueError):
+    """An archived record carries a machine data-use restriction or withheld text."""
+
+
 def _check(event_id, payload):
+    """Rehash, decode and admit one exact record before any projection."""
     if hashlib.sha256(payload).hexdigest() != event_id:
         raise ValueError("archived event payload does not match its identity")
-    return json.loads(payload.decode("utf-8", "surrogatepass"))
+    message = json.loads(payload.decode("utf-8", "surrogatepass"))
+    try:
+        _require_supported_data_use(message)  # same policy as evidence retrieval
+    except _UnsupportedDataUse as exc:
+        raise RestrictedEvidence("archived record is restricted") from exc
+    return message
+
+
+def _full_text(message):
+    """Content plus tool calls, so zoom can page everything read() truncates."""
+    text = _text_of(message)
+    calls = message.get("tool_calls")
+    if calls:
+        encoded = calls if isinstance(calls, str) else json.dumps(calls, ensure_ascii=False)
+        text += ("\n\n" if text else "") + "tool_calls: " + encoded
+    return text
 
 
 def _page_args(offset, limit, maximum):
@@ -111,7 +132,7 @@ class ArchiveReader:
         }
 
     def event(self, session_id, event_id, *, char_offset=0, max_chars=MAX_ZOOM_CHARS):
-        """One exact message, content paged by characters; carriers omitted."""
+        """One exact message (content, then tool calls) paged by characters; carriers omitted."""
         if type(char_offset) is not int or char_offset < 0:
             raise ValueError("invalid offset")
         if type(max_chars) is not int or not 1 <= max_chars <= MAX_ZOOM_CHARS:
@@ -126,7 +147,7 @@ class ArchiveReader:
         if not rows:
             return None
         message, omitted = carrier_free(_check(*rows[0]))
-        text = _text_of(message)
+        text = _full_text(message)
         chunk = text[char_offset : char_offset + max_chars]
         return {
             "session_id": session_id,
