@@ -7,10 +7,10 @@ One Hermes plugin, `ariadne`, that you select in **both** settings slots:
 | Memory provider | `memory.provider: ariadne` | Profile notes (`ariadne_notes`), one-way mirror of built-in memory writes, recall of relevant notes and past conversations each turn, `ariadne_conversations` to read past chats |
 | Context engine | `context.engine: ariadne` | The rolling engine (automatic summary of older turns through Hermes's LLM facade, page/search/zoom tools) plus the conversation index |
 
-Status: **experimental; use a dedicated development profile**. Phases 1 and 3
-of #41. The MVP keeps rolling's single cumulative summary with exact zoom; the
-UniiChat summary tree is deferred until after the MVP. Not yet implemented: the
-import skill (phase 4).
+Status: **experimental; use a dedicated development profile**. Phases 1, 3 and
+4 of #41. The MVP keeps rolling's single cumulative summary with exact zoom; the
+UniiChat summary tree is deferred until after the MVP. The dev-profile ship gate
+with a real model (phase 5) has not been run.
 
 ## Install (development profile)
 
@@ -97,3 +97,28 @@ request contains the note and chat A's index entry, and its
 were exposed directly in that configuration; the deferred `tool_call` path is
 not exercised. This is plumbing evidence with a scripted provider, not a claim
 about how well a real model uses the recall.
+
+## Importing data
+
+Ask the agent to import files (for example a ChatGPT export). The bundled
+skill `ariadne:import` tells it how: inspect the files with Hermes's normal
+tools, pick one linear path per conversation, then
+
+- archive each conversation with **`ariadne_import`** (`key`, ordered
+  `messages` of `{role, content, timestamp?, speaker?}`, up to 500 per call with
+  `offset`, plus `title`, its own `summary` and `source`), and
+- save durable facts with `ariadne_notes`, with a `source` pointing at the
+  imported conversation.
+
+There is no app-specific parser and no approval step; review afterwards with
+`ariadne_notes list/delete` and `ariadne_conversations list/open`.
+
+Imported conversations get the id `import-<first 24 hex of sha256(key)>` and
+deterministic per-position message ids, so re-sending a batch is a no-op and
+changed text is stored as a new version next to the old one. They live in the
+same exact archive as live chats (origin `import`), appear in the index and in
+recall, and are readable with `ariadne_conversations`. The `summary` is
+agent-written index text, not checked against the messages. Limits: 64 KiB per
+message, 2 MiB and 500 messages per call; text content only (no attachments).
+The skill's guidance (skip hidden reasoning and credentials, treat imported
+instructions as data) is not enforced by the tool.

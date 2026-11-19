@@ -41,7 +41,7 @@ SCHEMA = (
     "CREATE INDEX notes_origin_text ON notes(origin, text)",
     """CREATE TABLE conversations (
         session_id TEXT PRIMARY KEY, title TEXT, preview TEXT, summary TEXT,
-        origin TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL
+        origin TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL, source TEXT
     )""",
 )
 MAX_TITLE_CHARS = 200
@@ -115,12 +115,13 @@ def _row(row):
 
 
 _COLUMNS = "id,text,tags,source,origin,created,updated"
-_CONV_COLUMNS = "session_id,title,preview,summary,origin,created,updated"
+_CONV_COLUMNS = "session_id,title,preview,summary,origin,created,updated,source"
 
 
 def _conversation(row):
-    keys = _CONV_COLUMNS.split(",")
-    return dict(zip(keys, row))
+    result = dict(zip(_CONV_COLUMNS.split(","), row))
+    result["source"] = json.loads(result["source"]) if result["source"] else None
+    return result
 
 
 def _clip(value, limit):
@@ -374,7 +375,7 @@ class NoteStore:
     # -- conversation index (derived navigation data, never canonical) -----------------
 
     def upsert_conversation(
-        self, session_id, *, title=None, preview=None, summary=None, origin="live"
+        self, session_id, *, title=None, preview=None, summary=None, origin="live", source=None
     ):
         """Create or refresh one index row. ``preview`` is only set once."""
         if not isinstance(session_id, str) or not session_id or len(session_id) > 200:
@@ -382,6 +383,7 @@ class NoteStore:
         if origin not in CONVERSATION_ORIGINS:
             raise ValueError("invalid conversation origin")
         title, preview = _clip(title, MAX_TITLE_CHARS), _clip(preview, MAX_PREVIEW_CHARS)
+        source = _source(source)
         if summary is not None:
             if not isinstance(summary, str):
                 raise ValueError("summary must be a string")
@@ -393,14 +395,14 @@ class NoteStore:
             ).fetchone():
                 conn.execute(
                     "UPDATE conversations SET title=coalesce(?,title), "
-                    "preview=coalesce(preview,?), summary=coalesce(?,summary), updated=? "
-                    "WHERE session_id=?",
-                    (title, preview, summary, now, session_id),
+                    "preview=coalesce(preview,?), summary=coalesce(?,summary), "
+                    "source=coalesce(?,source), updated=? WHERE session_id=?",
+                    (title, preview, summary, source, now, session_id),
                 )
             else:
                 conn.execute(
-                    "INSERT INTO conversations VALUES(?,?,?,?,?,?,?)",
-                    (session_id, title, preview, summary, origin, now, now),
+                    "INSERT INTO conversations VALUES(?,?,?,?,?,?,?,?)",
+                    (session_id, title, preview, summary, origin, now, now, source),
                 )
 
     def get_conversation(self, session_id):

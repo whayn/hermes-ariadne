@@ -41,6 +41,8 @@ provider.initialize("native-s1", hermes_home=str(home), agent_context="primary")
 added = json.loads(provider.handle_tool_call("ariadne_notes", {"action": "add", "text": "native note"}))
 provider.on_memory_write("add", "user", "mirrored entry", {})
 recall = provider.prefetch("tell me the native note")
+from hermes_cli.plugins import get_plugin_manager
+skill = get_plugin_manager().find_plugin_skill("ariadne:import")
 origin = sys.modules[type(provider).__module__].__file__
 print(json.dumps({
     "engine": getattr(engine, "name", None),
@@ -53,6 +55,7 @@ print(json.dumps({
     "added": added["ok"],
     "recall": recall,
     "notes_db": (home / "ariadne" / "notes.sqlite3").is_file(),
+    "skill": str(skill) if skill else None,
 }))
 """
 
@@ -149,6 +152,7 @@ def test_install_enable_select_and_use(installed_home, tmp_path):
     assert "ariadne" in result["listed_engines"] and "ariadne" in result["listed_providers"]
     assert result["added"] and result["notes_db"]
     assert "native note" in result["recall"] and "mirrored entry" not in result["recall"]
+    assert result["skill"] and result["skill"].startswith(installed)
 
 
 SESSION_A, SESSION_B = "mvp-chat-a", "mvp-chat-b"
