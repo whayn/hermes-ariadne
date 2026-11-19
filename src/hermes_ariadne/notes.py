@@ -309,8 +309,10 @@ class NoteStore:
             raise
 
     def prepare(self):
-        """Create/admit the store now, so a later write cannot fail on admission."""
-        self._admit(create=True)
+        """Create, admit, identify and migrate the store now (no rows written), so a
+        caller can refuse before side effects elsewhere instead of failing afterwards."""
+        with self._connect(write=True):
+            pass
 
     # -- writes ------------------------------------------------------------------------
 
