@@ -96,7 +96,7 @@ def _archive_path(home, *, store=None, private_home=True):
     root = Path(home).absolute()
     archive = root / "ariadne" / "events.sqlite3"
     if not private_home:
-        from .notes import tighten_private
+        from .private_paths import tighten_private
 
         for item in (root, *root.parents):
             if item.is_symlink():

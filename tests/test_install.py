@@ -210,6 +210,7 @@ ROLLING_FILES = {
             "rolling_retrieval.py",
             "rolling_delta.py",
             "rolling_migrate.py",
+            "private_paths.py",
         )
     },
 }
