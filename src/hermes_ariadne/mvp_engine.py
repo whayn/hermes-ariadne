@@ -35,6 +35,8 @@ def _first_user_text(messages):
 
 
 class AriadneEngine(RollingAriadneEngine):
+    _private_home = False  # Hermes profile homes are 0755; Ariadne's own files stay private
+
     @property
     def name(self):
         return ENGINE_NAME

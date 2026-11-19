@@ -55,10 +55,10 @@ def incoming_anchor(history, incoming):
     if not starts or incoming.get("role") != "user":
         raise ValueError("incoming user anchor required")
     current = starts[-1]
-    payload = canonical_json(_comparison(history[current]))
+    payload = canonical_json(_comparison(history[current], memory_context=True))
     if (
         incoming.get("message_uid") != uids[current]
-        or canonical_json(_comparison(incoming)) != payload
+        or canonical_json(_comparison(incoming, memory_context=True)) != payload
     ):
         raise ValueError("incoming must anchor the latest user by UID and payload")
     return uids[current], sha256(payload)
@@ -120,7 +120,13 @@ def validate_rolling_alignment(
         retirement_policy=retirement_policy,
     )
     payloads = _exact_payloads(
-        history, active, policies, assembled=request[split:], delivery_ids=True, carriers=True
+        history,
+        active,
+        policies,
+        assembled=request[split:],
+        delivery_ids=True,
+        carriers=True,
+        memory_context=True,
     )
     anchor = incoming_anchor(history, incoming)
     starts = completed_exchange_starts(payloads, allow_current=True)
@@ -133,7 +139,7 @@ def validate_rolling_alignment(
         or count > starts[-2]
     ):
         raise ValueError("retain previous exchange and complete current tool groups")
-    _exact_occurrences(history, active, policies, carriers=True)
+    _exact_occurrences(history, active, policies, carriers=True, memory_context=True)
     _tool_sequence(payloads[count:])
     return Alignment(split, count, *anchor)
 

@@ -48,7 +48,9 @@ class ArchiveReader:
 
     def _connect(self):
         try:
-            archive = _archive_path(self.home)  # metadata-only admission, no creation
+            archive = _archive_path(
+                self.home, private_home=False
+            )  # metadata-only admission, no creation
         except ValueError as exc:
             raise StorageRefused(str(exc)) from exc
         if not archive.is_file():

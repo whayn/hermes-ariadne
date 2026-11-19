@@ -147,11 +147,24 @@ def test_skill_is_registered_and_bundled():
     assert text.startswith("---\nname: import\n") and "ariadne_import" in text
 
 
-def test_shared_home_permissions_report_storage_refused_not_bad_argument(tmp_path):
-    # `hermes profile create` makes 0755 homes; the archive admission refuses them.
+def test_hermes_profile_home_0755_is_accepted(tmp_path):
+    # `hermes profile create` makes 0755 homes; Ariadne's own files stay private.
     home = tmp_path / "shared-home"
     home.mkdir()
     os.chmod(home, 0o755)
+    provider = AriadneMemoryProvider()
+    provider.initialize("s", hermes_home=str(home))
+    batch = {"key": "k", "messages": [{"role": "user", "content": "hi"}]}
+    assert json.loads(provider.handle_tool_call("ariadne_import", batch))["ok"]
+    assert stat.S_IMODE((home / "ariadne" / "events.sqlite3").stat().st_mode) == 0o600
+
+
+def test_symlinked_storage_reports_storage_refused_not_bad_argument(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir(mode=0o700)
+    (home / "ariadne").symlink_to(elsewhere)
     provider = AriadneMemoryProvider()
     provider.initialize("s", hermes_home=str(home))
     batch = {"key": "k", "messages": [{"role": "user", "content": "hi"}]}
@@ -159,9 +172,4 @@ def test_shared_home_permissions_report_storage_refused_not_bad_argument(tmp_pat
         "ok": False,
         "error": "storage_refused",
     }
-    read = {"action": "read", "id": "import-x"}
-    assert json.loads(provider.handle_tool_call("ariadne_conversations", read)) == {
-        "ok": False,
-        "error": "storage_refused",
-    }
-    assert not (home / "ariadne" / "events.sqlite3").exists()
+    assert list(elsewhere.iterdir()) == []

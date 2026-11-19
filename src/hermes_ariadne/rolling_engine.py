@@ -85,10 +85,28 @@ def _flushing(method):
     return wrapper
 
 
-def _archive_path(home, *, store=None):
-    """Metadata-only admission, before EventStore can open or create SQLite files."""
+def _archive_path(home, *, store=None, private_home=True):
+    """Metadata-only admission, before EventStore can open or create SQLite files.
+
+    ``private_home=False`` (the MVP plugin): the Hermes home itself only has to be
+    free of symlinks, since Hermes creates 0755 profile homes; Ariadne's own
+    directory and files must still be private and are reset to 0700/0600 if
+    their mode drifted, rather than refused.
+    """
     root = Path(home).absolute()
     archive = root / "ariadne" / "events.sqlite3"
+    if not private_home:
+        from .notes import tighten_private
+
+        for item in (root, *root.parents):
+            if item.is_symlink():
+                raise ValueError("ariadne home must not traverse symlinks")
+        tighten_private(archive.parent, regular=False)
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            tighten_private(Path(str(archive) + suffix), regular=True)
+        if store is not None and (store.path.absolute() != archive or not archive.is_file()):
+            raise ValueError("rolling requires the initialized explicit-home archive")
+        return archive
     for directory in (root, archive.parent):
         _path_check(directory)
     for suffix in ("", "-wal", "-shm", "-journal"):
@@ -152,6 +170,8 @@ class _Scope:
 
 class RollingAriadneEngine(AriadneEngine):
     """Per-agent state; host reads and facade work never hold the engine lock."""
+
+    _private_home = True  # development engines keep requiring a 0700 Hermes home
 
     def __init__(self, llm, settings=None):
         super().__init__()
@@ -395,7 +415,7 @@ class RollingAriadneEngine(AriadneEngine):
             try:
                 if scope.store is None or scope.store is not self._store:
                     raise ValueError("rolling archive attachment changed")
-                _archive_path(scope.home, store=scope.store)
+                _archive_path(scope.home, store=scope.store, private_home=self._private_home)
             except Exception:
                 self._refuse_archive(scope)
                 raise
@@ -458,7 +478,7 @@ class RollingAriadneEngine(AriadneEngine):
         try:
             with self._lock:
                 self._guard(scope)
-                archive = _archive_path(scope.home)
+                archive = _archive_path(scope.home, private_home=self._private_home)
                 _mkdir_private(archive.parent)
                 self._store = EventStore(archive)
                 self._guard(scope)
@@ -761,9 +781,15 @@ class RollingAriadneEngine(AriadneEngine):
             history, active, request[split:], 0, scope.policy, retirement_policy=POLICY_ID
         )
         payloads = _exact_payloads(
-            history, active, policies, assembled=request[split:], delivery_ids=True, carriers=True
+            history,
+            active,
+            policies,
+            assembled=request[split:],
+            delivery_ids=True,
+            carriers=True,
+            memory_context=True,
         )
-        _exact_occurrences(history, active, policies, carriers=True)
+        _exact_occurrences(history, active, policies, carriers=True, memory_context=True)
         completed_exchange_starts(payloads, allow_current=True)
         if payloads[-1]["role"] not in {"user", "tool"}:
             raise ValueError("not an incoming request")

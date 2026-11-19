@@ -71,9 +71,11 @@ class Importer:
         rows = _messages(messages, conv_id, offset)
         notes = NoteStore(self.home)
         try:
-            archive = _archive_path(self.home)  # admission before any file is created
+            archive = _archive_path(
+                self.home, private_home=False
+            )  # admission before any file is created
             _mkdir_private(archive.parent)
-            archive = _archive_path(self.home)
+            archive = _archive_path(self.home, private_home=False)
         except ValueError as exc:
             raise StorageRefused(str(exc)) from exc
         outcome = EventStore(archive).ingest(conv_id, rows, origin="import", start=offset)
