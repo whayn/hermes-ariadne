@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 APPLICATION_ID = 0x41524E54  # "ARNT"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_NOTE_CHARS = 4000
 MAX_TAGS = 16
 MAX_TAG_CHARS = 64
@@ -47,7 +47,15 @@ SCHEMA = (
 )
 # Upgrades for stores written by earlier revisions: {from_version: statements}.
 MIGRATIONS = {
-    1: (SCHEMA[3],),  # add the conversations index
+    # v1 -> v2: the conversations index as first released (without ``source``).
+    1: (
+        """CREATE TABLE conversations (
+        session_id TEXT PRIMARY KEY, title TEXT, preview TEXT, summary TEXT,
+        origin TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL
+    )""",
+    ),
+    # v2 -> v3: import provenance on index rows.
+    2: ("ALTER TABLE conversations ADD COLUMN source TEXT",),
 }
 MAX_TITLE_CHARS = 200
 MAX_PREVIEW_CHARS = 300
@@ -140,6 +148,20 @@ def _clip(value, limit):
         raise ValueError("conversation fields must be strings")
     value = " ".join(value.split())
     return value[:limit] or None
+
+
+def conversation_fields(*, title=None, preview=None, summary=None, source=None):
+    """Validate and normalize index metadata without touching storage."""
+    if summary is not None:
+        if not isinstance(summary, str):
+            raise ValueError("summary must be a string")
+        summary = summary.strip()[:MAX_SUMMARY_CHARS] or None
+    return {
+        "title": _clip(title, MAX_TITLE_CHARS),
+        "preview": _clip(preview, MAX_PREVIEW_CHARS),
+        "summary": summary,
+        "source": _source(source),
+    }
 
 
 class NoteStore:
@@ -283,6 +305,10 @@ class NoteStore:
         except BaseException:
             conn.rollback()
             raise
+
+    def prepare(self):
+        """Create/admit the store now, so a later write cannot fail on admission."""
+        self._admit(create=True)
 
     # -- writes ------------------------------------------------------------------------
 
@@ -452,12 +478,13 @@ class NoteStore:
             raise ValueError("invalid session id")
         if origin not in CONVERSATION_ORIGINS:
             raise ValueError("invalid conversation origin")
-        title, preview = _clip(title, MAX_TITLE_CHARS), _clip(preview, MAX_PREVIEW_CHARS)
-        source = _source(source)
-        if summary is not None:
-            if not isinstance(summary, str):
-                raise ValueError("summary must be a string")
-            summary = summary.strip()[:MAX_SUMMARY_CHARS] or None
+        fields = conversation_fields(title=title, preview=preview, summary=summary, source=source)
+        title, preview, summary, source = (
+            fields["title"],
+            fields["preview"],
+            fields["summary"],
+            fields["source"],
+        )
         now = time.time()
         with self._connect(write=True) as conn:
             if conn.execute(

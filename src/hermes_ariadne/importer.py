@@ -11,7 +11,7 @@ summary is index data labelled as such, never canonical.
 
 import hashlib
 
-from .notes import NoteStore, StorageRefused
+from .notes import NoteStore, StorageRefused, conversation_fields
 from .receipts import _mkdir_private
 from .rolling_engine import _archive_path
 from .store import EventStore
@@ -69,19 +69,26 @@ class Importer:
     def import_batch(self, key, messages, *, offset=0, title=None, summary=None, source=None):
         conv_id = conversation_id(key)
         rows = _messages(messages, conv_id, offset)
+        preview = next(
+            (r["content"] for r in rows if r["role"] == "user" and isinstance(r["content"], str)),
+            None,
+        )
+        preview = preview if offset == 0 else None
+        # Every refusal happens before the archive is written: metadata, then storage.
+        conversation_fields(title=title, preview=preview, summary=summary, source=source)
         notes = NoteStore(self.home)
         try:
+            notes.prepare()
             archive = _archive_path(self.home)  # admission before any file is created
             _mkdir_private(archive.parent)
             archive = _archive_path(self.home)
         except ValueError as exc:
             raise StorageRefused(str(exc)) from exc
         outcome = EventStore(archive).ingest(conv_id, rows, origin="import", start=offset)
-        preview = next((r["content"] for r in rows if r["role"] == "user"), None)
         notes.upsert_conversation(
             conv_id,
             title=title,
-            preview=preview if offset == 0 else None,
+            preview=preview,
             summary=summary,
             origin="import",
             source=source,

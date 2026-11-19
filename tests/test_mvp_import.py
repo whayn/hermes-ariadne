@@ -12,7 +12,7 @@ if not os.environ.get("HERMES_SOURCE"):
 from hermes_ariadne.conversations import ArchiveReader  # noqa: E402
 from hermes_ariadne.importer import MAX_MESSAGE_BYTES, Importer, conversation_id  # noqa: E402
 from hermes_ariadne.memory_provider import AriadneMemoryProvider  # noqa: E402
-from hermes_ariadne.notes import NoteStore  # noqa: E402
+from hermes_ariadne.notes import NoteStore, StorageRefused  # noqa: E402
 
 
 @pytest.fixture
@@ -164,4 +164,50 @@ def test_shared_home_permissions_report_storage_refused_not_bad_argument(tmp_pat
         "ok": False,
         "error": "storage_refused",
     }
+    assert not (home / "ariadne" / "events.sqlite3").exists()
+
+
+def test_store_from_v2_gains_source_column(home):
+    import sqlite3
+
+    import hermes_ariadne.notes as notes
+
+    (home / "ariadne").mkdir(mode=0o700)
+    path = home / "ariadne" / "notes.sqlite3"
+    conn = sqlite3.connect(path)
+    for sql in (*notes.SCHEMA[:3], *notes.MIGRATIONS[1]):
+        conn.execute(sql)
+    conn.execute(f"PRAGMA application_id={notes.APPLICATION_ID}")
+    conn.execute("PRAGMA user_version=2")
+    conn.execute("INSERT INTO conversations VALUES('old','t','p','s','live',1,1)")
+    conn.commit()
+    conn.close()
+    os.chmod(path, 0o600)
+    store = NoteStore(home)
+    assert store.get_conversation("old")["source"] is None
+    store.upsert_conversation("imp", origin="import", source={"file": "x"})
+    assert store.get_conversation("imp")["source"] == {"file": "x"}
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"source": {"file": "x" * 3000}},
+        {"source": "not a mapping"},
+        {"title": 5},
+        {"summary": ["x"]},
+    ],
+)
+def test_invalid_metadata_rejects_before_archiving(home, extra):
+    with pytest.raises((ValueError, TypeError)):
+        Importer(home).import_batch("k", _chat(2), **extra)
+    reader = ArchiveReader(home)
+    assert reader.page(conversation_id("k"))["messages"] == []
+
+
+def test_refused_note_store_rejects_before_archiving(home):
+    (home / "ariadne").mkdir(mode=0o700)
+    (home / "ariadne" / "notes.sqlite3").symlink_to(home / "elsewhere")
+    with pytest.raises(StorageRefused):
+        Importer(home).import_batch("k", _chat(2))
     assert not (home / "ariadne" / "events.sqlite3").exists()
