@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 APPLICATION_ID = 0x41524E54  # "ARNT"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_NOTE_CHARS = 4000
 MAX_TAGS = 16
 MAX_TAG_CHARS = 64
@@ -45,6 +45,10 @@ SCHEMA = (
         origin TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL
     )""",
 )
+# Upgrades for stores written by earlier revisions: {from_version: statements}.
+MIGRATIONS = {
+    1: (SCHEMA[3],),  # add the conversations index
+}
 MAX_TITLE_CHARS = 200
 MAX_PREVIEW_CHARS = 300
 MAX_SUMMARY_CHARS = 8000
@@ -237,11 +241,10 @@ class NoteStore:
             return
         conn = sqlite3.connect(self.path, timeout=10)
         try:
-            if (
-                conn.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID
-                or conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
-            ):
+            if conn.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID:
                 raise ValueError("not an ariadne note store")
+            if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                self._migrate(conn)
             conn.execute("PRAGMA foreign_keys=ON")
             if write:
                 conn.execute("PRAGMA synchronous=FULL")
@@ -257,6 +260,24 @@ class NoteStore:
             raise
         finally:
             conn.close()
+
+    @staticmethod
+    def _migrate(conn):
+        """Upgrade an older Ariadne store in one transaction; unknown versions refuse."""
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            while version != SCHEMA_VERSION:
+                if version not in MIGRATIONS:
+                    raise ValueError("not an ariadne note store")
+                for sql in MIGRATIONS[version]:
+                    conn.execute(sql)
+                version += 1
+                conn.execute(f"PRAGMA user_version={version}")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
     # -- writes ------------------------------------------------------------------------
 

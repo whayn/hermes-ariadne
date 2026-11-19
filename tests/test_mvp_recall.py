@@ -254,3 +254,98 @@ def test_engine_index_failure_never_breaks_turn(tmp_path, monkeypatch):
     db.rows = exchange("A") + exchange("B")
     complete(engine, db, "B")
     assert engine._published is not None
+
+
+# -- review fixes ------------------------------------------------------------------------
+
+
+def test_store_from_previous_schema_is_migrated_in_place(home):
+    import hermes_ariadne.notes as notes
+
+    (home / "ariadne").mkdir(mode=0o700)
+    path = home / "ariadne" / "notes.sqlite3"
+    conn = sqlite3.connect(path)
+    for sql in notes.SCHEMA[:3]:  # schema v1: notes, revisions, index only
+        conn.execute(sql)
+    conn.execute(f"PRAGMA application_id={notes.APPLICATION_ID}")
+    conn.execute("PRAGMA user_version=1")
+    conn.execute("INSERT INTO notes VALUES('n1','kept','[]',NULL,'agent',1,1)")
+    conn.commit()
+    conn.close()
+    os.chmod(path, 0o600)
+    store = NoteStore(home)
+    assert store.conversations()["total"] == 0  # a read migrates instead of failing
+    store.upsert_conversation("s1", preview="hello")
+    assert store.get("n1")["text"] == "kept"
+    assert store.get_conversation("s1")["preview"] == "hello"
+
+
+@needs_host
+@pytest.mark.parametrize(
+    "restriction",
+    [
+        {"data_use": ["no_training"]},
+        {"display_metadata": json.dumps({"data_use": ["no_training"]})},
+        {"display_metadata": json.dumps({"withheld_prompt": "secret original"})},
+    ],
+)
+def test_reader_refuses_restricted_records(home, restriction):
+    from hermes_ariadne.conversations import ArchiveReader, RestrictedEvidence
+
+    _archive(home, {"old": [_msg("u1", "user", "restricted text", **restriction)]})
+    reader = ArchiveReader(home)
+    with pytest.raises(RestrictedEvidence):
+        reader.page("old")
+    with pytest.raises(RestrictedEvidence):
+        reader.search("restricted")
+    event = (
+        sqlite3.connect(home / "ariadne" / "events.sqlite3")
+        .execute("SELECT event_id FROM events")
+        .fetchone()[0]
+    )
+    with pytest.raises(RestrictedEvidence):
+        reader.event("old", event)
+
+
+@needs_host
+def test_provider_reports_restricted_without_content(home):
+    from hermes_ariadne.memory_provider import AriadneMemoryProvider
+
+    _archive(home, {"old": [_msg("u1", "user", "restricted text", data_use=["no_training"])]})
+    provider = AriadneMemoryProvider()
+    provider.initialize("new", hermes_home=str(home))
+    out = provider.handle_tool_call("ariadne_conversations", {"action": "read", "id": "old"})
+    assert json.loads(out) == {"ok": False, "error": "restricted"}
+
+
+@needs_host
+def test_zoom_recovers_tool_calls_that_read_truncates(home):
+    from hermes_ariadne.conversations import MAX_MESSAGE_CHARS, ArchiveReader
+
+    calls = [
+        {
+            "id": "c1",
+            "type": "function",
+            "function": {"name": "terminal", "arguments": json.dumps({"cmd": "x" * 5000})},
+        }
+    ]
+    _archive(home, {"old": [_msg("a1", "assistant", None, tool_calls=calls)]})
+    reader = ArchiveReader(home)
+    row = reader.page("old")["messages"][0]
+    assert row["tool_calls"] is None and row["tool_calls_truncated"]
+    text, offset = "", 0
+    while True:
+        part = reader.event("old", row["event_id"], char_offset=offset)
+        text += part["content"]
+        offset += len(part["content"])
+        if not part["has_more"]:
+            break
+    assert "x" * 5000 in text and '"terminal"' in text
+    assert len(text) > MAX_MESSAGE_CHARS
+
+
+def test_preview_skips_restricted_first_message():
+    from hermes_ariadne.mvp_engine import _first_user_text
+
+    assert _first_user_text([{"role": "user", "content": "ok"}]) == "ok"
+    assert _first_user_text([{"role": "user", "content": "x", "data_use": ["no_training"]}]) is None

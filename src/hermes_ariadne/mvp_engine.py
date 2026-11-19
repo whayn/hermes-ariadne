@@ -10,6 +10,7 @@ a failure is logged and never affects selection, archiving or publication.
 import logging
 
 from .notes import NoteStore
+from .retrieval import _require_supported_data_use
 from .rolling_engine import RollingAriadneEngine
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,10 @@ ENGINE_NAME = "ariadne"
 def _first_user_text(messages):
     for message in messages or ():
         if isinstance(message, dict) and message.get("role") == "user":
+            try:
+                _require_supported_data_use(message)
+            except ValueError:
+                return None  # never index restricted or withheld text
             content = message.get("content")
             if isinstance(content, str) and content.strip():
                 return content
