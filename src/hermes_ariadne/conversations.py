@@ -48,6 +48,18 @@ def _check(event_id, payload):
     return message
 
 
+_LINKAGE_KEYS = ("tool_call_id", "name", "_tool_call_uid")
+
+
+def _linkage(message):
+    """Short identifiers tying a tool result to its call (bounded, strings only)."""
+    return {
+        key: message[key]
+        for key in _LINKAGE_KEYS
+        if isinstance(message.get(key), str) and len(message[key]) <= 200
+    }
+
+
 def _full_text(message):
     """Content plus tool calls, so zoom can page everything read() truncates."""
     text = _text_of(message)
@@ -122,6 +134,7 @@ class ArchiveReader:
                     "tool_calls": calls if len(calls_text) <= MAX_MESSAGE_CHARS else None,
                     "tool_calls_truncated": len(calls_text) > MAX_MESSAGE_CHARS,
                     "omitted_keys": omitted,
+                    **_linkage(message),
                 }
             )
         return {
@@ -158,6 +171,7 @@ class ArchiveReader:
             "chars": len(text),
             "has_more": char_offset + len(chunk) < len(text),
             "omitted_keys": omitted,
+            **_linkage(message),
         }
 
     def search(self, query, *, limit=10, exclude=None):
