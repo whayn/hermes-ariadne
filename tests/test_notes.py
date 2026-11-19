@@ -157,3 +157,103 @@ def test_leftover_temporary_does_not_block_initialization(home):
 def test_persists_across_instances(home):
     NoteStore(home).add("durable")
     assert NoteStore(home).search("durable")[0]["text"] == "durable"
+
+
+def test_concurrent_read_cannot_delete_an_active_initializer(home, monkeypatch):
+    import threading
+
+    import hermes_ariadne.notes as notes
+
+    paused, release = threading.Event(), threading.Event()
+    real_link = os.link
+
+    def slow_link(src, dst):
+        paused.set()
+        assert release.wait(5)
+        return real_link(src, dst)
+
+    monkeypatch.setattr(notes.os, "link", slow_link)
+    errors = []
+    writer = threading.Thread(target=lambda: _try(lambda: NoteStore(home).add("x"), errors))
+    writer.start()
+    assert paused.wait(5)
+    reader = threading.Thread(target=lambda: _try(lambda: NoteStore(home).list(), errors))
+    reader.start()
+    reader.join(0.3)  # the reader must wait for the initializer, not delete its file
+    release.set()
+    writer.join(5)
+    reader.join(5)
+    assert errors == []
+    assert NoteStore(home).list()["total"] == 1
+
+
+def _try(fn, errors):
+    try:
+        fn()
+    except Exception as exc:  # pragma: no cover - reported by the assertion
+        errors.append(repr(exc))
+
+
+def test_crash_after_publication_link_recovers(home):
+    NoteStore(home).add("kept")
+    store = home / "ariadne" / "notes.sqlite3"
+    os.link(store, home / "ariadne" / ".notes-init-crashed")  # residual publication link
+    assert NoteStore(home).list()["total"] == 1
+    assert not (home / "ariadne" / ".notes-init-crashed").exists()
+
+
+def test_unrelated_hardlink_is_still_refused(home, tmp_path):
+    NoteStore(home).add("x")
+    os.link(home / "ariadne" / "notes.sqlite3", tmp_path / "elsewhere")
+    with pytest.raises(ValueError):
+        NoteStore(home).list()
+
+
+def test_unicode_tags_are_searchable_and_stored_readably(home):
+    store = NoteStore(home)
+    store.add("meeting preference", tags=["café"])
+    assert [n["text"] for n in store.search("café")] == ["meeting preference"]
+    note = store.add("other")
+    store.edit(note["id"], "other", tags=["thé"])
+    assert [n["text"] for n in store.search("thé")] == ["other"]
+
+
+def test_count_and_page_share_one_snapshot(home, monkeypatch):
+    import sqlite3
+
+    store = NoteStore(home)
+    note = store.add("only")
+    real = sqlite3.Connection.execute
+    connect = sqlite3.connect
+    state = {"done": False}
+
+    class Spy(sqlite3.Connection):
+        def execute(self, sql, *args):
+            if "LIMIT" in sql and "OFFSET" in sql and not state["done"]:
+                state["done"] = True
+                other = connect(home / "ariadne" / "notes.sqlite3", timeout=0.2)
+                try:
+                    other.execute("DELETE FROM notes WHERE id=?", (note["id"],))
+                    other.commit()
+                except sqlite3.OperationalError:
+                    pass  # blocked by the reader's snapshot: acceptable
+                finally:
+                    other.close()
+            return real(self, sql, *args)
+
+    monkeypatch.setattr(
+        "hermes_ariadne.notes.sqlite3.connect",
+        lambda *a, **k: connect(*a, factory=Spy, **k),
+    )
+    page = store.list()
+    assert page["total"] == len(page["notes"])
+
+
+def test_tags_written_by_older_revision_remain_searchable(home):
+    import sqlite3
+
+    store = NoteStore(home)
+    note = store.add("legacy row")
+    with sqlite3.connect(home / "ariadne" / "notes.sqlite3") as conn:
+        conn.execute("UPDATE notes SET tags=? WHERE id=?", ('["caf\\u00e9"]', note["id"]))
+    assert [n["text"] for n in store.search("café")] == ["legacy row"]

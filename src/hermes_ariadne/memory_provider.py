@@ -162,7 +162,7 @@ class AriadneMemoryProvider(MemoryProvider):
             return ""
         scored = []
         for order, (note_id, text, tags) in enumerate(candidates):
-            score = len(wanted & (_words(text) | {t.lower() for t in tags}))
+            score = len(wanted & (_words(text) | _words(" ".join(tags))))
             if score:
                 scored.append((-score, order, note_id, text))
         if not scored:
