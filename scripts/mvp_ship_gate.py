@@ -146,12 +146,14 @@ LONG_TURNS = [
     "How should I name MQTT topics for the two sensors?" + FILLER,
     "What backup strategy makes sense for the Pi's SD card?" + FILLER,
     "Give one tip for reducing Zigbee interference." + FILLER,
-    "Without guessing: what was the project codeword I gave at the very start? "
-    "If it is no longer in your context, use your Ariadne tools to check the originals.",
+    "Without guessing: what was the project codeword I gave at the very start of THIS "
+    "conversation? If it is no longer in your context, use your Ariadne tools to check "
+    "this conversation's originals.",
 ]
 RESTART_TURN = (
-    "What names did I give the living-room and kitchen sensors? Check the originals "
-    "with your Ariadne tools if they are not in your context."
+    "In THIS conversation, what names did I give the living-room and kitchen sensors? "
+    "Check this conversation's originals with your Ariadne tools if they are not in "
+    "your context."
 )
 NEWCHAT_TURNS = [
     "Two questions. 1) What e-bike do I own and which tubes does it need? 2) In an "
@@ -179,6 +181,15 @@ def tool_names(messages, start):
                     name = "tool_call:" + ",".join(c.get("name", "?") for c in inner)
                 except Exception:
                     pass
+            names.append(name)
+    return names
+
+
+def offered_tools(agent):
+    names = []
+    for tool in getattr(agent, "tools", None) or []:
+        name = (tool.get("function") or {}).get("name") if isinstance(tool, dict) else None
+        if name and "ariadne" in name:
             names.append(name)
     return names
 
@@ -317,7 +328,11 @@ def main():
             "ariadne:import skill first and follow it."
         ]
     elif phase == "long":
-        prompts = LONG_TURNS
+        # Run-unique values, so an earlier run's archive cannot answer for this one.
+        prompts = [
+            p.replace("AMBER-LANTERN-42", f"AMBER-LANTERN-{run.upper()}") for p in LONG_TURNS
+        ]
+        prompts = [p.replace("'otter'", f"'otter-{run}'") for p in prompts]
     elif phase == "restart":
         prompts = [RESTART_TURN]
     elif phase == "probe":
@@ -385,6 +400,7 @@ def main():
     notes_mod = import_module(type(engine).__module__.rsplit(".", 1)[0] + ".notes")
     store = notes_mod.NoteStore(home)
     receipt = {
+        "offered_ariadne_tools": offered_tools(agent),
         "phase": phase,
         "model": model,
         "provider": provider,
