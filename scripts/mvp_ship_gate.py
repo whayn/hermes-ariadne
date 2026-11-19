@@ -354,8 +354,8 @@ def main():
                     k: status.get("rolling", {}).get(k)
                     for k in (
                         "status",
-                        "published_sequence",
-                        "frontier_count",
+                        "published_generation",
+                        "next_sequence",
                         "logical_reservations",
                         "blocked_reason",
                     )
