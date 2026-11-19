@@ -268,3 +268,21 @@ def test_tags_written_by_older_revision_remain_searchable(home):
     with sqlite3.connect(home / "ariadne" / "notes.sqlite3") as conn:
         conn.execute("UPDATE notes SET tags=? WHERE id=?", ('["caf\\u00e9"]', note["id"]))
     assert [n["text"] for n in store.search("café")] == ["legacy row"]
+
+
+def test_sidecar_disappearing_during_admission_is_tolerated(home, monkeypatch):
+    import hermes_ariadne.notes as notes
+
+    NoteStore(home).add("x")
+    journal = home / "ariadne" / "notes.sqlite3-journal"
+    journal.write_bytes(b"")
+    journal.chmod(0o600)
+    real = notes._check_private
+
+    def racing(path, *, regular):
+        if path == journal and path.exists():
+            path.unlink()  # another session commits and SQLite removes its journal
+        return real(path, regular=regular)
+
+    monkeypatch.setattr(notes, "_check_private", racing)
+    assert NoteStore(home).list()["total"] == 1

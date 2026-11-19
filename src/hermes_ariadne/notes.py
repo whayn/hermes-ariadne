@@ -182,8 +182,10 @@ class NoteStore:
                 _check_private(self.path, regular=True)
                 for suffix in ("-journal", "-wal", "-shm"):
                     companion = Path(str(self.path) + suffix)
-                    if companion.exists() or companion.is_symlink():
+                    try:
                         _check_private(companion, regular=True)
+                    except FileNotFoundError:
+                        pass  # absent, or removed by a concurrent commit: nothing to admit
                 return True
             if not create:
                 return False
@@ -301,8 +303,10 @@ class NoteStore:
             raise
 
     def prepare(self):
-        """Create/admit the store now, so a later write cannot fail on admission."""
-        self._admit(create=True)
+        """Create, admit, identify and migrate the store now (no rows written), so a
+        caller can refuse before side effects elsewhere instead of failing afterwards."""
+        with self._connect(write=True):
+            pass
 
     # -- writes ------------------------------------------------------------------------
 

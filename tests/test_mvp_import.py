@@ -219,3 +219,16 @@ def test_refused_note_store_rejects_before_archiving(home):
     with pytest.raises(StorageRefused):
         Importer(home).import_batch("k", _chat(2))
     assert not (home / "ariadne" / "events.sqlite3").exists()
+
+
+@pytest.mark.parametrize("pragma", ["application_id=1234", "user_version=99"])
+def test_foreign_note_database_rejects_before_archiving(home, pragma):
+    import sqlite3
+
+    NoteStore(home).add("x")
+    path = home / "ariadne" / "notes.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute(f"PRAGMA {pragma}")
+    with pytest.raises(StorageRefused):
+        Importer(home).import_batch("k", _chat(2))
+    assert not (home / "ariadne" / "events.sqlite3").exists()
