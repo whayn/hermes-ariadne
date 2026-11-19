@@ -64,9 +64,12 @@ class AriadneEngine(RollingAriadneEngine):
         return title if isinstance(title, str) and title.strip() else None
 
     def on_turn_complete(self, messages, usage=None, **kwargs):
+        scope = self._capture()  # the binding these messages belong to
         result = super().on_turn_complete(messages, usage, **kwargs)
-        scope = self._capture()
-        self._index(scope, preview=_first_user_text(messages), title=self._title(scope))
+        with self._lock:
+            current = self._current(scope)
+        if current:  # a reset/rebind during the call must not index into the new session
+            self._index(scope, preview=_first_user_text(messages), title=self._title(scope))
         return result
 
     def _publish(self, scope, journal, target, text, observed, coverage):
