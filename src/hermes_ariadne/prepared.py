@@ -639,15 +639,61 @@ def _require_carrier_origin(message, reference):
         raise _carrier_error("reasoning carrier without a canonical counterpart", found[0][0])
 
 
+# Hermes's recalled-memory fence, byte-for-byte as agent/memory_context.py's
+# build_memory_context_block writes it and turn_context.compose_user_api_content
+# appends it (content + "\n\n" + block). Any other wording, an extra
+# pre_llm_call block, or a nested fence keeps declining.
+_MEMORY_OPEN = (
+    "<memory-context>\n"
+    "[System note: The following is recalled memory context, "
+    "NOT new user input. Treat as authoritative reference data — "
+    "this is the agent's persistent memory and should inform all responses.]\n\n"
+)
+_MEMORY_CLOSE = "\n</memory-context>"
+_REQUEST_REASONING_TOKENS = "_replayed_reasoning_tokens"
+_MEMORY_FENCE = re.compile(r"</?\s*memory-context\s*>", re.IGNORECASE)
+
+
+def recalled_memory_suffix(content, api_content):
+    """True iff ``api_content`` is the typed text plus exactly one host memory block.
+
+    ``content`` may be the restored view's outer-stripped form of the typed text.
+    """
+    if type(content) is not str or type(api_content) is not str:
+        return False
+    if not api_content.endswith(_MEMORY_CLOSE):
+        return False
+    split = api_content.rfind("\n\n" + _MEMORY_OPEN)
+    if split < 0:
+        return False
+    typed = api_content[:split]
+    if typed != content and typed.strip() != content:
+        return False
+    body = api_content[split + 2 + len(_MEMORY_OPEN) : len(api_content) - len(_MEMORY_CLOSE)]
+    return bool(body.strip()) and not _MEMORY_FENCE.search(body)
+
+
 def _provider(
-    message, *, wire=False, durable=False, reasoning_policy=None, delivery_ids=False, carriers=False
+    message,
+    *,
+    wire=False,
+    durable=False,
+    reasoning_policy=None,
+    delivery_ids=False,
+    carriers=False,
+    memory_context=False,
 ):
     """``delivery_ids`` (rolling only): accept the gateway's ``platform_message_id`` on an
     assembled user message. It is delivery bookkeeping that Hermes strips before the
     provider call; it never enters the compared payload.
 
     ``carriers`` (rolling only, #29): admit ``_OPAQUE_CARRIERS`` structurally on rows
-    without Codex reasoning and leave them out of the compared payload."""
+    without Codex reasoning and leave them out of the compared payload.
+
+    ``memory_context`` (rolling only, #41): a user row whose ``api_content`` is its
+    ``content`` plus one host recalled-memory block is compared as that sent text
+    (the assembled view already carries it as ``content``). Readable summaries keep
+    using the canonical ``content`` only."""
     if type(message) is not dict:
         raise ValueError("message must be a mapping")
     opaque = _opaque(message, carriers)
@@ -658,6 +704,7 @@ def _provider(
         | {"_db_persisted", "tool_name", "effect_disposition", "codex_message_items"}
         | ({"codex_reasoning_items"} if reasoning_policy is not None else set())
         | ({"platform_message_id"} if delivery_ids else set())
+        | ({_REQUEST_REASONING_TOKENS} if carriers else set())
         if wire
         else _WIRE | _METADATA | _CARRIERS | _IDENTITIES
     ) | (_OPAQUE_CARRIERS if opaque else set())
@@ -668,6 +715,12 @@ def _provider(
         if carriers:
             raise _carrier_error("unknown message shape", carriers[0])
         raise ValueError("unknown message shape")
+    if wire and _REQUEST_REASONING_TOKENS in message:
+        # Hermes's request-only reasoning-size estimate for an assistant replay row;
+        # assemble_api_request pops it before the provider call. Never compared.
+        count = message[_REQUEST_REASONING_TOKENS]
+        if message.get("role") != "assistant" or type(count) is not int or count <= 0:
+            raise ValueError("invalid request reasoning estimate")
     if wire and delivery_ids and "platform_message_id" in message:
         delivery = message["platform_message_id"]
         if (
@@ -689,6 +742,7 @@ def _provider(
     if message.get("codex_reasoning_items") not in (None, "", False, [], {}):
         reasoning_items = _encrypted_codex_reasoning(message, reasoning_policy, durable=durable)
     codex_items = None
+    sent = None
     for key in sorted(_CARRIERS & message.keys()):  # Deterministic: names the reported carrier.
         value = message[key]
         if reasoning_items is not None and key in {
@@ -699,6 +753,14 @@ def _provider(
             continue  # Companions are checked independently before this projection.
         if key == "api_content" and value == content:
             continue  # An identical sidecar cannot change this supported wire mapping.
+        if (
+            key == "api_content"
+            and memory_context
+            and role == "user"
+            and recalled_memory_suffix(content, value)
+        ):
+            sent = value
+            continue
         if opaque and key in _OPAQUE_CARRIERS:
             continue  # Admitted above; opaque, so never part of the compared payload.
         if value not in (None, "", False, [], {}):
@@ -718,6 +780,8 @@ def _provider(
         for key, value in message.items()
         if key in _WIRE and (key in {"role", "content"} or value is not None)
     }
+    if sent is not None:
+        result["content"] = sent
     if codex_items is not None:
         # A real replay payload, never a redundant text sidecar: compare every
         # validated field across active, restored and assembled views unchanged.
@@ -734,7 +798,14 @@ def _provider(
 
 
 def _comparison(
-    message, *, wire=False, durable=False, reasoning_policy=None, delivery_ids=False, carriers=False
+    message,
+    *,
+    wire=False,
+    durable=False,
+    reasoning_policy=None,
+    delivery_ids=False,
+    carriers=False,
+    memory_context=False,
 ):
     """Audited pretransport comparison only; never returned as request/source.
 
@@ -750,6 +821,7 @@ def _comparison(
         reasoning_policy=reasoning_policy,
         delivery_ids=delivery_ids,
         carriers=carriers,
+        memory_context=memory_context,
     )
     opaque = _opaque(message, carriers)
     # make_tool_result_message writes name + tool_name; SessionDB restores only
@@ -872,7 +944,9 @@ def _identity_value(message, name):
     return values[0] if values else None
 
 
-def _occurrences(messages, *, durable=False, reasoning_policies=None, carriers=False):
+def _occurrences(
+    messages, *, durable=False, reasoning_policies=None, carriers=False, memory_context=False
+):
     _tool_sequence(messages)
     pending = {}
     seen = set()
@@ -883,6 +957,7 @@ def _occurrences(messages, *, durable=False, reasoning_policies=None, carriers=F
             durable=durable,
             reasoning_policy=reasoning_policies[index] if reasoning_policies else None,
             carriers=carriers,
+            memory_context=memory_context,
         ).get("tool_calls")
         mapping = _identity_value(message, "tool_call_uids")
         result_uid = _identity_value(message, "tool_call_uid")
@@ -976,7 +1051,14 @@ def _reasoning_permissions(history, active, request, count, policy, *, retiremen
 
 
 def _comparison_payloads(
-    messages, policies, *, wire=False, durable=False, delivery_ids=False, carriers=False
+    messages,
+    policies,
+    *,
+    wire=False,
+    durable=False,
+    delivery_ids=False,
+    carriers=False,
+    memory_context=False,
 ):
     """Use a separate request-local reasoning ID set for each compared view."""
     payloads = []
@@ -989,6 +1071,7 @@ def _comparison_payloads(
             reasoning_policy=policies[index],
             delivery_ids=delivery_ids,
             carriers=carriers,
+            memory_context=memory_context,
         )
         items = payload.get("codex_reasoning_items")
         if items:
@@ -1002,7 +1085,14 @@ def _comparison_payloads(
 
 
 def _exact_payloads(
-    history, active, policies, *, assembled=None, delivery_ids=False, carriers=False
+    history,
+    active,
+    policies,
+    *,
+    assembled=None,
+    delivery_ids=False,
+    carriers=False,
+    memory_context=False,
 ):
     """Shared audited canonical/restored comparison; assembled is real or absent.
 
@@ -1012,10 +1102,14 @@ def _exact_payloads(
     instead every restored/assembled carrier needs a canonical one at its position
     (or is the must-echo pad), and the assembled request's carriers share one bound.
     """
-    raw_payload = _comparison_payloads(history, policies, carriers=carriers)
+    raw_payload = _comparison_payloads(
+        history, policies, carriers=carriers, memory_context=memory_context
+    )
     if any(m["role"] not in {"user", "assistant", "tool"} for m in raw_payload):
         raise ValueError("host role inside history")
-    active_payload = _comparison_payloads(active, policies, durable=True, carriers=carriers)
+    active_payload = _comparison_payloads(
+        active, policies, durable=True, carriers=carriers, memory_context=memory_context
+    )
     for index, replay in enumerate(raw_payload):
         items = replay.get("codex_message_items")
         if items:
@@ -1061,10 +1155,18 @@ def _exact_payloads(
     return raw_payload
 
 
-def _exact_occurrences(history, active, policies, *, carriers=False):
-    occurrences = _occurrences(history, reasoning_policies=policies, carriers=carriers)
+def _exact_occurrences(history, active, policies, *, carriers=False, memory_context=False):
+    occurrences = _occurrences(
+        history, reasoning_policies=policies, carriers=carriers, memory_context=memory_context
+    )
     if canonical_json(
-        _occurrences(active, durable=True, reasoning_policies=policies, carriers=carriers)
+        _occurrences(
+            active,
+            durable=True,
+            reasoning_policies=policies,
+            carriers=carriers,
+            memory_context=memory_context,
+        )
     ) != canonical_json(occurrences[: len(active)]):
         raise ValueError("active/conversation occurrence mismatch")
     return occurrences

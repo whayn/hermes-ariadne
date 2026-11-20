@@ -267,12 +267,16 @@ def _canonical_rows(rows, *, policy, settings):
             bounded_text(row["name"], settings.max_checkpoint_bytes)
         event_ids.append(sha256(data))
     _uids(rows)
-    payloads = _comparison_payloads(rows, policies, durable=True, carriers=True)
+    payloads = _comparison_payloads(
+        rows, policies, durable=True, carriers=True, memory_context=True
+    )
     for row, payload in zip(rows, payloads):
         items = payload.get("codex_message_items")
         if items and items[0]["content"][0]["text"] != row["content"]:
             raise ValueError("Codex replay requires exact canonical source text")
-    _occurrences(rows, durable=True, reasoning_policies=policies, carriers=True)
+    _occurrences(
+        rows, durable=True, reasoning_policies=policies, carriers=True, memory_context=True
+    )
     if rows[0]["role"] != "user" or rows[-1]["role"] != "assistant" or rows[-1].get("tool_calls"):
         raise ValueError("whole completed exchanges required")
     return tuple(event_ids), tuple(row["message_uid"] for row in rows), payloads
@@ -1576,7 +1580,9 @@ def validate_completed_turn(active_rows, observed_messages, *, reasoning_policy,
         reasoning_policy,
         retirement_policy=POLICY_ID,
     )
-    payloads = _exact_payloads(observed_messages, active_rows, policies, carriers=True)
-    _exact_occurrences(observed_messages, active_rows, policies, carriers=True)
+    payloads = _exact_payloads(
+        observed_messages, active_rows, policies, carriers=True, memory_context=True
+    )
+    _exact_occurrences(observed_messages, active_rows, policies, carriers=True, memory_context=True)
     starts = completed_exchange_starts(payloads)
     return Coverage(events, uids, uids[-1], len(starts))

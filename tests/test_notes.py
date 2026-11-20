@@ -127,11 +127,22 @@ def test_refuses_symlinked_directory(home, tmp_path):
     assert list(elsewhere.iterdir()) == []
 
 
-def test_refuses_shared_permissions(home):
+def test_tightens_drifted_permissions_instead_of_refusing(home):
     (home / "ariadne").mkdir(mode=0o755)
     os.chmod(home / "ariadne", 0o755)
+    NoteStore(home).add("x")
+    assert stat.S_IMODE((home / "ariadne").stat().st_mode) == 0o700
+    path = home / "ariadne" / "notes.sqlite3"
+    os.chmod(path, 0o644)
+    assert NoteStore(home).list()["total"] == 1
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_refuses_hardlinked_store(home, tmp_path):
+    NoteStore(home).add("x")
+    os.link(home / "ariadne" / "notes.sqlite3", tmp_path / "alias")
     with pytest.raises(ValueError):
-        NoteStore(home).add("x")
+        NoteStore(home).list()
 
 
 def test_refuses_foreign_database(home):

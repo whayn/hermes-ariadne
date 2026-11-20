@@ -10,6 +10,7 @@ and are only ever changed by mirroring, never by agent note tools.
 
 import fcntl
 import json
+import logging
 import os
 import sqlite3
 import stat
@@ -18,6 +19,10 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+
+from .private_paths import StorageRefused, tighten_private  # noqa: F401
+
+logger = logging.getLogger(__name__)
 
 APPLICATION_ID = 0x41524E54  # "ARNT"
 SCHEMA_VERSION = 3
@@ -73,10 +78,6 @@ MAX_SUMMARY_CHARS = 8000
 CONVERSATION_ORIGINS = ("live", "import")
 
 
-class StorageRefused(ValueError):
-    """Ariadne's private storage failed admission (links, permissions, foreign files)."""
-
-
 def _text(value):
     if not isinstance(value, str) or not value.strip():
         raise ValueError("note text must be a non-empty string")
@@ -107,17 +108,7 @@ def _source(value):
     return encoded
 
 
-def _check_private(path, *, regular):
-    """Refuse links, shared permissions and non-regular files before any open."""
-    info = path.lstat()
-    if stat.S_ISLNK(info.st_mode):
-        raise StorageRefused("ariadne paths must not be symlinks")
-    if regular and (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
-        raise StorageRefused("ariadne store must be a regular single-link file")
-    if not regular and not stat.S_ISDIR(info.st_mode):
-        raise StorageRefused("ariadne directory is not a directory")
-    if info.st_mode & 0o077:
-        raise StorageRefused("ariadne paths must be private")
+_check_private = tighten_private
 
 
 def _fsync_dir(path):
@@ -216,12 +207,16 @@ class NoteStore:
         """Serialize initialization and leftover cleanup across threads and processes."""
         lock = self.directory / ".notes.lock"
         if lock.is_symlink():
-            raise ValueError("ariadne paths must not be symlinks")
+            raise StorageRefused("ariadne paths must not be symlinks")
         fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
             info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o077:
-                raise ValueError("invalid ariadne lock file")
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise StorageRefused("invalid ariadne lock file")
+            if info.st_uid != os.geteuid():
+                raise StorageRefused("ariadne lock file belongs to another user")
+            if info.st_mode & 0o077:
+                os.fchmod(fd, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX)
             yield
         finally:
@@ -244,7 +239,6 @@ class NoteStore:
                 published is not None
                 and stat.S_ISREG(info.st_mode)
                 and (info.st_dev, info.st_ino) == (published.st_dev, published.st_ino)
-                and not info.st_mode & 0o077
             )
             if not residual:
                 _check_private(leftover, regular=True)
