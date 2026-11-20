@@ -144,6 +144,27 @@ class ArchiveReader:
             "has_more": len(rows) > limit,
         }
 
+    def first_user_text(self, session_id, *, scan=50):
+        """Text of the session's first archived user record, admitted by the evidence
+        policy; None if absent, restricted or not textual."""
+        rows = self._rows(
+            "SELECT e.event_id, e.payload_json, MIN(o.position) AS pos "
+            "FROM events e JOIN observations o USING (event_id) WHERE o.session_id=? "
+            "GROUP BY e.event_id ORDER BY pos, e.event_id LIMIT ?",
+            (session_id, scan),
+        )
+        for event_id, payload, _ in rows:
+            message = json.loads(payload.decode("utf-8", "surrogatepass"))
+            if message.get("role") != "user":
+                continue
+            try:
+                message, _ = carrier_free(_check(event_id, payload))
+            except RestrictedEvidence:
+                return None
+            text = _text_of(message)
+            return text if text.strip() else None
+        return None
+
     def event(self, session_id, event_id, *, char_offset=0, max_chars=MAX_ZOOM_CHARS):
         """One exact message (content, then tool calls) paged by characters; carriers omitted."""
         if type(char_offset) is not int or char_offset < 0:

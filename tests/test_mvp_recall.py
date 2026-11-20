@@ -413,3 +413,31 @@ def test_reader_handles_uri_reserved_characters_in_home(tmp_path, name):
     before = sorted(p.name for p in tmp_path.iterdir())
     assert ArchiveReader(home).page("old")["messages"][0]["content"] == "hello"
     assert sorted(p.name for p in tmp_path.iterdir()) == before  # read-only: no stray files
+
+
+@needs_host
+@pytest.mark.parametrize(
+    "metadata",
+    [{"data_use": ["no_training"]}, {"withheld_prompt": "original"}],
+)
+def test_engine_preview_admits_the_canonical_record(tmp_path, monkeypatch, metadata):
+    from test_rolling_engine import DB, Facade, complete
+    from test_rolling_selection import POLICY, exchange
+
+    from hermes_ariadne import rolling
+    from hermes_ariadne.mvp_engine import AriadneEngine
+
+    monkeypatch.setattr(AriadneEngine, "_bound_reasoning_policy", staticmethod(lambda *a: POLICY))
+    facade, db = Facade(), DB()
+    engine = AriadneEngine(llm=facade, settings=rolling.RollingSettings(trigger_bytes=1))
+    engine.update_model("gpt-test", 100000, "https://invalid.test", "", "fixture", "fixture")
+    engine.bind_session_state(db, "s")
+    engine.on_session_start("s", hermes_home=tmp_path)
+    db.rows = exchange("A")
+    first = next(r for r in db.rows if r["role"] == "user")
+    first["display_metadata"] = json.dumps(metadata)  # durable only, not in the callback
+    complete(engine, db, "A")
+    db.rows += exchange("B")
+    complete(engine, db, "B")
+    row = NoteStore(tmp_path).get_conversation("s")
+    assert row is None or row["preview"] is None

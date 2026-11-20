@@ -9,6 +9,7 @@ a failure is logged and never affects selection, archiving or publication.
 
 import logging
 
+from .conversations import ArchiveReader
 from .notes import NoteStore
 from .retrieval import _require_supported_data_use
 from .rolling_engine import RollingAriadneEngine
@@ -54,6 +55,17 @@ class AriadneEngine(RollingAriadneEngine):
         except Exception as exc:
             logger.warning("ariadne conversation index update failed: %s", type(exc).__name__)
 
+    def _preview(self, scope, messages):
+        """Preview from the canonical archived record (admitted by the evidence policy),
+        never from callback text alone: restrictions may live only on the durable row."""
+        if _first_user_text(messages) is None:
+            return None
+        try:
+            return ArchiveReader(scope.home).first_user_text(scope.session_id)
+        except Exception as exc:
+            logger.warning("ariadne preview lookup failed: %s", type(exc).__name__)
+            return None
+
     def _title(self, scope):
         getter = getattr(scope.db, "get_session", None)
         if getter is None:
@@ -71,7 +83,7 @@ class AriadneEngine(RollingAriadneEngine):
         with self._lock:
             current = self._current(scope)
         if current:  # a reset/rebind during the call must not index into the new session
-            self._index(scope, preview=_first_user_text(messages), title=self._title(scope))
+            self._index(scope, preview=self._preview(scope, messages), title=self._title(scope))
         return result
 
     def _publish(self, scope, journal, target, text, observed, coverage):
