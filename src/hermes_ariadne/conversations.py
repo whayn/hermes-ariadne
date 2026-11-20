@@ -82,7 +82,7 @@ class ArchiveReader:
         archive = _archive_path(self.home)  # metadata-only admission, no creation
         if not archive.is_file():
             return None
-        conn = sqlite3.connect(f"file:{archive}?mode=ro", uri=True, timeout=10)
+        conn = sqlite3.connect(archive.as_uri() + "?mode=ro", uri=True, timeout=10)
         if conn.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID:
             conn.close()
             raise ValueError("not an ariadne archive")
