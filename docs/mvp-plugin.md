@@ -7,10 +7,11 @@ One Hermes plugin, `ariadne`, that you select in **both** settings slots:
 | Memory provider | `memory.provider: ariadne` | Profile notes (`ariadne_notes`), one-way mirror of built-in memory writes, recall of relevant notes and past conversations each turn, `ariadne_conversations` to read past chats |
 | Context engine | `context.engine: ariadne` | The rolling engine (automatic summary of older turns through Hermes's LLM facade, page/search/zoom tools) plus the conversation index |
 
-Status: **experimental; use a dedicated development profile**. Phases 1, 3 and
-4 of #41. The MVP keeps rolling's single cumulative summary with exact zoom; the
-UniiChat summary tree is deferred until after the MVP. The dev-profile ship gate
-with a real model passed once (see [Ship gate](#ship-gate)).
+Status: **experimental prerelease (v0.2.0); use a dedicated development
+profile**. Implements #41. The MVP keeps rolling's single cumulative summary with
+exact zoom; the UniiChat summary tree is deferred. The dev-profile ship gate with
+a real model passed (see [Ship gate](#ship-gate)); see
+[Limitations](#limitations) and [Rollback](#rollback) before installing.
 
 ## Install (development profile)
 
@@ -173,8 +174,8 @@ synchronously in turn completion and added 6–43 s to the turns that triggered
 it (the user waits for it before the next turn starts). Not measured: large
 chats near the default limits (#19), other providers.
 
-Rerun on 2026-11-20 after the review fixes, installed at `0cb7ec2` into the same
-profile (its note store was still at pre-release schema version 1 and migrated to
+Rerun on 2026-11-20 after the review fixes, Hermes `caafe53` (0.23.3), installed
+at `0cb7ec2` into the same profile (its note store was still at pre-release schema version 1 and migrated to
 3 in place): import (existing notes found, not duplicated), long chat (summaries
 after turns 3/5/7, selected from turn 4; turn 8 quoted the run's codeword from
 the original via `ariadne_find`), restart (answered both sensor names from the
@@ -185,7 +186,47 @@ logical identity" while no summary existed yet; Hermes sent the original
 request. The stored rows had unique identities; the in-memory message lacking
 one was not captured.
 
+Follow-up new-chat run on 2026-11-20 (Hermes `caafe53`, plugin `19861ff`): the
+model found a detail that exists only in an imported conversation's originals
+(`ariadne_conversations` read), and a built-in memory add, replace and remove
+were all mirrored (the remove matched the replaced text; the mirror ended empty
+like built-in memory, agent notes untouched).
+
 Observed confusion: in one run the past-conversation index showed earlier runs'
 summaries containing a similar codeword, and the model briefly described them
 as a lossy summary of the current chat. The answer was still taken from the
 exact original.
+
+## Limitations
+
+- One provider (Mistral `mistral-large-4`) and short chats were tested with a real
+  model, on Hermes `ae2a81c` and `caafe53` (0.23.3); CI pins Hermes `c627ec8`.
+  Other providers and Hermes builds are unverified.
+- Summary preparation runs inside turn completion and can add tens of seconds to
+  the turns that trigger it. Large chats near the default limits are slow (#19).
+- One cumulative summary per conversation, not the UniiChat summary tree.
+- Recall is literal word overlap, not semantic search.
+- Some requests decline selection and fall back to the full history (#47), which
+  can hit provider limits in long chats.
+- Archives and notes are not encrypted, and Hermes rewind/delete does not erase
+  Ariadne's copies; there is no erasure command.
+- The recall compatibility check pins Hermes's current `<memory-context>` wording;
+  if Hermes changes it, summaries stop being used (fail-closed) until updated.
+
+## Rollback
+
+Select the built-in engines again; nothing in Hermes's own history is modified by
+Ariadne:
+
+```bash
+hermes config set context.engine compressor
+hermes memory off                           # built-in memory only
+hermes plugins disable ariadne
+hermes plugins remove ariadne               # optional
+```
+
+Ariadne's data stays in `$HERMES_HOME/ariadne/` (archive, rolling journals, notes)
+until you delete that directory. To go back to an earlier plugin revision, run
+`hermes plugins install whayn/hermes-ariadne --ref <full commit SHA> --force`.
+Note stores are migrated forward in place (schema 1 → 3); an older revision
+refuses a newer store rather than misreading it.
