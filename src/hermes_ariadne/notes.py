@@ -50,17 +50,27 @@ SCHEMA = (
         origin TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL, source TEXT
     )""",
 )
+
+
 # Upgrades for stores written by earlier revisions: {from_version: statements}.
+def _add_source_column(conn):
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(conversations)")}
+    if "source" not in columns:
+        conn.execute("ALTER TABLE conversations ADD COLUMN source TEXT")
+
+
+# Statements must be idempotent: pre-release revisions created newer tables while
+# still labelling the store version 1.
 MIGRATIONS = {
     # v1 -> v2: the conversations index as first released (without ``source``).
     1: (
-        """CREATE TABLE conversations (
+        """CREATE TABLE IF NOT EXISTS conversations (
         session_id TEXT PRIMARY KEY, title TEXT, preview TEXT, summary TEXT,
         origin TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL
     )""",
     ),
-    # v2 -> v3: import provenance on index rows.
-    2: ("ALTER TABLE conversations ADD COLUMN source TEXT",),
+    # v2 -> v3: import provenance on index rows (skipped if already present).
+    2: (_add_source_column,),
 }
 MAX_TITLE_CHARS = 200
 MAX_PREVIEW_CHARS = 300
@@ -293,8 +303,8 @@ class NoteStore:
             while version != SCHEMA_VERSION:
                 if version not in MIGRATIONS:
                     raise StorageRefused("not an ariadne note store")
-                for sql in MIGRATIONS[version]:
-                    conn.execute(sql)
+                for step in MIGRATIONS[version]:
+                    step(conn) if callable(step) else conn.execute(step)
                 version += 1
                 conn.execute(f"PRAGMA user_version={version}")
             conn.commit()
