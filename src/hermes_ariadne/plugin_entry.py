@@ -22,11 +22,25 @@ def _facade(ctx):
     return llm if callable(getattr(llm, "complete", None)) else None
 
 
+def _register_skill(ctx):
+    from pathlib import Path
+
+    register_skill = getattr(ctx, "register_skill", None)
+    if not callable(register_skill):
+        return
+    path = Path(__file__).parent / "skills" / "import" / "SKILL.md"
+    try:
+        register_skill("import", path, "Import supplied files into Ariadne memory")
+    except Exception:  # a skill problem must never cost the provider or engine
+        pass
+
+
 def register(ctx):
     from .memory_provider import AriadneMemoryProvider
 
     llm = _facade(ctx)
     ctx.register_memory_provider(AriadneMemoryProvider())
+    _register_skill(ctx)
     if llm is None:
         return None
     from .mvp_engine import AriadneEngine

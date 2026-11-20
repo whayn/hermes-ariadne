@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 APPLICATION_ID = 0x41524E54  # "ARNT"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_NOTE_CHARS = 4000
 MAX_TAGS = 16
 MAX_TAG_CHARS = 64
@@ -42,19 +42,39 @@ SCHEMA = (
     "CREATE INDEX notes_origin_text ON notes(origin, text)",
     """CREATE TABLE conversations (
         session_id TEXT PRIMARY KEY, title TEXT, preview TEXT, summary TEXT,
-        origin TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL
+        origin TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL, source TEXT
     )""",
 )
+
+
 # Upgrades for stores written by earlier revisions: {from_version: statements}.
+def _add_source_column(conn):
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(conversations)")}
+    if "source" not in columns:
+        conn.execute("ALTER TABLE conversations ADD COLUMN source TEXT")
+
+
 # Statements must be idempotent: pre-release revisions created newer tables while
 # still labelling the store version 1.
 MIGRATIONS = {
-    1: (SCHEMA[3].replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1),),  # index
+    # v1 -> v2: the conversations index as first released (without ``source``).
+    1: (
+        """CREATE TABLE IF NOT EXISTS conversations (
+        session_id TEXT PRIMARY KEY, title TEXT, preview TEXT, summary TEXT,
+        origin TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL
+    )""",
+    ),
+    # v2 -> v3: import provenance on index rows (skipped if already present).
+    2: (_add_source_column,),
 }
 MAX_TITLE_CHARS = 200
 MAX_PREVIEW_CHARS = 300
 MAX_SUMMARY_CHARS = 8000
 CONVERSATION_ORIGINS = ("live", "import")
+
+
+class StorageRefused(ValueError):
+    """Ariadne's private storage failed admission (links, permissions, foreign files)."""
 
 
 def _text(value):
@@ -91,13 +111,13 @@ def _check_private(path, *, regular):
     """Refuse links, shared permissions and non-regular files before any open."""
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode):
-        raise ValueError("ariadne paths must not be symlinks")
+        raise StorageRefused("ariadne paths must not be symlinks")
     if regular and (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
-        raise ValueError("ariadne store must be a regular single-link file")
+        raise StorageRefused("ariadne store must be a regular single-link file")
     if not regular and not stat.S_ISDIR(info.st_mode):
-        raise ValueError("ariadne directory is not a directory")
+        raise StorageRefused("ariadne directory is not a directory")
     if info.st_mode & 0o077:
-        raise ValueError("ariadne paths must be private")
+        raise StorageRefused("ariadne paths must be private")
 
 
 def _fsync_dir(path):
@@ -122,12 +142,13 @@ def _row(row):
 
 
 _COLUMNS = "id,text,tags,source,origin,created,updated"
-_CONV_COLUMNS = "session_id,title,preview,summary,origin,created,updated"
+_CONV_COLUMNS = "session_id,title,preview,summary,origin,created,updated,source"
 
 
 def _conversation(row):
-    keys = _CONV_COLUMNS.split(",")
-    return dict(zip(keys, row))
+    result = dict(zip(_CONV_COLUMNS.split(","), row))
+    result["source"] = json.loads(result["source"]) if result["source"] else None
+    return result
 
 
 def _clip(value, limit):
@@ -137,6 +158,20 @@ def _clip(value, limit):
         raise ValueError("conversation fields must be strings")
     value = " ".join(value.split())
     return value[:limit] or None
+
+
+def conversation_fields(*, title=None, preview=None, summary=None, source=None):
+    """Validate and normalize index metadata without touching storage."""
+    if summary is not None:
+        if not isinstance(summary, str):
+            raise ValueError("summary must be a string")
+        summary = summary.strip()[:MAX_SUMMARY_CHARS] or None
+    return {
+        "title": _clip(title, MAX_TITLE_CHARS),
+        "preview": _clip(preview, MAX_PREVIEW_CHARS),
+        "summary": summary,
+        "source": _source(source),
+    }
 
 
 class NoteStore:
@@ -151,10 +186,10 @@ class NoteStore:
 
     def _admit(self, *, create):
         if not self.home.is_absolute():
-            raise ValueError("hermes home must be absolute")
+            raise StorageRefused("hermes home must be absolute")
         for parent in (self.home, *self.home.parents):
             if parent.is_symlink():
-                raise ValueError("hermes home must not traverse symlinks")
+                raise StorageRefused("hermes home must not traverse symlinks")
         if not (self.directory.exists() or self.directory.is_symlink()):
             if not create:
                 return False
@@ -246,7 +281,7 @@ class NoteStore:
         conn = sqlite3.connect(self.path, timeout=10)
         try:
             if conn.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID:
-                raise ValueError("not an ariadne note store")
+                raise StorageRefused("not an ariadne note store")
             if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
                 self._migrate(conn)
             conn.execute("PRAGMA foreign_keys=ON")
@@ -273,15 +308,21 @@ class NoteStore:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             while version != SCHEMA_VERSION:
                 if version not in MIGRATIONS:
-                    raise ValueError("not an ariadne note store")
-                for sql in MIGRATIONS[version]:
-                    conn.execute(sql)
+                    raise StorageRefused("not an ariadne note store")
+                for step in MIGRATIONS[version]:
+                    step(conn) if callable(step) else conn.execute(step)
                 version += 1
                 conn.execute(f"PRAGMA user_version={version}")
             conn.commit()
         except BaseException:
             conn.rollback()
             raise
+
+    def prepare(self):
+        """Create, admit, identify and migrate the store now (no rows written), so a
+        caller can refuse before side effects elsewhere instead of failing afterwards."""
+        with self._connect(write=True):
+            pass
 
     # -- writes ------------------------------------------------------------------------
 
@@ -444,18 +485,20 @@ class NoteStore:
     # -- conversation index (derived navigation data, never canonical) -----------------
 
     def upsert_conversation(
-        self, session_id, *, title=None, preview=None, summary=None, origin="live"
+        self, session_id, *, title=None, preview=None, summary=None, origin="live", source=None
     ):
         """Create or refresh one index row. ``preview`` is only set once."""
         if not isinstance(session_id, str) or not session_id or len(session_id) > 200:
             raise ValueError("invalid session id")
         if origin not in CONVERSATION_ORIGINS:
             raise ValueError("invalid conversation origin")
-        title, preview = _clip(title, MAX_TITLE_CHARS), _clip(preview, MAX_PREVIEW_CHARS)
-        if summary is not None:
-            if not isinstance(summary, str):
-                raise ValueError("summary must be a string")
-            summary = summary.strip()[:MAX_SUMMARY_CHARS] or None
+        fields = conversation_fields(title=title, preview=preview, summary=summary, source=source)
+        title, preview, summary, source = (
+            fields["title"],
+            fields["preview"],
+            fields["summary"],
+            fields["source"],
+        )
         now = time.time()
         with self._connect(write=True) as conn:
             if conn.execute(
@@ -463,14 +506,14 @@ class NoteStore:
             ).fetchone():
                 conn.execute(
                     "UPDATE conversations SET title=coalesce(?,title), "
-                    "preview=coalesce(preview,?), summary=coalesce(?,summary), updated=? "
-                    "WHERE session_id=?",
-                    (title, preview, summary, now, session_id),
+                    "preview=coalesce(preview,?), summary=coalesce(?,summary), "
+                    "source=coalesce(?,source), updated=? WHERE session_id=?",
+                    (title, preview, summary, source, now, session_id),
                 )
             else:
                 conn.execute(
-                    "INSERT INTO conversations VALUES(?,?,?,?,?,?,?)",
-                    (session_id, title, preview, summary, origin, now, now),
+                    "INSERT INTO conversations VALUES(?,?,?,?,?,?,?,?)",
+                    (session_id, title, preview, summary, origin, now, now, source),
                 )
 
     def get_conversation(self, session_id):

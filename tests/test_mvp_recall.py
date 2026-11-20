@@ -453,7 +453,10 @@ def test_v1_store_that_already_has_the_index_migrates(home):
         conn.execute(sql)
     conn.execute(f"PRAGMA application_id={notes.APPLICATION_ID}")
     conn.execute("PRAGMA user_version=1")
-    conn.execute("INSERT INTO conversations VALUES('old','t','p','s','live',1,1)")
+    conn.execute(
+        "INSERT INTO conversations (session_id, title, preview, summary, origin, created, "
+        "updated) VALUES ('old','t','p','s','live',1,1)"
+    )
     conn.commit()
     conn.close()
     os.chmod(path, 0o600)

@@ -244,12 +244,15 @@ class EventStore:
         finally:
             conn.close()
 
-    def ingest(self, session_id, messages, *, origin):
+    def ingest(self, session_id, messages, *, origin, start=0):
+        """Archive ``messages``; observation positions count from ``start``."""
+        if type(start) is not int or start < 0:
+            raise ValueError("start must be a nonnegative integer")
         inserted = 0
         skipped = 0
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            for position, message in enumerate(messages):
+            for position, message in enumerate(messages, start):
                 uid = message.get("message_uid")
                 if not isinstance(uid, str) or not uid:
                     skipped += 1
