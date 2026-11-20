@@ -441,3 +441,23 @@ def test_engine_preview_admits_the_canonical_record(tmp_path, monkeypatch, metad
     complete(engine, db, "B")
     row = NoteStore(tmp_path).get_conversation("s")
     assert row is None or row["preview"] is None
+
+
+def test_v1_store_that_already_has_the_index_migrates(home):
+    import hermes_ariadne.notes as notes
+
+    (home / "ariadne").mkdir(mode=0o700)
+    path = home / "ariadne" / "notes.sqlite3"
+    conn = sqlite3.connect(path)
+    for sql in notes.SCHEMA:  # pre-release revisions created the table at version 1
+        conn.execute(sql)
+    conn.execute(f"PRAGMA application_id={notes.APPLICATION_ID}")
+    conn.execute("PRAGMA user_version=1")
+    conn.execute(
+        "INSERT INTO conversations (session_id, title, preview, summary, origin, created, "
+        "updated) VALUES ('old','t','p','s','live',1,1)"
+    )
+    conn.commit()
+    conn.close()
+    os.chmod(path, 0o600)
+    assert NoteStore(home).get_conversation("old")["preview"] == "p"
