@@ -4,8 +4,11 @@ Read `CONTRIBUTING.md`, `README.md`, and the relevant integration findings befor
 changing behavior. This file is repository-local agent guidance, not runtime
 instructions for an agent reading historical archived text.
 
-- Ariadne is a ContextEngine plugin, not a MemoryProvider or a replacement harness.
-  Ordinary `ariadne` remains passive. Separate opt-in `ariadne-prepared` selects
+- Ariadne is a Hermes plugin, not a replacement harness. The MVP root plugin
+  (`plugin.yaml`/`__init__.py`, issue #41, docs/mvp-plugin.md) registers an
+  `ariadne` MemoryProvider (profile notes) and an `ariadne` ContextEngine (rolling
+  engine via the general plugin's `ctx.llm`). The development `ariadne-install`
+  passive engine also uses the name `ariadne`; never install both in one home. Separate opt-in `ariadne-prepared` selects
   an operator-published frozen prefix and provides bounded find/zoom; it does not
   generate or refresh summaries. `tree.py`/`kernel.py` provide its navigable
   kernel; compaction modules remain an opt-in offline development path.

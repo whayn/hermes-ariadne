@@ -15,7 +15,15 @@ provider) is recorded in its docs, with the failure modes it hit. All three
 displace the built-in compressor; long chats or selection fallback can hit
 provider limits. This is not yet a production long-horizon memory engine.
 
-## Passive engine (`ariadne`)
+## MVP plugin (memory + context, experimental)
+
+`hermes plugins install whayn/hermes-ariadne`, then `hermes plugins enable ariadne`
+and select `ariadne` as both memory provider and context engine. It provides
+profile notes with built-in memory mirroring and the rolling context engine.
+Dedicated development profile only; see [docs/mvp-plugin.md](docs/mvp-plugin.md)
+and issue #41 for what is and is not implemented yet.
+
+## Passive engine (`ariadne`, development installer)
 
 - Exact JSON-value snapshots: Unicode, whitespace, structured content, nulls,
   tool calls/results, host identity fields and metadata are preserved.
