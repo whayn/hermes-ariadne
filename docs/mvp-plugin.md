@@ -59,7 +59,9 @@ installed host source and exercised by `tests/test_mvp_native.py`):
   without the host's `previous_content` is skipped, never guessed. Mirrored
   notes are read-only through `ariadne_notes` and are not recalled by
   `prefetch` (they are already in the prompt). Entries that existed before the
-  plugin was installed are not copied.
+  plugin was installed are not copied. Only the primary agent mirrors; writes
+  made by subagents, cron jobs or the pre-compression flush agent are not copied
+  (Hermes's `agent_context` guidance), so the mirror can lag built-in memory.
 - Recall is literal word overlap between the user's message and note text/tags,
   capped at 2,000 characters, labelled as stored data rather than instructions.
   It is not semantic search.
