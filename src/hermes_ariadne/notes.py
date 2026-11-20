@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 APPLICATION_ID = 0x41524E54  # "ARNT"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_NOTE_CHARS = 4000
 MAX_TAGS = 16
 MAX_TAG_CHARS = 64
@@ -40,7 +40,21 @@ SCHEMA = (
         PRIMARY KEY (note_id, rev)
     )""",
     "CREATE INDEX notes_origin_text ON notes(origin, text)",
+    """CREATE TABLE conversations (
+        session_id TEXT PRIMARY KEY, title TEXT, preview TEXT, summary TEXT,
+        origin TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL
+    )""",
 )
+# Upgrades for stores written by earlier revisions: {from_version: statements}.
+# Statements must be idempotent: pre-release revisions created newer tables while
+# still labelling the store version 1.
+MIGRATIONS = {
+    1: (SCHEMA[3].replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1),),  # index
+}
+MAX_TITLE_CHARS = 200
+MAX_PREVIEW_CHARS = 300
+MAX_SUMMARY_CHARS = 8000
+CONVERSATION_ORIGINS = ("live", "import")
 
 
 def _text(value):
@@ -108,6 +122,21 @@ def _row(row):
 
 
 _COLUMNS = "id,text,tags,source,origin,created,updated"
+_CONV_COLUMNS = "session_id,title,preview,summary,origin,created,updated"
+
+
+def _conversation(row):
+    keys = _CONV_COLUMNS.split(",")
+    return dict(zip(keys, row))
+
+
+def _clip(value, limit):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("conversation fields must be strings")
+    value = " ".join(value.split())
+    return value[:limit] or None
 
 
 class NoteStore:
@@ -216,11 +245,10 @@ class NoteStore:
             return
         conn = sqlite3.connect(self.path, timeout=10)
         try:
-            if (
-                conn.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID
-                or conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
-            ):
+            if conn.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID:
                 raise ValueError("not an ariadne note store")
+            if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                self._migrate(conn)
             conn.execute("PRAGMA foreign_keys=ON")
             if write:
                 conn.execute("PRAGMA synchronous=FULL")
@@ -236,6 +264,24 @@ class NoteStore:
             raise
         finally:
             conn.close()
+
+    @staticmethod
+    def _migrate(conn):
+        """Upgrade an older Ariadne store in one transaction; unknown versions refuse."""
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            while version != SCHEMA_VERSION:
+                if version not in MIGRATIONS:
+                    raise ValueError("not an ariadne note store")
+                for sql in MIGRATIONS[version]:
+                    conn.execute(sql)
+                version += 1
+                conn.execute(f"PRAGMA user_version={version}")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
     # -- writes ------------------------------------------------------------------------
 
@@ -394,3 +440,87 @@ class NoteStore:
                     f"SELECT id,text,tags FROM notes {clause} ORDER BY updated DESC LIMIT ?", (cap,)
                 )
             ]
+
+    # -- conversation index (derived navigation data, never canonical) -----------------
+
+    def upsert_conversation(
+        self, session_id, *, title=None, preview=None, summary=None, origin="live"
+    ):
+        """Create or refresh one index row. ``preview`` is only set once."""
+        if not isinstance(session_id, str) or not session_id or len(session_id) > 200:
+            raise ValueError("invalid session id")
+        if origin not in CONVERSATION_ORIGINS:
+            raise ValueError("invalid conversation origin")
+        title, preview = _clip(title, MAX_TITLE_CHARS), _clip(preview, MAX_PREVIEW_CHARS)
+        if summary is not None:
+            if not isinstance(summary, str):
+                raise ValueError("summary must be a string")
+            summary = summary.strip()[:MAX_SUMMARY_CHARS] or None
+        now = time.time()
+        with self._connect(write=True) as conn:
+            if conn.execute(
+                "SELECT 1 FROM conversations WHERE session_id=?", (session_id,)
+            ).fetchone():
+                conn.execute(
+                    "UPDATE conversations SET title=coalesce(?,title), "
+                    "preview=coalesce(preview,?), summary=coalesce(?,summary), updated=? "
+                    "WHERE session_id=?",
+                    (title, preview, summary, now, session_id),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO conversations VALUES(?,?,?,?,?,?,?)",
+                    (session_id, title, preview, summary, origin, now, now),
+                )
+
+    def get_conversation(self, session_id):
+        with self._connect(write=False) as conn:
+            if conn is None:
+                return None
+            row = conn.execute(
+                f"SELECT {_CONV_COLUMNS} FROM conversations WHERE session_id=?", (session_id,)
+            ).fetchone()
+            return _conversation(row) if row else None
+
+    def conversations(self, *, offset=0, limit=20, exclude=None):
+        if (
+            type(offset) is not int
+            or offset < 0
+            or type(limit) is not int
+            or not 1 <= limit <= MAX_PAGE
+        ):
+            raise ValueError("invalid page")
+        with self._connect(write=False) as conn:
+            if conn is None:
+                return {"conversations": [], "offset": offset, "total": 0}
+            where, params = ("WHERE session_id != ?", (exclude,)) if exclude else ("", ())
+            total = conn.execute(f"SELECT count(*) FROM conversations {where}", params).fetchone()[
+                0
+            ]
+            rows = conn.execute(
+                f"SELECT {_CONV_COLUMNS} FROM conversations {where} "
+                "ORDER BY updated DESC, session_id LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            ).fetchall()
+            return {
+                "conversations": [_conversation(r) for r in rows],
+                "offset": offset,
+                "total": total,
+            }
+
+    def search_conversations(self, query, *, limit=20, exclude=None):
+        if not isinstance(query, str) or not query.strip() or len(query) > 500:
+            raise ValueError("invalid query")
+        if type(limit) is not int or not 1 <= limit <= MAX_PAGE:
+            raise ValueError("invalid limit")
+        like = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        with self._connect(write=False) as conn:
+            if conn is None:
+                return []
+            rows = conn.execute(
+                f"SELECT {_CONV_COLUMNS} FROM conversations WHERE session_id != ? AND "
+                "(title LIKE ? ESCAPE '\\' OR preview LIKE ? ESCAPE '\\' "
+                "OR summary LIKE ? ESCAPE '\\') ORDER BY updated DESC LIMIT ?",
+                (exclude or "", like, like, like, limit),
+            ).fetchall()
+            return [_conversation(r) for r in rows]

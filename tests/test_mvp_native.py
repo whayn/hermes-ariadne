@@ -8,6 +8,10 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -105,7 +109,7 @@ def _run(args, home, stderr_path):
     return proc.stdout
 
 
-def test_install_enable_select_and_use(tmp_path):
+def _install(tmp_path):
     repo, home = tmp_path / "repo", tmp_path / "home"
     repo.mkdir()
     home.mkdir(mode=0o700)
@@ -116,9 +120,24 @@ def test_install_enable_select_and_use(tmp_path):
         home,
         tmp_path / "install.err",
     )
+    for key, value in (
+        ("memory.provider", "ariadne"),
+        ("context.engine", "ariadne"),
+        ("model.context_length", "128000"),
+        ("auxiliary.title_generation.enabled", "false"),
+    ):
+        _run([*hermes, "config", "set", key, value], home, tmp_path / "config.err")
     _run([*hermes, "plugins", "enable", "ariadne"], home, tmp_path / "enable.err")
-    _run([*hermes, "config", "set", "memory.provider", "ariadne"], home, tmp_path / "m.err")
-    _run([*hermes, "config", "set", "context.engine", "ariadne"], home, tmp_path / "c.err")
+    return home
+
+
+@pytest.fixture(scope="module")
+def installed_home(tmp_path_factory):
+    return _install(tmp_path_factory.mktemp("mvp-native"))
+
+
+def test_install_enable_select_and_use(installed_home, tmp_path):
+    home = installed_home
     out = _run([HERMES_PYTHON, "-c", CHILD], home, tmp_path / "child.err")
     result = json.loads(out.strip().splitlines()[-1])
 
@@ -130,3 +149,168 @@ def test_install_enable_select_and_use(tmp_path):
     assert "ariadne" in result["listed_engines"] and "ariadne" in result["listed_providers"]
     assert result["added"] and result["notes_db"]
     assert "native note" in result["recall"] and "mirrored entry" not in result["recall"]
+
+
+SESSION_A, SESSION_B = "mvp-chat-a", "mvp-chat-b"
+PROMPT_A = "NOTE-IT: my e-bike is a Nakamura Crossover XV, remember that."
+PROMPT_B = "ASK-BIKE: which tyres fit my bike?"
+NOTE = "User's e-bike: Nakamura Crossover XV"
+
+
+def _texts(messages):
+    out = []
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, str):
+            out.append(content)
+        elif isinstance(content, list):
+            out.extend(p.get("text", "") for p in content if isinstance(p, dict))
+    return "\n".join(out)
+
+
+class _Provider(BaseHTTPRequestHandler):
+    requests, errors, observed = [], [], {}
+
+    def log_message(self, *args):
+        pass
+
+    def _call(self, body, name, args):
+        names = [t["function"]["name"] for t in body.get("tools") or []]
+        if name in names:
+            self.observed.setdefault("direct", set()).add(name)
+            return name, args
+        assert "tool_call" in names, f"{name} neither exposed nor deferred: {names}"
+        self.observed.setdefault("deferred", set()).add(name)
+        return "tool_call", {"calls": [{"name": name, "arguments": args}]}
+
+    def _answer(self, body):
+        messages = body["messages"]
+        assert all("message_uid" not in m for m in messages)
+        last = messages[-1]
+        prompt = next((m.get("content") for m in reversed(messages) if m["role"] == "user"), "")
+        prompt = prompt if isinstance(prompt, str) else _texts([{"content": prompt}])
+        # Checked first: chat B's recalled index quotes chat A's NOTE-IT preview.
+        if "ASK-BIKE" in prompt:
+            if last["role"] == "tool":
+                assert PROMPT_A in last["content"], last["content"][:500]
+                self.observed["read_exact_original"] = True
+                return {"role": "assistant", "content": "answered"}, "stop"
+            text = _texts(messages)
+            self.observed["recall_note"] = NOTE in text
+            self.observed["recall_index"] = f"[{SESSION_A}]" in text
+            name, args = self._call(
+                body, "ariadne_conversations", {"action": "read", "id": SESSION_A}
+            )
+        elif "NOTE-IT" in prompt:
+            if last["role"] == "tool":
+                assert '"ok": true' in last["content"], last["content"]
+                return {"role": "assistant", "content": "noted"}, "stop"
+            name, args = self._call(body, "ariadne_notes", {"action": "add", "text": NOTE})
+        else:
+            self.observed.setdefault("other", 0)
+            self.observed["other"] += 1
+            return {"role": "assistant", "content": "ok"}, "stop"
+        call = {
+            "id": "call_" + name,
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args)},
+        }
+        return {"role": "assistant", "content": None, "tool_calls": [call]}, "tool_calls"
+
+    def do_POST(self):
+        streaming = False
+        try:
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            self.requests.append(body)
+            message, finish = self._answer(body)
+            answer = {
+                "id": "offline",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "ariadne/test",
+                "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110},
+            }
+            streaming = bool(body.get("stream"))
+            if streaming:
+                delta = dict(message)
+                if delta.get("tool_calls"):
+                    delta["tool_calls"] = [
+                        {**tc, "index": i} for i, tc in enumerate(delta["tool_calls"])
+                    ]
+                chunks = [
+                    {
+                        **answer,
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                    },
+                    {
+                        **answer,
+                        "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+                    },
+                ]
+                payload = (
+                    "".join("data: " + json.dumps(c) + "\n\n" for c in chunks) + "data: [DONE]\n\n"
+                ).encode()
+            else:
+                payload = json.dumps(answer).encode()
+            self.send_response(200)
+        except Exception as exc:
+            self.errors.append(repr(exc))
+            streaming = False
+            payload = json.dumps({"error": str(exc)}).encode()
+            self.send_response(400)
+        self.send_header("Content-Type", "text/event-stream" if streaming else "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+def test_new_chat_gets_notes_index_and_reads_previous_chat(installed_home, tmp_path):
+    home = installed_home
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Provider)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_port}/v1"
+    worker = Path(__file__).parent / "fixtures" / "mvp_chat_worker.py"
+    env = _env(home)
+    env.update(HERMES_MANAGED_DIR=tempfile.mkdtemp(prefix="managed-", dir=tmp_path), TZ="UTC")
+    reports = []
+    try:
+        for session, prompt in ((SESSION_A, PROMPT_A), (SESSION_B, PROMPT_B)):
+            err = tmp_path / f"{session}.err"
+            with open(err, "w") as stderr:
+                proc = subprocess.run(
+                    [HERMES_PYTHON, str(worker), session, url, prompt],
+                    env=env,
+                    cwd=home,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr,
+                    text=True,
+                    timeout=300,
+                )
+            returncode = proc.returncode
+            assert returncode == 0, f"worker {session} failed; see {err}"
+            reports.append(json.loads(proc.stdout.strip().splitlines()[-1]))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert not _Provider.errors, _Provider.errors
+    a, b = reports
+    assert a["engine"] == b["engine"] == "ariadne" and a["pid"] != b["pid"]
+    assert (a["final_response"], b["final_response"]) == ("noted", "answered")
+    seen = _Provider.observed
+    assert seen.get("recall_note") and seen.get("recall_index"), seen
+    assert seen.get("read_exact_original"), seen
+    print(
+        json.dumps(
+            {
+                "exposure": {k: sorted(v) for k, v in seen.items() if isinstance(v, set)},
+                "requests": len(_Provider.requests),
+                "other": seen.get("other", 0),
+            }
+        )
+    )
+    assert sys.prefix

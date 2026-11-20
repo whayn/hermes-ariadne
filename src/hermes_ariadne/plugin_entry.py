@@ -13,8 +13,6 @@ The engine needs Hermes's LLM facade for summaries, so it is registered only
 when that facade is present. Import and construction perform no I/O.
 """
 
-ENGINE_NAME = "ariadne"
-
 
 def _facade(ctx):
     try:
@@ -31,15 +29,8 @@ def register(ctx):
     ctx.register_memory_provider(AriadneMemoryProvider())
     if llm is None:
         return None
+    from .mvp_engine import AriadneEngine
     from .rolling import RollingSettings
-    from .rolling_engine import RollingAriadneEngine
-
-    class AriadneEngine(RollingAriadneEngine):
-        """The MVP engine: rolling preparation selected under the plain name."""
-
-        @property
-        def name(self):
-            return ENGINE_NAME
 
     settings = RollingSettings(**ctx.get_config("rolling", {}))
     return ctx.register_context_engine(AriadneEngine(llm=llm, settings=settings))
