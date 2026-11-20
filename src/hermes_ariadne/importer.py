@@ -11,8 +11,10 @@ summary is index data labelled as such, never canonical.
 
 import hashlib
 
+from .conversations import RestrictedEvidence
 from .notes import NoteStore, StorageRefused, conversation_fields
 from .receipts import _mkdir_private
+from .retrieval import _require_supported_data_use, _UnsupportedDataUse
 from .rolling_engine import _archive_path
 from .store import EventStore
 
@@ -40,6 +42,10 @@ def _messages(messages, conv_id, offset):
     for index, item in enumerate(messages):
         if not isinstance(item, dict) or item.get("role") not in ROLES:
             raise ValueError("each message needs a supported role")
+        try:  # refuse, never strip, machine data-use restrictions (same policy as retrieval)
+            _require_supported_data_use(item)
+        except _UnsupportedDataUse as exc:
+            raise RestrictedEvidence("import message is restricted") from exc
         content = item.get("content")
         if not isinstance(content, str):
             raise ValueError("message content must be text")

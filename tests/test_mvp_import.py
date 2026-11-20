@@ -224,3 +224,25 @@ def test_foreign_note_database_rejects_before_archiving(home, pragma):
     with pytest.raises(StorageRefused):
         Importer(home).import_batch("k", _chat(2))
     assert not (home / "ariadne" / "events.sqlite3").exists()
+
+
+@pytest.mark.parametrize(
+    "restriction",
+    [
+        {"data_use": ["no_training"]},
+        {"display_metadata": json.dumps({"data_use": ["no_training"]})},
+        {"display_metadata": json.dumps({"withheld_prompt": "secret"})},
+    ],
+)
+def test_restricted_messages_are_refused_not_stripped(home, restriction):
+    from hermes_ariadne.conversations import RestrictedEvidence
+
+    batch = _chat(2)
+    batch[0] = {**batch[0], **restriction}
+    with pytest.raises(RestrictedEvidence):
+        Importer(home).import_batch("k", batch)
+    assert not (home / "ariadne" / "events.sqlite3").exists()
+    provider = AriadneMemoryProvider()
+    provider.initialize("s", hermes_home=str(home))
+    out = provider.handle_tool_call("ariadne_import", {"key": "k", "messages": batch})
+    assert json.loads(out) == {"ok": False, "error": "restricted"}
