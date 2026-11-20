@@ -338,7 +338,8 @@ def main():
     elif phase == "probe":
         prompts = ["Say hi in five words."]
     else:
-        prompts = NEWCHAT_TURNS
+        # Run-unique fact, so an identical earlier mirror note cannot mask a missing write.
+        prompts = [p.replace("metric units", f"metric units (gate {run})") for p in NEWCHAT_TURNS]
 
     history = db.get_messages_as_conversation(session, repair_alternation=True) or []
     turns = []

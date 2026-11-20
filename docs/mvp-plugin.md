@@ -171,6 +171,18 @@ synchronously in turn completion and added 6–43 s to the turns that triggered
 it (the user waits for it before the next turn starts). Not measured: large
 chats near the default limits (#19), other providers.
 
+Rerun on 2026-11-20 after the review fixes, installed at `0cb7ec2` into the same
+profile (its note store was still at pre-release schema version 1 and migrated to
+3 in place): import (existing notes found, not duplicated), long chat (summaries
+after turns 3/5/7, selected from turn 4; turn 8 quoted the run's codeword from
+the original via `ariadne_find`), restart (answered both sensor names from the
+originals), new chat (imported fact from notes, earlier codeword via
+`ariadne_conversations`, run-unique built-in memory write mirrored). One
+mid-turn request in the import turn was declined with "missing or duplicate
+logical identity" while no summary existed yet; Hermes sent the original
+request. The stored rows had unique identities; the in-memory message lacking
+one was not captured.
+
 Observed confusion: in one run the past-conversation index showed earlier runs'
 summaries containing a similar codeword, and the model briefly described them
 as a lossy summary of the current chat. The answer was still taken from the
