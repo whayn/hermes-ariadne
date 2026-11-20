@@ -46,8 +46,10 @@ SCHEMA = (
     )""",
 )
 # Upgrades for stores written by earlier revisions: {from_version: statements}.
+# Statements must be idempotent: pre-release revisions created newer tables while
+# still labelling the store version 1.
 MIGRATIONS = {
-    1: (SCHEMA[3],),  # add the conversations index
+    1: (SCHEMA[3].replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1),),  # index
 }
 MAX_TITLE_CHARS = 200
 MAX_PREVIEW_CHARS = 300
