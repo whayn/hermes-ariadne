@@ -344,6 +344,7 @@ def test_zoom_recovers_tool_calls_that_read_truncates(home):
     assert len(text) > MAX_MESSAGE_CHARS
 
 
+@needs_host
 def test_preview_skips_restricted_first_message():
     from hermes_ariadne.mvp_engine import _first_user_text
 
@@ -399,3 +400,16 @@ def test_read_and_zoom_keep_tool_result_linkage(home):
     assert [(r.get("tool_call_id"), r.get("name")) for r in rows[1:]] == [("c1", "t"), ("c2", "t")]
     zoom = reader.event("old", rows[2]["event_id"])
     assert (zoom["tool_call_id"], zoom["name"]) == ("c2", "t")
+
+
+@needs_host
+@pytest.mark.parametrize("name", ["profile?test", "pro#file", "50%25"])
+def test_reader_handles_uri_reserved_characters_in_home(tmp_path, name):
+    from hermes_ariadne.conversations import ArchiveReader
+
+    home = tmp_path / name
+    home.mkdir(mode=0o700)
+    _archive(home, {"old": [_msg("u1", "user", "hello")]})
+    before = sorted(p.name for p in tmp_path.iterdir())
+    assert ArchiveReader(home).page("old")["messages"][0]["content"] == "hello"
+    assert sorted(p.name for p in tmp_path.iterdir()) == before  # read-only: no stray files
