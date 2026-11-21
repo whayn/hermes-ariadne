@@ -27,3 +27,18 @@ config_schema:
       max_checkpoint_bytes: 16777216
       max_tokens: 2048
       timeout: 60
+  tree:
+    type: dict
+    description: "TreeSettings for the profile-wide summary tree; unknown keys or invalid integers refuse registration. Logical jobs/bytes are not HTTP or billing caps. Summaries use the auxiliary task ariadne_summary (the chat model unless pinned)."
+    default:
+      high: 128000
+      seen_high: 32000
+      node_bytes: 512
+      jobs: 4
+      max_jobs: 100000
+      max_request_bytes: 65536
+      max_total_request_bytes: 1073741824
+      tail_bytes: 32768
+      tries: 5
+      max_tokens: 1024
+      timeout: 120
