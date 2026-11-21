@@ -792,3 +792,170 @@ def test_the_retirement_count_is_pinned_within_one_tool_loop(home, monkeypatch):
     world.ask("chat-a", "F")
     fourth, request = world.select(a, "chat-a", "F")
     assert assert_shape(fourth, request) > 8
+
+
+# --------------------------------------------------------------------------- #
+# Waiting for in-flight summaries: process exit only
+# --------------------------------------------------------------------------- #
+
+
+def _live_engine(home, monkeypatch, llm, settings):
+    """A background engine (the real worker) whose one-time backfill has finished."""
+    import time
+
+    monkeypatch.setattr(
+        TreeAriadneEngine, "_bound_reasoning_policy", staticmethod(lambda *a: POLICY)
+    )
+    db = DB()
+    db.sessions["chat-a"] = {"source": "cli"}
+    engine = TreeAriadneEngine(llm=llm, tree_settings=settings)
+    engine.update_model("gpt-test", BUDGET, "https://invalid.test", "", "fixture", "fixture")
+    engine.bind_session_state(db, "chat-a")
+    engine.on_session_start("chat-a", hermes_home=home)
+    for _ in range(100):
+        if engine._shared.backfill == "done":
+            break
+        time.sleep(0.05)
+    assert engine._shared.backfill == "done"
+    return engine, db
+
+
+def _record_stops(monkeypatch):
+    stops = []
+    real = TreeBuilder.stop
+
+    def recording(self, timeout=5.0):
+        stops.append(timeout)
+        return real(self, timeout)
+
+    monkeypatch.setattr(TreeBuilder, "stop", recording)
+    return stops
+
+
+def _wait(check, timeout=5):
+    import time
+
+    deadline = time.time() + timeout
+    while not check() and time.time() < deadline:
+        time.sleep(0.01)
+    assert check()
+
+
+def test_turns_selection_tools_and_session_end_never_wait_for_the_builder(home, monkeypatch):
+    import threading
+
+    gate = threading.Event()
+    stops = _record_stops(monkeypatch)
+    llm = FakeLlm(lambda n, m, k: gate.wait(10) and "merged")
+    engine, db = _live_engine(home, monkeypatch, llm, TreeSettings(exit_wait=30))
+    db.rows += rows_for("chat-a", "A")
+    engine.on_turn_complete(restored(db.rows), usage={}, turn_id="A")
+    _wait(lambda: engine._shared.builder.status()["running"] >= 1)
+    db.rows += rows_for("chat-a", "B", complete=False)[:1]
+    history = restored(db.rows)
+    request = assembled(history)
+    engine.select_context(
+        request,
+        conversation_messages=history,
+        incoming_message=next(m for m in history if m["message_uid"] == "Bu"),
+        budget_tokens=BUDGET,
+    )
+    engine.handle_tool_call("ariadne_memory_status", {})
+    assert stops == []  # a turn never stops, let alone waits for, the builder
+    engine.on_session_end("chat-a", [])  # a real session boundary in a long-lived process
+    assert stops == [0]  # the last release stops scheduling and waits for nothing
+    gate.set()
+    _wait(lambda: Part(1, 0) in TreeStore(home).nodes())
+
+
+def test_process_exit_waits_for_the_inflight_call_up_to_exit_wait(home, monkeypatch):
+    import threading
+    import time
+
+    gate = threading.Event()
+    stops = _record_stops(monkeypatch)
+    llm = FakeLlm(lambda n, m, k: gate.wait(10) and "merged")
+    engine, db = _live_engine(home, monkeypatch, llm, TreeSettings(exit_wait=10))
+    db.rows += rows_for("chat-a", "A")
+    engine.on_turn_complete(restored(db.rows), usage={}, turn_id="A")
+    builder = engine._shared.builder
+    _wait(lambda: builder.status()["running"] >= 1)
+    engine.on_session_end("chat-a", [])  # agent close: stops scheduling, no wait
+    threading.Timer(0.3, gate.set).start()
+    started = time.monotonic()
+    tree_engine._shutdown()  # the atexit path
+    assert 0.2 < time.monotonic() - started < 5  # waited for the call, not the whole 10 s
+    assert max(stops) > 1 and 8 < max(stops) <= 10  # exit_wait, minus time already spent
+    assert builder.status()["running"] == 0
+    jobs = TreeStore(home).jobs()
+    assert jobs and all(job.state == "done" for job in jobs.values())
+
+
+def test_process_exit_gives_up_after_exit_wait_and_leaves_the_job_reserved(home, monkeypatch):
+    import threading
+    import time
+
+    gate = threading.Event()
+    llm = FakeLlm(lambda n, m, k: gate.wait(10) and "merged")
+    engine, db = _live_engine(home, monkeypatch, llm, TreeSettings(exit_wait=0.3))
+    db.rows += rows_for("chat-a", "A")
+    engine.on_turn_complete(restored(db.rows), usage={}, turn_id="A")
+    builder = engine._shared.builder
+    _wait(lambda: builder.status()["running"] >= 1)
+    started = time.monotonic()
+    tree_engine._shutdown()
+    assert 0.25 < time.monotonic() - started < 3
+    states = {j.state for j in TreeStore(home).jobs().values()}
+    assert states == {"reserved"}
+    gate.set()
+    _wait(lambda: Part(1, 0) in TreeStore(home).nodes())
+
+
+def test_process_exit_with_exit_wait_zero_does_not_wait(home, monkeypatch):
+    import threading
+    import time
+
+    gate = threading.Event()
+    stops = _record_stops(monkeypatch)
+    llm = FakeLlm(lambda n, m, k: gate.wait(10) and "merged")
+    engine, db = _live_engine(home, monkeypatch, llm, TreeSettings(exit_wait=0))
+    db.rows += rows_for("chat-a", "A")
+    engine.on_turn_complete(restored(db.rows), usage={}, turn_id="A")
+    _wait(lambda: engine._shared.builder.status()["running"] >= 1)
+    started = time.monotonic()
+    tree_engine._shutdown()
+    assert time.monotonic() - started < 1 and set(stops) == {0}
+    states = {j.state for j in TreeStore(home).jobs().values()}
+    assert states == {"reserved"}
+    gate.set()
+    _wait(lambda: Part(1, 0) in TreeStore(home).nodes())
+
+
+def test_shutdown_stops_every_home_before_waiting_and_shares_one_deadline(monkeypatch):
+    import time
+    import types
+
+    calls = []
+
+    class Fake:
+        def __init__(self, name):
+            self.settings = TreeSettings(exit_wait=0.4)
+
+            def stop(timeout=5.0):
+                calls.append((name, round(timeout, 1)))
+                time.sleep(timeout)  # an in-flight call that never finishes
+
+            self.builder = types.SimpleNamespace(stop=stop)
+
+        def wait_backfill(self, timeout):
+            calls.append(("backfill", timeout))
+
+    _, homes = tree_engine._registry()
+    homes["a"], homes["b"] = Fake("a"), Fake("b")
+    try:
+        tree_engine._shutdown()
+    finally:
+        homes.pop("a"), homes.pop("b")
+    assert calls[:2] == [("a", 0.0), ("b", 0.0)]  # everything stops scheduling first
+    assert calls[2:4] == [("backfill", 10.0)] * 2
+    assert calls[4] == ("a", 0.4) and calls[5] == ("b", 0.0)  # b gets what is left: nothing

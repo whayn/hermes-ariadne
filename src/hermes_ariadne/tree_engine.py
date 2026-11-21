@@ -83,6 +83,17 @@ excluding subagent/cron sessions (and archive sessions SessionDB does not know,
 unless they are imports); live appends wait until that backfill has completed, then
 catch up (appends are idempotent and every turn appends all missing active rows).
 
+Waiting for in-flight summaries (``tree.exit_wait``): a turn never blocks on the builder.
+``on_turn_complete``, ``select_context``, the tools and a session end only ever kick the
+builder or call ``stop(timeout=0)``. The one place that waits is the ``atexit`` hook
+``_shutdown``: it stops scheduling, then gives in-flight calls up to ``exit_wait`` seconds
+(default 60, 0 = none) to commit. The final ``release`` of a home does NOT wait, because
+the host calls ``on_session_end`` for ``/new`` and gateway session rollover too and
+nothing there distinguishes a process that is exiting; at a real exit it runs first
+(agent close) or after ``_shutdown``, and ``stop`` is repeatable, so ``_shutdown`` still
+waits for what is left. Calls that outlive the wait stay ``reserved`` and the next start
+re-asks them once (``tree.auto_reask_lost``).
+
 Tools (replacing ``ariadne_find``/``ariadne_rolling_page`` for this engine):
 ``ariadne_zoom``, ``ariadne_search``, ``ariadne_memory_status``. Their output is
 labelled historical data, bounded, and never includes reasoning carriers.
@@ -95,6 +106,7 @@ import logging
 import sqlite3
 import sys
 import threading
+import time
 import types
 from dataclasses import replace
 from pathlib import Path
@@ -223,7 +235,9 @@ class _Home:
             self.users = max(0, self.users - 1)
             last = self.users == 0
         if last and self.background:
-            self.builder.stop(timeout=0)  # never waits for an in-flight call
+            # Never waits (see ``_shutdown``): this runs at every session end, and a
+            # long-lived process (gateway, /new) must not stall on a summary call.
+            self.builder.stop(timeout=0)
 
     def kick(self):
         if self.background:
@@ -340,12 +354,32 @@ def _reset_registry():
 
 
 def _shutdown():
+    """Process exit (``atexit``): the ONLY place that waits for in-flight summary calls.
+
+    First every home's builder stops scheduling (nothing new is reserved or sent while
+    anything waits), then a running backfill gets a moment, then each builder is given up
+    to its ``exit_wait`` seconds for the calls in flight to commit, all sharing one
+    deadline (the largest ``exit_wait``) so several homes never add their waits up. A call
+    still running afterwards stays ``reserved``; the next start re-asks it once.
+    """
     lock, homes = _registry()
     with lock:
         entries = list(homes.values())
     for entry in entries:
-        entry.wait_backfill(10.0)
-        entry.builder.stop(timeout=0.5)
+        _guarded(entry.builder.stop, 0)
+    for entry in entries:
+        _guarded(entry.wait_backfill, 10.0)
+    deadline = time.monotonic() + max((entry.settings.exit_wait for entry in entries), default=0)
+    for entry in entries:
+        remaining = max(0.0, deadline - time.monotonic())
+        _guarded(entry.builder.stop, min(entry.settings.exit_wait, remaining))
+
+
+def _guarded(call, *args):
+    try:
+        call(*args)
+    except Exception:  # noqa: BLE001 - one home's failure must not skip the others at exit
+        logger.debug("Ariadne tree shutdown step failed", exc_info=True)
 
 
 atexit.register(_shutdown)
