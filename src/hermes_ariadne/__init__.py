@@ -1,6 +1,6 @@
 """Ariadne's archive primitives (no Hermes import or I/O at package import)."""
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 
 def register(ctx):

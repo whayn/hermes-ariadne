@@ -1,6 +1,6 @@
 manifest_version: 2
 name: ariadne
-version: "0.2.0"
+version: "0.2.1"
 description: "Ariadne memory provider (profile notes) and context engine (rolling summaries with zoom). Experimental; use a dedicated development profile."
 author: Whayn
 license: Apache-2.0
