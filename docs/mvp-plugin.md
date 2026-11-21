@@ -7,7 +7,7 @@ One Hermes plugin, `ariadne`, that you select in **both** settings slots:
 | Memory provider | `memory.provider: ariadne` | Profile notes (`ariadne_notes`), one-way mirror of built-in memory writes, recall of relevant notes and past conversations each turn, `ariadne_conversations` to read past chats |
 | Context engine | `context.engine: ariadne` | The rolling engine (automatic summary of older turns through Hermes's LLM facade, page/search/zoom tools) plus the conversation index |
 
-Status: **experimental prerelease (v0.2.0); use a dedicated development
+Status: **experimental prerelease (v0.2.1); use a dedicated development
 profile**. Implements #41. The MVP keeps rolling's single cumulative summary with
 exact zoom; the UniiChat summary tree is deferred. The dev-profile ship gate with
 a real model passed (see [Ship gate](#ship-gate)); see
@@ -25,7 +25,7 @@ hermes config set context.engine ariadne
 
 The plugin has no Python dependencies and declares none, so Hermes asks no
 dependency question and installs nothing into its own environment; several
-profiles can each install it. Releases up to v0.2.0 did declare a buildable
+profiles can each install it. v0.2.0 declared a buildable
 package, so a second profile failed with "Two workspace members are both named
 `hermes-ariadne`": remove the plugin from the other profile, or install a later
 revision in both.

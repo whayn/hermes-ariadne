@@ -69,7 +69,7 @@ Python environment. A wheel install works too:
 
 ```bash
 .venv/bin/python -m build
-uv pip install --python /path/to/disposable/venv/bin/python dist/hermes_ariadne-0.2.0-py3-none-any.whl
+uv pip install --python /path/to/disposable/venv/bin/python dist/hermes_ariadne-0.2.1-py3-none-any.whl
 /path/to/disposable/venv/bin/ariadne-install --home /path/to/new/dev-home
 ```
 
