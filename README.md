@@ -28,7 +28,7 @@ Select `ariadne` as both the memory provider and the context engine, and:
 
 ```bash
 export HERMES_HOME=/path/to/dev-profile          # never your live/default home
-hermes plugins install whayn/hermes-ariadne --yes-deps
+hermes plugins install whayn/hermes-ariadne
 hermes plugins enable ariadne
 hermes config set memory.provider ariadne
 hermes config set context.engine ariadne

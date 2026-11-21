@@ -42,7 +42,7 @@ installation. With `uv` (or equivalent `venv` + pip in your disposable env):
 ```bash
 cd /path/to/hermes-ariadne
 uv venv --python /path/to/hermes/.venv/bin/python .venv
-uv pip install --python .venv/bin/python -e '.[dev]'
+uv pip install --python .venv/bin/python -r requirements-dev.txt -e .
 
 # Pick a NEW path, not your normal HERMES_HOME or another existing profile.
 export ARIADNE_DEV_HOME="$PWD/.dev-home"

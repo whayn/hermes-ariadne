@@ -1,11 +1,13 @@
-[build-system]
-requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta"
-
+# This file is also the Hermes plugin's dependency declaration (the repository root
+# is the plugin). It must install nothing for Hermes: no [build-system], extras or
+# dependency groups, and no runtime dependencies. Otherwise Hermes builds the package
+# into its shared environment, and a second profile installing the plugin fails
+# ("two workspace members are both named hermes-ariadne"). Development tooling lives
+# in requirements-dev.txt; pip and build fall back to setuptools without a table.
 [project]
 name = "hermes-ariadne"
 version = "0.2.0"
-description = "Passive, versioned verbatim archive ContextEngine for Hermes Agent"
+description = "Memory and context plugin for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Whayn" }]
@@ -16,9 +18,6 @@ license-files = ["LICENSE", "NOTICE"]
 Repository = "https://github.com/whayn/hermes-ariadne"
 Issues = "https://github.com/whayn/hermes-ariadne/issues"
 Contributing = "https://github.com/whayn/hermes-ariadne/blob/main/CONTRIBUTING.md"
-
-[project.optional-dependencies]
-dev = ["pytest>=8", "build>=1", "ruff>=0.9"]
 
 [project.scripts]
 ariadne-install = "hermes_ariadne.install:main"

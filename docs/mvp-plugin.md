@@ -17,11 +17,18 @@ a real model passed (see [Ship gate](#ship-gate)); see
 
 ```bash
 export HERMES_HOME=/path/to/dev-profile          # never your live/default home
-hermes plugins install whayn/hermes-ariadne --yes-deps
+hermes plugins install whayn/hermes-ariadne
 hermes plugins enable ariadne                    # required, see below
 hermes config set memory.provider ariadne
 hermes config set context.engine ariadne
 ```
+
+The plugin has no Python dependencies and declares none, so Hermes asks no
+dependency question and installs nothing into its own environment; several
+profiles can each install it. Releases up to v0.2.0 did declare a buildable
+package, so a second profile failed with "Two workspace members are both named
+`hermes-ariadne`": remove the plugin from the other profile, or install a later
+revision in both.
 
 Both choices also appear in `hermes plugins` → Provider Plugins and in the
 dashboard. The engine needs `plugins.isolation: in_process` (Hermes's default);
