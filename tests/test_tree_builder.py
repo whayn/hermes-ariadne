@@ -141,6 +141,21 @@ def test_settings_defaults_and_validation():
         TreeSettings(max_request_bytes=10)
 
 
+def test_exit_wait_and_auto_reask_lost_defaults_and_validation():
+    s = TreeSettings()
+    assert s.exit_wait == 60 and s.auto_reask_lost == 1
+    assert TreeSettings(exit_wait=0).exit_wait == 0  # 0 = never wait
+    assert TreeSettings(exit_wait=2.5).exit_wait == 2.5  # int or float
+    assert TreeSettings(auto_reask_lost=0).auto_reask_lost == 0  # 0 disables
+    assert TreeSettings.from_config({"exit_wait": 5, "auto_reask_lost": 2}).auto_reask_lost == 2
+    for bad in (-1, -0.5, True, "5", None, float("nan"), float("inf"), 10**6):
+        with pytest.raises(ValueError):
+            TreeSettings(exit_wait=bad)
+    for bad in (-1, True, 1.5, "1", None, 10**6):
+        with pytest.raises(ValueError):
+            TreeSettings(auto_reask_lost=bad)
+
+
 def test_settings_from_config_rejects_unknown_keys_and_bad_values():
     assert TreeSettings.from_config(None) == TreeSettings()
     assert TreeSettings.from_config({}) == TreeSettings()
@@ -742,3 +757,189 @@ def test_reported_usage_is_counted_only_when_present(home, log):
     b = builder(home, FakeLlm(usage=usage))
     drain(b)
     assert b.status()["usage"] == {"known_calls": 1, "unknown_calls": 0, "total_tokens": 15}
+
+
+# -- lost owners: automatic re-ask, at most once ------------------------------------------
+
+
+def dead_owner():
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    return f"{dead.pid}:gone"
+
+
+CAPS = {"max_jobs": 100, "max_total_bytes": 10**6}
+
+
+def test_start_rearms_a_lost_job_and_builds_the_node_once_more(home, log):
+    log.add(long())
+    log.store.reserve(Part(0, 0), 10, dead_owner(), **CAPS)  # a process that exited mid-call
+    llm = FakeLlm()
+    b = builder(home, llm)
+    b.start()
+    wait_idle(b)
+    assert log.store.nodes()[Part(0, 0)] == "summary 1"
+    job = log.store.jobs()[Part(0, 0)]
+    assert (job.state, job.attempts, job.auto_retries) == ("done", 2, 1)
+    assert log.store.counters()["logical_jobs"] == 2  # the re-ask is a charged reservation
+    status = b.status()
+    assert status["auto_rearmed"] == 1 and status["uncertain"] == 0
+    b.stop()
+
+
+def test_a_node_lost_twice_stays_uncertain(home, log):
+    log.add(long())
+    log.store.reserve(Part(0, 0), 10, dead_owner(), **CAPS)
+    builder(home, FakeLlm()).recover()  # the first start: lost, then re-armed once
+    assert log.store.rearm_lost(1) == [Part(0, 0)]
+    assert log.store.reserve(Part(0, 0), 10, dead_owner(), **CAPS)  # lost again
+    llm = FakeLlm()
+    again = builder(home, llm)
+    again.start()
+    wait_idle(again)
+    job = log.store.jobs()[Part(0, 0)]
+    assert (job.state, job.error_type, job.auto_retries) == ("uncertain", "owner_lost", 1)
+    assert llm.calls == [] and log.store.nodes() == {}
+    status = again.status()
+    assert status["uncertain"] == 1 and status["auto_rearmed"] == 1
+    assert again.retry() == [Part(0, 0)]  # an explicit retry still works
+    drain(again)
+    assert log.store.nodes()[Part(0, 0)] == "summary 1"
+    again.stop()
+
+
+def test_start_leaves_facade_failures_blocked(home, log):
+    log.add(long())
+    b = builder(home, FakeLlm(lambda n, m, k: TimeoutError("slow")))
+    drain(b)
+    assert log.store.jobs()[Part(0, 0)].error_type == "TimeoutError"
+    llm = FakeLlm()
+    later = builder(home, llm)
+    later.start()
+    wait_idle(later)
+    assert llm.calls == [] and log.store.jobs()[Part(0, 0)].state == "uncertain"
+    assert later.status()["auto_rearmed"] == 0
+    later.stop()
+
+
+def test_auto_reask_lost_zero_disables_the_rearm(home, log):
+    log.add(long())
+    log.store.reserve(Part(0, 0), 10, dead_owner(), **CAPS)
+    llm = FakeLlm()
+    b = builder(home, llm, auto_reask_lost=0)
+    b.start()
+    wait_idle(b)
+    assert llm.calls == [] and log.store.jobs()[Part(0, 0)].state == "uncertain"
+    b.stop()
+
+
+def test_start_on_an_empty_home_creates_nothing(home):
+    b = builder(home, FakeLlm())
+    b.start()
+    b.stop()
+    assert not (home / "ariadne").exists()
+
+
+# -- waiting at exit ----------------------------------------------------------------------
+
+
+def wait_running(b, count=1, timeout=5):
+    deadline = time.time() + timeout
+    while b.status()["running"] < count and time.time() < deadline:
+        time.sleep(0.01)
+    assert b.status()["running"] >= count
+
+
+def test_stop_waits_for_an_inflight_call_to_commit_and_schedules_nothing_new(home, log):
+    log.add(long("a"))
+    log.add(long("b"))
+    gate = threading.Event()
+    llm = FakeLlm(lambda n, m, k: gate.wait(10) and f"s{n}")
+    b = builder(home, llm, jobs=1)
+    b.start()
+    wait_running(b)
+    threading.Timer(0.3, gate.set).start()
+    t0 = time.monotonic()
+    b.stop(timeout=10)
+    waited = time.monotonic() - t0
+    assert 0.2 < waited < 5  # it waited for the call, not for the whole timeout
+    assert log.store.nodes() == {Part(0, 0): "s1"}  # the in-flight call committed
+    assert log.store.jobs()[Part(0, 0)].state == "done"
+    assert b.status()["running"] == 0
+    time.sleep(0.3)  # the finished call must not wake the worker into new work
+    assert len(llm.calls) == 1 and Part(0, 1) not in log.store.jobs()
+
+
+def test_stop_without_wait_returns_at_once_and_leaves_the_call_reserved(home, log):
+    log.add(long())
+    gate = threading.Event()
+    b = builder(home, FakeLlm(lambda n, m, k: gate.wait(10) and "late"))
+    b.start()
+    wait_running(b)
+    t0 = time.monotonic()
+    b.stop(timeout=0)
+    assert time.monotonic() - t0 < 1
+    assert log.store.jobs()[Part(0, 0)].state == "reserved" and log.store.nodes() == {}
+    gate.set()  # cleanup: the daemon thread finishes by itself
+    wait_for(lambda: Part(0, 0) in log.store.nodes())
+
+
+def test_stop_timeout_gives_up_on_a_slow_call_and_it_stays_reserved(home, log):
+    log.add(long())
+    gate = threading.Event()
+    b = builder(home, FakeLlm(lambda n, m, k: gate.wait(10) and "late"))
+    b.start()
+    wait_running(b)
+    t0 = time.monotonic()
+    b.stop(timeout=0.3)
+    assert 0.25 < time.monotonic() - t0 < 3
+    job = log.store.jobs()[Part(0, 0)]
+    assert job.state == "reserved" and job.owner == b.owner  # the next start reconciles it
+    gate.set()
+    wait_for(lambda: Part(0, 0) in log.store.nodes())
+
+
+def test_stop_is_still_waiting_after_an_earlier_stop_without_wait(home, log):
+    log.add(long())
+    gate = threading.Event()
+    b = builder(home, FakeLlm(lambda n, m, k: gate.wait(10) and "late"))
+    b.start()
+    wait_running(b)
+    b.stop(timeout=0)  # a session end: stops scheduling, does not wait
+    threading.Timer(0.3, gate.set).start()
+    b.stop(timeout=10)  # the process exit that follows does wait
+    assert log.store.nodes() == {Part(0, 0): "late"}
+
+
+def test_stop_does_not_send_the_over_limit_re_ask(home, log):
+    log.add(long())
+    gate = threading.Event()
+    llm = FakeLlm(lambda n, m, k: gate.wait(10) and "y" * 600)  # over node_bytes: asks again
+    b = builder(home, llm)
+    b.start()
+    wait_running(b)
+    threading.Timer(0.3, gate.set).start()
+    b.stop(timeout=10)
+    assert len(llm.calls) == 1  # no second ask once stopped
+    job = log.store.jobs()[Part(0, 0)]
+    assert job.state == "refused" and log.store.nodes() == {}  # reservable again later
+
+
+def test_a_job_launched_after_stop_is_never_sent_or_reserved(home, log):
+    log.add(long())
+    llm = FakeLlm()
+    b = builder(home, llm)
+    plan = b._plan({"live": 1, "import": 1})
+    assert len(plan.jobs) == 1
+    b.stop(timeout=0)
+    b._launch(plan.jobs[0])  # the worker was mid-plan when stop() came
+    time.sleep(0.2)
+    assert llm.calls == [] and log.store.jobs() == {} and b.status()["running"] == 0
+    assert b.kick() is False
+
+
+def wait_for(check, timeout=5):
+    deadline = time.time() + timeout
+    while not check() and time.time() < deadline:
+        time.sleep(0.01)
+    assert check()

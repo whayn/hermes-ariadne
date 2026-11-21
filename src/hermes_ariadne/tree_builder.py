@@ -17,6 +17,12 @@ the answer and stores the node. It follows UniiChat's ``Memory.ts`` build semant
   back): the job becomes ``uncertain`` and is never resubmitted automatically; only
   ``TreeBuilder.retry`` re-arms it. A reservation is a LOGICAL job, not a physical
   send or billing ceiling. Missing or zero usage is UNKNOWN, never measured zero.
+* The one exception (#54): a job whose OWNER process died (``owner_lost``: the calls in
+  flight when a Hermes process exited) is re-armed by ``start()`` at most
+  ``auto_reask_lost`` times per node (default 1, 0 disables). The re-ask is a new durable
+  reservation, charged in the logical totals like any other; a node lost again stays
+  ``uncertain`` for an explicit ``retry``. Facade errors, timeouts and invalid results are
+  never re-asked automatically.
 * Two sides, called lanes: ``live`` and ``import`` (by the origin of a node's LAST
   message, like UniiChat). Each lane has its own ``jobs`` concurrency and its own first
   unbuilt leaf (the context cutoff), and a pass always plans the live lane first, so an
@@ -30,8 +36,12 @@ Deliberate choices beyond the plan:
   like UniiChat's concurrent builds. ``step()`` runs a pass sequentially (deterministic);
   the worker runs the same plan with up to ``jobs`` calls per lane in flight, replanning
   as each finishes. Worker calls use plain daemon threads (not a pool), so an in-flight
-  call never blocks interpreter exit; such a call is left ``reserved`` and the next
-  start turns it ``uncertain``.
+  call never blocks interpreter exit by itself. ``stop(timeout)`` stops scheduling at once
+  (no launch, no reservation, no over-limit re-ask after it) and then waits up to
+  ``timeout`` seconds for the calls in flight to commit; a caller that may block (process
+  exit, ``exit_wait``) passes a timeout, a long-lived process passes 0. A call still
+  running after the timeout is left ``reserved`` and the next start turns it
+  ``uncertain`` (``owner_lost``), which ``start()`` then re-asks once.
 * Liveness of a reservation owner (``recover``): owners are ``"<pid>:<token>"``. An owner
   is alive when it is a builder of this process, or when another process with that pid
   exists (``os.kill(pid, 0)``; on Windows other processes are assumed alive because that
@@ -89,6 +99,8 @@ _LIMITS = {
     "tries": (1, 20),
     "max_tokens": (1, 1 << 20),
     "timeout": (1, 3600),
+    "exit_wait": (0, 3600),
+    "auto_reask_lost": (0, 100),
 }
 
 
@@ -100,6 +112,11 @@ class TreeSettings:
     ``max_tokens`` leaves room above the ~130 tokens a 512-byte line needs because a
     reasoning model spends its budget on thinking first: an empty answer is read as a
     refusal and would clip the node.
+
+    ``exit_wait`` is the seconds (int or float, 0 = never wait) a process may wait at its
+    exit for in-flight summary calls to commit. ``auto_reask_lost`` is how often a job
+    whose owner process died is re-armed automatically per node (0 disables); see the
+    module docs.
     """
 
     high: int = 128000
@@ -113,12 +130,15 @@ class TreeSettings:
     tries: int = 5
     max_tokens: int = 1024
     timeout: int = 120
+    exit_wait: int | float = 60
+    auto_reask_lost: int = 1
 
     def __post_init__(self) -> None:
         for spec in fields(self):
             value = getattr(self, spec.name)
             low, high = _LIMITS[spec.name]
-            if type(value) is not int or not low <= value <= high:
+            kinds = (int, float) if spec.name == "exit_wait" else (int,)
+            if type(value) not in kinds or not low <= value <= high:
                 raise ValueError(f"tree setting {spec.name} must be an integer in {low}..{high}")
 
     @classmethod
@@ -288,6 +308,7 @@ class TreeBuilder:
         self._lock = threading.RLock()
         self._plan_lock = threading.Lock()
         self._wake = threading.Event()
+        self._idle = threading.Condition(self._lock)  # notified when a call leaves flight
         self._thread: threading.Thread | None = None
         self._context: contextvars.Context | None = None
         self._stopped = False
@@ -571,20 +592,24 @@ class TreeBuilder:
             else:
                 self._usage_unknown += 1  # missing or zero usage is unknown, not zero
 
-    def _execute(self, job: _Job) -> str:
-        """Run one job to an outcome: built, taken, caps, held, uncertain or error."""
+    def _execute(self, job: _Job, *, worker: bool = False) -> str:
+        """Run one job to an outcome: built, taken, caps, held, stopped, uncertain or error.
+
+        ``worker`` jobs obey ``stop()``: once it was called they send no further call.
+        """
         with self._lock:
             self._inflight[job.part] = job.lane
         try:
-            return self._build(job)
+            return self._build(job, worker)
         except Exception as error:  # noqa: BLE001 - a store failure must not kill the worker
             self._last_error = type(error).__name__
             return "error"
         finally:
-            with self._lock:
+            with self._idle:
                 self._inflight.pop(job.part, None)
+                self._idle.notify_all()
 
-    def _build(self, job: _Job) -> str:
+    def _build(self, job: _Job, worker: bool = False) -> str:
         s, part, store = self.settings, job.part, self._store
         source = job.inputs[0] if part.level == 0 else pt.merge_input(*job.inputs)
         lines: list[str] = []
@@ -597,6 +622,8 @@ class TreeBuilder:
                 if request is None:
                     return "held"
                 messages, size = request
+            if worker and self._stopped:
+                return "stopped"  # nothing is reserved or sent once stop() was called
             outcome = self._reserve(part, size)
             if outcome != "ok":
                 return outcome
@@ -677,10 +704,15 @@ class TreeBuilder:
     # -- background worker -----------------------------------------------------------
 
     def start(self) -> None:
-        """Reconcile dead reservations and start the worker. Never blocks on a model."""
+        """Reconcile dead reservations and start the worker. Never blocks on a model.
+
+        Reservations of dead owners become ``uncertain``; those (and only those) are then
+        re-armed once more, up to ``settings.auto_reask_lost`` times per node.
+        """
         with self._lock:
             self._stopped = False
         self.recover()
+        self._store.rearm_lost(self.settings.auto_reask_lost)  # no-op without a store
         self.kick()
 
     def kick(self) -> bool:
@@ -708,23 +740,36 @@ class TreeBuilder:
         return True
 
     def stop(self, timeout: float = 5.0) -> None:
-        """Stop launching work and wait up to ``timeout`` for the worker thread.
+        """Stop scheduling now, then wait up to ``timeout`` seconds in total.
 
-        Calls already in flight are not cancellable; they finish on their own daemon
-        threads (or stay ``reserved`` if the process exits first).
+        Scheduling stops at once: no job is launched or reserved and no over-limit re-ask
+        is sent after this call. It then waits for the worker thread and for the calls
+        already in flight to finish and commit as usual. A call still running when
+        ``timeout`` ends is not cancelled: it stays ``reserved`` (the next start reconciles
+        it) or, if the process lives on, finishes on its own daemon thread. ``timeout=0``
+        waits for nothing. Safe to repeat: a later call with a longer timeout waits for
+        what an earlier one did not.
         """
+        deadline = time.monotonic() + max(0.0, timeout)
         with self._lock:
             self._stopped = True
             thread = self._thread
         self._wake.set()
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout)
-        with self._lock:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        with self._idle:
+            while self._inflight:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._idle.wait(remaining)
             if self._thread is thread and (thread is None or not thread.is_alive()):
                 self._thread = None
 
     def _launch(self, job: _Job) -> None:
         with self._lock:
+            if self._stopped:
+                return  # the worker was planning when stop() came
             self._inflight[job.part] = job.lane
         context = contextvars.copy_context()
         threading.Thread(
@@ -733,7 +778,7 @@ class TreeBuilder:
 
     def _job_thread(self, job: _Job) -> None:
         try:
-            outcome = self._execute(job)
+            outcome = self._execute(job, worker=True)
             if outcome in ("caps", "error"):
                 self._stalled = True
         finally:
@@ -802,6 +847,7 @@ class TreeBuilder:
             "uncertain": states.count("uncertain"),
             "refused": states.count("refused"),
             "armed": states.count("armed"),
+            "auto_rearmed": sum(1 for job in jobs.values() if job.auto_retries > 0),
             "held": self._held,
             "counters": store.counters(),
             "caps_exhausted": self._caps_exhausted,

@@ -415,23 +415,202 @@ def test_views_are_validated(home):
 
 
 def test_migrations_upgrade_older_stores_and_unknown_versions_refuse(home, monkeypatch):
-    assert tree_store.SCHEMA_VERSION == 1 and tree_store.MIGRATIONS == {}
+    assert tree_store.SCHEMA_VERSION == 2 and set(tree_store.MIGRATIONS) == {1}
     TreeStore(home).append("s", [entry("a")], origin="live")
-    monkeypatch.setattr(tree_store, "SCHEMA_VERSION", 2)
+    monkeypatch.setattr(tree_store, "SCHEMA_VERSION", 3)
     monkeypatch.setattr(
         tree_store,
         "MIGRATIONS",
-        {1: ("CREATE TABLE IF NOT EXISTS probe (x)", lambda conn: None)},
+        {2: ("CREATE TABLE IF NOT EXISTS probe (x)", lambda conn: None)},
     )
     assert TreeStore(home).count() == 1
     conn = sqlite3.connect(home / "ariadne" / "tree.sqlite3")
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
     assert conn.execute("SELECT name FROM sqlite_schema WHERE name='probe'").fetchone()
     conn.execute("PRAGMA user_version=7")
     conn.commit()
     conn.close()
     with pytest.raises(StorageRefused):
         TreeStore(home).count()
+
+
+# The exact v1 schema (before ``jobs.auto_retries``), as an existing dev profile has it.
+V1_SCHEMA = (
+    """CREATE TABLE log (
+        position INTEGER PRIMARY KEY CHECK (position >= 0),
+        session_id TEXT NOT NULL, message_uid TEXT NOT NULL, event_id TEXT NOT NULL,
+        role TEXT NOT NULL, date TEXT, origin TEXT NOT NULL,
+        restricted INTEGER NOT NULL CHECK (restricted IN (0, 1)),
+        UNIQUE (session_id, event_id)
+    )""",
+    """CREATE TABLE sessions (
+        session_id TEXT PRIMARY KEY, tag TEXT NOT NULL UNIQUE, title TEXT, source TEXT,
+        origin TEXT NOT NULL, first_position INTEGER NOT NULL,
+        last_position INTEGER NOT NULL
+    )""",
+    """CREATE TABLE nodes (
+        level INTEGER NOT NULL, idx INTEGER NOT NULL, text TEXT NOT NULL,
+        bytes INTEGER NOT NULL, built_at REAL NOT NULL, PRIMARY KEY (level, idx)
+    )""",
+    """CREATE TABLE jobs (
+        level INTEGER NOT NULL, idx INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK (state IN
+            ('reserved', 'done', 'uncertain', 'refused', 'armed')),
+        attempts INTEGER NOT NULL, request_bytes INTEGER NOT NULL, owner TEXT,
+        reserved_at REAL, finished_at REAL, error_type TEXT, PRIMARY KEY (level, idx)
+    )""",
+    """CREATE TABLE counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL)""",
+    """INSERT INTO counters VALUES ('logical_jobs', 0), ('request_bytes', 0)""",
+    """CREATE TABLE views (
+        name TEXT PRIMARY KEY CHECK (name IN ('chat', 'seen')),
+        parts_json TEXT NOT NULL, size INTEGER NOT NULL, batch INTEGER NOT NULL,
+        high INTEGER NOT NULL, revision INTEGER NOT NULL
+    )""",
+)
+
+
+def _v1_store(home):
+    """A real v1 store with two log rows, an uncertain owner_lost job and a done job."""
+    directory = home / "ariadne"
+    directory.mkdir(mode=0o700)
+    path = directory / "tree.sqlite3"
+    conn = sqlite3.connect(path)
+    with conn:
+        for sql in V1_SCHEMA:
+            conn.execute(sql)
+        conn.execute(f"PRAGMA application_id={tree_store.APPLICATION_ID}")
+        conn.execute("PRAGMA user_version=1")
+        for position, text in enumerate("ab"):
+            conn.execute(
+                "INSERT INTO log VALUES(?,?,?,?,?,?,?,?)",
+                (position, "s", "uid-" + text, eid(text), "user", None, "live", 0),
+            )
+        conn.execute("INSERT INTO jobs VALUES(0,0,'uncertain',2,200,'1:x',1.0,2.0,'owner_lost')")
+        conn.execute("INSERT INTO jobs VALUES(0,1,'done',1,100,'1:x',1.0,2.0,NULL)")
+        conn.execute("UPDATE counters SET value=3 WHERE name='logical_jobs'")
+        conn.execute("UPDATE counters SET value=300 WHERE name='request_bytes'")
+    conn.close()
+    path.chmod(0o600)
+    return path
+
+
+def test_v1_store_migrates_in_place_to_v2_keeping_every_job(home):
+    path = _v1_store(home)
+    store = TreeStore(home)
+    assert store.count() == 2  # a plain read migrates
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    columns = {row[1]: row for row in conn.execute("PRAGMA table_info(jobs)")}
+    _, _, kind, not_null, default, _ = columns["auto_retries"]
+    assert (kind, not_null, default) == ("INTEGER", 1, "0")
+    conn.close()
+    jobs = store.jobs()
+    assert jobs[Part(0, 0)].auto_retries == 0 and jobs[Part(0, 1)].auto_retries == 0
+    assert (jobs[Part(0, 0)].state, jobs[Part(0, 0)].error_type) == ("uncertain", "owner_lost")
+    assert jobs[Part(0, 0)].attempts == 2 and jobs[Part(0, 0)].request_bytes == 200
+    assert store.counters() == {"logical_jobs": 3, "request_bytes": 300}
+    assert store.rearm_lost(1) == [Part(0, 0)]  # the migrated column is usable
+    # migrating again is a no-op
+    TreeStore(home).prepare()
+    assert TreeStore(home).jobs()[Part(0, 0)].auto_retries == 1
+
+
+def test_v1_migration_step_is_idempotent(home):
+    path = _v1_store(home)
+    conn = sqlite3.connect(path)
+    for step in tree_store.MIGRATIONS[1] * 2:  # already applied: must not fail
+        step(conn) if callable(step) else conn.execute(step)
+    conn.close()
+    assert TreeStore(home).jobs()[Part(0, 0)].auto_retries == 0
+
+
+def test_fresh_store_has_the_v2_schema(home):
+    TreeStore(home).prepare()
+    conn = sqlite3.connect(home / "ariadne" / "tree.sqlite3")
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert "auto_retries" in {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+    conn.close()
+
+
+# -- re-arming lost jobs -------------------------------------------------------------
+
+
+CAPS = {"max_jobs": 100, "max_total_bytes": 10**6}
+
+
+def _lost(store, n, *, other=()):
+    """Log ``n`` entries; reserve every one; lose the owner of all, then mark ``other``
+    parts uncertain for a different reason first."""
+    _log(store, n)
+    for i in range(n):
+        assert store.reserve(Part(0, i), 10, "dead", **CAPS)
+    for i in other:
+        store.mark(Part(0, i), "uncertain", "TimeoutError")
+    store.stale_reserved(lambda owner: False)
+
+
+def test_rearm_lost_only_takes_owner_lost_and_counts_nothing(home):
+    store = TreeStore(home)
+    _lost(store, 3, other=(2,))
+    before = store.counters()
+    assert store.rearm_lost(1) == [Part(0, 0), Part(0, 1)]
+    jobs = store.jobs()
+    for i in (0, 1):
+        assert jobs[Part(0, i)].state == "armed" and jobs[Part(0, i)].auto_retries == 1
+        assert jobs[Part(0, i)].attempts == 1 and jobs[Part(0, i)].request_bytes == 10
+    assert (jobs[Part(0, 2)].state, jobs[Part(0, 2)].auto_retries) == ("uncertain", 0)
+    assert jobs[Part(0, 2)].error_type == "TimeoutError"  # facade errors stay blocked
+    assert store.counters() == before  # re-arming charges nothing
+    assert store.rearm_lost(1) == []  # nothing left to re-arm
+
+
+def test_rearmed_job_is_reserved_again_as_a_new_charged_reservation(home):
+    store = TreeStore(home)
+    _lost(store, 1)
+    assert store.reserve(Part(0, 0), 10, "b", **CAPS) is False  # blocked until re-armed
+    store.rearm_lost(1)
+    assert store.reserve(Part(0, 0), 10, "b", **CAPS) is True
+    job = store.jobs()[Part(0, 0)]
+    assert (job.state, job.attempts, job.auto_retries) == ("reserved", 2, 1)
+    assert store.counters() == {"logical_jobs": 2, "request_bytes": 20}
+
+
+def test_rearm_lost_is_capped_per_node(home):
+    store = TreeStore(home)
+    _lost(store, 1)
+    assert store.rearm_lost(1) == [Part(0, 0)]
+    store.reserve(Part(0, 0), 10, "dead2", **CAPS)
+    store.stale_reserved(lambda owner: False)  # lost a second time
+    assert store.jobs()[Part(0, 0)].state == "uncertain"
+    assert store.rearm_lost(1) == []  # at most once
+    assert store.rearm_lost(0) == []
+    assert store.rearm_lost(2) == [Part(0, 0)]  # a higher cap allows another
+    assert store.jobs()[Part(0, 0)].auto_retries == 2
+
+
+def test_rearm_lost_zero_disables_and_validates(home):
+    store = TreeStore(home)
+    _lost(store, 1)
+    assert store.rearm_lost(0) == []
+    assert store.jobs()[Part(0, 0)].state == "uncertain"
+    for bad in (-1, True, 1.5, "1", None):
+        with pytest.raises(ValueError):
+            store.rearm_lost(bad)
+
+
+def test_rearm_lost_never_creates_the_store(home):
+    assert TreeStore(home).rearm_lost(1) == [] and not (home / "ariadne").exists()
+
+
+def test_explicit_retry_is_independent_of_auto_retries(home):
+    store = TreeStore(home)
+    _lost(store, 1)
+    store.rearm_lost(1)
+    store.reserve(Part(0, 0), 10, "dead2", **CAPS)
+    store.stale_reserved(lambda owner: False)
+    assert store.retry() == [Part(0, 0)]  # explicit retry always works
+    job = store.jobs()[Part(0, 0)]
+    assert (job.state, job.auto_retries) == ("armed", 1)  # untouched by retry
 
 
 # -- backfill from the exact archive ------------------------------------------------
