@@ -1,10 +1,12 @@
 """Profile tree store: admission, append-only log, nodes, jobs, views, backfill."""
 
 import hashlib
-import multiprocessing
 import os
 import sqlite3
 import stat
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -207,25 +209,26 @@ def test_append_rejects_bad_session_and_origin(home):
         TreeStore(home).append("s", [entry("a")], origin="elsewhere")
 
 
-def _writer(home, name, count, barrier):
-    store = TreeStore(home)
-    barrier.wait()
-    for i in range(count):
-        store.append(f"{name}-{i % 3}", [entry(f"{name}-{i}")], origin="live")
-
-
-def test_two_processes_append_concurrently_without_gaps_or_duplicates(home):
+def test_two_processes_append_concurrently_without_gaps_or_duplicates(home, tmp_path):
+    # Separate interpreters with an explicit path (like the other fixtures): a spawned
+    # multiprocessing child would re-import this module and depend on the runner's state.
     TreeStore(home).prepare()
-    context = multiprocessing.get_context("spawn")
-    barrier = context.Barrier(2)
-    workers = [
-        context.Process(target=_writer, args=(str(home), name, 40, barrier)) for name in "ab"
+    src = Path(tree_store.__file__).resolve().parents[1]
+    worker = Path(__file__).with_name("fixtures") / "tree_store_writer.py"
+    start = tmp_path / "start"
+    procs = [
+        subprocess.Popen(
+            [sys.executable, str(worker), str(src), str(home), name, "40", str(start)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for name in "ab"
     ]
-    for worker in workers:
-        worker.start()
-    for worker in workers:
-        worker.join(120)
-        assert worker.exitcode == 0
+    start.touch()
+    for proc in procs:
+        _out, err = proc.communicate(timeout=120)
+        assert proc.returncode == 0, err
     store = TreeStore(home)
     rows = store.entries(0, store.count() + 1)
     assert [row.position for row in rows] == list(range(80))
