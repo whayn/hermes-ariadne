@@ -1,7 +1,7 @@
 # v0.1 verification evidence
 
 These are actual local executions, not inferred results. Re-run with the commands
-in README; test identifiers and timings naturally differ between runs.
+in [passive-engine.md](passive-engine.md#tests) and CONTRIBUTING; test identifiers and timings naturally differ between runs.
 
 ## Environment
 
