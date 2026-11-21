@@ -1,4 +1,4 @@
-# Hermes Ariadne v0.1
+# Hermes Ariadne v0.2 (prerelease)
 
 An installable, Hermes-native **ContextEngine development plugin**. It archives
 verbatim message snapshots in SQLite and exposes `ariadne_search`. It is not a
@@ -18,10 +18,18 @@ provider limits. This is not yet a production long-horizon memory engine.
 ## MVP plugin (memory + context, experimental)
 
 `hermes plugins install whayn/hermes-ariadne`, then `hermes plugins enable ariadne`
-and select `ariadne` as both memory provider and context engine. It provides
-profile notes with built-in memory mirroring and the rolling context engine.
-Dedicated development profile only; see [docs/mvp-plugin.md](docs/mvp-plugin.md)
-and issue #41 for what is and is not implemented yet.
+and select `ariadne` as both memory provider and context engine. It provides:
+
+- profile notes the agent writes directly, plus a one-way mirror of built-in memory;
+- recall of relevant notes and an index of past conversations in new chats, with
+  exact reads of their archived messages;
+- automatic summaries replacing older history in long chats, with search and
+  zoom down to the exact originals;
+- agent-driven import of supplied chat exports (any format) through the
+  `ariadne:import` skill.
+
+Dedicated development profile only. Read the limitations and rollback steps in
+[docs/mvp-plugin.md](docs/mvp-plugin.md) first.
 
 ## Passive engine (`ariadne`, development installer)
 
@@ -49,7 +57,8 @@ The long-term direction is a UniiChat-inspired memory/context engine **inside
 Hermes**. The default installed runtime implements the archival foundation above;
 the separately installed prepared engine connects frozen offline kernel views to
 live request selection and bounded session-local evidence.
-There is no stable release or PyPI publication.
+Releases are experimental prereleases; there is no stable release or PyPI
+publication.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) for commit/branch naming, PRs, issue triage,
 verification and release policy. [AGENTS.md](AGENTS.md) carries repository-local
@@ -105,7 +114,7 @@ Python environment. A wheel install works too:
 
 ```bash
 .venv/bin/python -m build
-uv pip install --python /path/to/disposable/venv/bin/python dist/hermes_ariadne-0.1.0-py3-none-any.whl
+uv pip install --python /path/to/disposable/venv/bin/python dist/hermes_ariadne-0.2.0-py3-none-any.whl
 /path/to/disposable/venv/bin/ariadne-install --home /path/to/new/dev-home
 ```
 
@@ -115,7 +124,7 @@ described here (rolling has separate enablement; see its guide). The tool must b
 platform's enabled toolsets: if you use an explicit list, retain all your desired
 existing toolsets and include `context_engine`. An empty list intentionally
 exposes no engine tools. `skip_memory` does not disable this ContextEngine.
-No extra Ariadne configuration is needed in v0.1.
+No extra Ariadne configuration is needed for the passive engine.
 
 Archive location: `$HERMES_HOME/ariadne/events.sqlite3` (and SQLite WAL/SHM files).
 The host `state.db` remains authoritative; Ariadne never writes to it. By default

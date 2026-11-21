@@ -192,6 +192,16 @@ def tool_names(messages, start):
     return names
 
 
+def host_stamp():
+    """Installed Hermes build, so a report names the host it actually ran on."""
+    stamp = Path(sys.modules["hermes_cli"].__file__).resolve().parents[1] / "install-stamp.json"
+    try:
+        data = json.loads(stamp.read_text())
+    except (OSError, ValueError):
+        return None
+    return {k: data.get(k) for k in ("commit", "displayVersion", "builtAt")}
+
+
 def offered_tools(agent):
     names = []
     for tool in getattr(agent, "tools", None) or []:
@@ -408,6 +418,7 @@ def main():
     notes_mod = import_module(type(engine).__module__.rsplit(".", 1)[0] + ".notes")
     store = notes_mod.NoteStore(home)
     receipt = {
+        "host": host_stamp(),
         "offered_ariadne_tools": offered_tools(agent),
         "phase": phase,
         "model": model,
