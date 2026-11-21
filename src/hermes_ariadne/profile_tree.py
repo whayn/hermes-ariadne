@@ -58,8 +58,9 @@ HISTORY_CLOSE = "</history>"
 CONVERSATIONS_OPEN = "<conversations>"
 CONVERSATIONS_CLOSE = "</conversations>"
 _MAX_COUNT = (1 << 31) - 1
-_TAG = re.compile(r"[0-9a-f]{8}")
-_TAG_IN_TEXT = re.compile(r"(?<![0-9a-f])[0-9a-f]{8}(?![0-9a-f])")
+# A stored tag is 8 hex characters, lengthened by 4 at a time on a collision (tree_store).
+_TAG = re.compile(r"[0-9a-f]{8}(?:[0-9a-f]{4}){0,14}")
+_TAG_IN_TEXT = re.compile(r"(?<![0-9a-f])[0-9a-f]{8,64}(?![0-9a-f])")
 _WHITESPACE = re.compile(r"\s")
 _PART_TYPE = re.compile(r"[A-Za-z0-9_.-]{1,40}")
 _ROLES = {
@@ -183,6 +184,17 @@ class LogEntry:
             raise ValueError("origin must be 'live' or 'import'")
         if type(self.restricted) is not bool:
             raise TypeError("restricted must be bool")
+
+
+def iso_or_none(value: object) -> str | None:
+    """``value`` when it is a date ``LogEntry``/``LegendEntry`` accept, else None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        _date("date", value)
+    except (TypeError, ValueError):
+        return None
+    return value
 
 
 @dataclass(frozen=True)
@@ -421,8 +433,11 @@ def _call_lines(calls: object) -> list[str]:
     return lines
 
 
-def leaf_source(entry: LogEntry, message: Mapping | None) -> str:
+def leaf_source(entry: LogEntry, message: Mapping | None, tag: str | None = None) -> str:
     """The text of leaf ``entry.position``: ``"<tag> <date-or-?> <who>: <text>"``.
+
+    ``tag`` is the conversation's STORED tag (``tree_store`` lengthens it on a collision,
+    so the legend and the lines agree); without it, ``conversation_tag(session_id)``.
 
     The text is the carrier-free message: string/text-part content (other parts as
     ``[type]``), an assistant's tool calls as ``call <name>(<args json>)`` lines and a
@@ -431,8 +446,12 @@ def leaf_source(entry: LogEntry, message: Mapping | None) -> str:
     """
     if not isinstance(entry, LogEntry):
         raise TypeError("entry must be LogEntry")
+    if tag is None:
+        tag = conversation_tag(entry.session_id)
+    elif not isinstance(tag, str) or not _TAG.fullmatch(tag):
+        raise ValueError("tag must be 8 to 64 lowercase hex characters")
     who = _ROLES[entry.role]
-    head = f"{conversation_tag(entry.session_id)} {entry.date or '?'} {who}: "
+    head = f"{tag} {entry.date or '?'} {who}: "
     if entry.restricted:
         return head + RESTRICTED
     if type(message) is not dict:
@@ -687,7 +706,7 @@ def render_view(
         if not isinstance(tag, str) or not isinstance(item, LegendEntry):
             raise TypeError("legend must map tag str to LegendEntry")
         if not _TAG.fullmatch(tag):
-            raise ValueError("legend tags are 8 lowercase hex characters")
+            raise ValueError("legend tags are 8 to 64 lowercase hex characters")
     if not isinstance(exclude_positions, AbstractSet):
         raise TypeError("exclude_positions must be a set of positions")
     for position in exclude_positions:

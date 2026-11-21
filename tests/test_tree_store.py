@@ -579,3 +579,55 @@ def test_backfill_refuses_a_tampered_payload(home):
     with pytest.raises(ValueError):
         TreeStore(home).backfill(path)
     assert TreeStore(home).count() == 0
+
+
+# -- engine lookups (phase D) ---------------------------------------------------------
+
+
+def test_engine_lookups_read_only_snapshots(home):
+    store = TreeStore(home)
+    assert store.positions("s", [eid("a")]) == {}
+    assert dict(store.nodes_for([Part(0, 0)])) == {}
+    assert dict(store.legend()) == {} and store.built_counts() == (0, 0)
+    assert not store.backfilled() and not (home / "ariadne").exists()
+    store.append("s", [entry("a", date="2026-01-01"), entry("b")], origin="live", title="T")
+    store.append("t", [entry("c", date="2026-02-02")], origin="import")
+    assert store.positions("s", [eid("b"), eid("a"), eid("c")]) == {eid("a"): 0, eid("b"): 1}
+    assert store.positions("t", [eid("c")]) == {eid("c"): 2}
+    store.put_node(Part(0, 0), "leaf")
+    store.put_node(Part(1, 0), "parent")
+    many = [Part(0, i) for i in range(3)] * 300 + [Part(1, 0), Part(1, 1)]
+    assert dict(store.nodes_for(many)) == {Part(0, 0): "leaf", Part(1, 0): "parent"}
+    assert store.built_counts() == (1, 1)
+    tags = {sid: row.tag for sid, row in store.sessions().items()}
+    assert dict(store.legend()) == {
+        "s": (tags["s"], "T", "2026-01-01", None),
+        "t": (tags["t"], None, "2026-02-02", "2026-02-02"),
+    }
+    with pytest.raises(ValueError):
+        store.positions("s", ["not-an-event-id"])
+
+
+def test_backfill_marker_is_durable_and_not_a_logical_counter(home):
+    store = TreeStore(home)
+    store.mark_backfilled()
+    assert TreeStore(home).backfilled()
+    assert store.counters() == {"logical_jobs": 0, "request_bytes": 0}
+
+
+def test_log_entry_for_matches_the_backfill_rules():
+    from hermes_ariadne.tree_store import log_entry_for
+
+    event = eid("m")
+    assert log_entry_for(event, {"role": "user", "content": "x"}) is None  # no uid
+    assert log_entry_for(event, {"role": "narrator", "message_uid": "u"}) is None
+    row = log_entry_for(event, {"role": "tool", "message_uid": "u", "timestamp": 0})
+    assert row == {
+        "event_id": event,
+        "message_uid": "u",
+        "role": "tool",
+        "date": "1970-01-01T00:00:00Z",
+        "restricted": False,
+    }
+    restricted = {"role": "user", "message_uid": "u", "data_use": ["x"]}
+    assert log_entry_for(event, restricted)["restricted"] is True

@@ -299,6 +299,7 @@ class TreeBuilder:
         self._nonfit: set[int] = set()
         self._unavailable: dict[int, float] = {}
         self._archive: EventStore | None = None
+        self._tags: dict[str, str] = {}
         self._caps_exhausted = False
         self._last_error: str | None = None
         self._held = 0
@@ -342,6 +343,16 @@ class TreeBuilder:
                 return None
         return self._archive
 
+    def _tag(self, session_id: str) -> str:
+        """The conversation's stored legend tag (lengthened on a collision), cached."""
+        tag = self._tags.get(session_id)
+        if tag is None:
+            found = self._store.sessions().get(session_id)
+            if found is None:
+                raise _Unavailable("session_missing")
+            tag = self._tags[session_id] = found.tag
+        return tag
+
     def _read_source(self, position: int) -> str:
         entry = self._store.entry(position)
         if entry is None:
@@ -363,8 +374,9 @@ class TreeBuilder:
                 item = pt.LogEntry(**{**fields_, "date": None})
             except ValueError:
                 raise _Unavailable("entry_invalid") from None
+        tag = self._tag(entry.session_id)
         if item.restricted:
-            return pt.leaf_source(item, None)  # the archive is not even opened
+            return pt.leaf_source(item, None, tag)  # the archive is not even opened
         archive = self._archive_store()
         if archive is None:
             raise _Unavailable("source_unavailable")
@@ -375,7 +387,7 @@ class TreeBuilder:
         if message is None:
             raise _Unavailable("source_unavailable")
         try:
-            return pt.leaf_source(item, message)
+            return pt.leaf_source(item, message, tag)
         except (TypeError, ValueError):
             raise _Unavailable("source_invalid") from None
 

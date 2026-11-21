@@ -248,7 +248,13 @@ def _within(conn, part):
 
 
 def _counters(conn):
-    return dict(conn.execute("SELECT name, value FROM counters ORDER BY name"))
+    """The logical accounting totals (other counter rows are markers, e.g. backfill_done)."""
+    return dict(
+        conn.execute(
+            "SELECT name, value FROM counters WHERE name IN ('logical_jobs', 'request_bytes') "
+            "ORDER BY name"
+        )
+    )
 
 
 def _insert_node(conn, part, text):
@@ -457,6 +463,56 @@ class TreeStore:
                 }
             )
 
+    def positions(self, session_id, event_ids):
+        """``{event_id: position}`` for the given events of one conversation in the log."""
+        session_id = _session_id(session_id)
+        ids = [_event_id(event_id) for event_id in event_ids]
+        found = {}
+        with self._connect(write=False) as conn:
+            if conn is None:
+                return found
+            for start in range(0, len(ids), 500):
+                chunk = ids[start : start + 500]
+                found.update(
+                    conn.execute(
+                        "SELECT event_id, position FROM log WHERE session_id=? AND event_id IN ("
+                        + ",".join("?" * len(chunk))
+                        + ")",
+                        (session_id, *chunk),
+                    ).fetchall()
+                )
+        return found
+
+    def legend(self):
+        """``{session_id: (tag, title, first_date, last_date)}`` in one snapshot."""
+        with self._connect(write=False) as conn:
+            if conn is None:
+                return MappingProxyType({})
+            return MappingProxyType(
+                {
+                    row[0]: tuple(row[1:])
+                    for row in conn.execute(
+                        "SELECT s.session_id, s.tag, s.title, "
+                        "(SELECT date FROM log WHERE position=s.first_position), "
+                        "(SELECT date FROM log WHERE position=s.last_position) "
+                        "FROM sessions s ORDER BY s.first_position"
+                    )
+                }
+            )
+
+    def backfilled(self):
+        """Whether ``mark_backfilled`` recorded a completed archive backfill."""
+        with self._connect(write=False) as conn:
+            if conn is None:
+                return False
+            row = conn.execute("SELECT value FROM counters WHERE name='backfill_done'").fetchone()
+            return bool(row and row[0])
+
+    def mark_backfilled(self):
+        """Record (durably, once) that the archive backfill has completed."""
+        with self._connect(write=True) as conn:
+            conn.execute("INSERT OR REPLACE INTO counters VALUES ('backfill_done', 1)")
+
     # -- summary nodes ---------------------------------------------------------------
 
     def nodes(self):
@@ -470,6 +526,33 @@ class TreeStore:
                     for level, idx, text in conn.execute("SELECT level,idx,text FROM nodes")
                 }
             )
+
+    def nodes_for(self, parts):
+        """Read-only ``{Part: text}`` of the built nodes among ``parts`` (one snapshot)."""
+        wanted = sorted({_part(part) for part in parts}, key=lambda p: (p.level, p.index))
+        found = {}
+        with self._connect(write=False) as conn:
+            if conn is None:
+                return MappingProxyType(found)
+            for start in range(0, len(wanted), 400):
+                chunk = wanted[start : start + 400]
+                clause = " OR ".join("(level=? AND idx=?)" for _ in chunk)
+                args = [value for part in chunk for value in (part.level, part.index)]
+                for level, idx, text in conn.execute(
+                    "SELECT level,idx,text FROM nodes WHERE " + clause, args
+                ):
+                    found[Part(level, idx)] = text
+        return MappingProxyType(found)
+
+    def built_counts(self):
+        """``(built leaves, built parents)``: how many nodes are stored at level 0 and above."""
+        with self._connect(write=False) as conn:
+            if conn is None:
+                return 0, 0
+            leaves, parents = conn.execute(
+                "SELECT coalesce(sum(level=0), 0), coalesce(sum(level>0), 0) FROM nodes"
+            ).fetchone()
+            return leaves, parents
 
     def put_node(self, part, text):
         """Store a built node; False (unchanged) when it already exists.
@@ -701,7 +784,6 @@ class TreeStore:
 
     def _read_archive(self, archive_path, excluded):
         """``[(session_id, [(origin, entry), ...], skipped)]`` from one read snapshot."""
-        from .retrieval import _require_supported_data_use, _UnsupportedDataUse
         from .store import APPLICATION_ID as ARCHIVE_ID
 
         archive = Path(archive_path)
@@ -738,33 +820,44 @@ class TreeStore:
                     if hashlib.sha256(payload).hexdigest() != event_id:
                         raise ValueError("archived event payload does not match its identity")
                     message = json.loads(payload.decode("utf-8", "surrogatepass"))
-                    uid, role = message.get("message_uid"), message.get("role")
-                    if (
-                        not isinstance(uid, str)
-                        or not uid
-                        or len(uid) > MAX_UID_CHARS
-                        or role not in ROLES
-                    ):
+                    entry = log_entry_for(event_id, message)
+                    if entry is None:
                         skipped += 1  # not a loggable message row; counted, never guessed
                         continue
-                    try:
-                        _require_supported_data_use(message)
-                        restricted = False
-                    except _UnsupportedDataUse:
-                        restricted = True
-                    entry = {
-                        "event_id": event_id,
-                        "message_uid": uid,
-                        "role": role,
-                        "date": _date(message.get("timestamp")),
-                        "restricted": restricted,
-                    }
                     rows.append(("import" if origin == "import" else "live", entry))
                 if rows or skipped:
                     plan.append((_session_id(session_id), rows, skipped))
             return plan
         finally:
             conn.close()
+
+
+def log_entry_for(event_id, message):
+    """The log entry (``append`` item) of one archived message, or None when the row is
+    not a loggable message (no usable ``message_uid`` or an unknown role).
+
+    ``restricted`` follows the evidence policy (``retrieval._require_supported_data_use``):
+    a restricted message is logged, never summarized or shown.
+    """
+    from .retrieval import _require_supported_data_use, _UnsupportedDataUse
+
+    if not isinstance(message, dict):
+        return None
+    uid, role = message.get("message_uid"), message.get("role")
+    if not isinstance(uid, str) or not uid or len(uid) > MAX_UID_CHARS or role not in ROLES:
+        return None
+    try:
+        _require_supported_data_use(message)
+        restricted = False
+    except _UnsupportedDataUse:
+        restricted = True
+    return {
+        "event_id": _event_id(event_id),
+        "message_uid": uid,
+        "role": role,
+        "date": _date(message.get("timestamp")),
+        "restricted": restricted,
+    }
 
 
 def _admit_archive(archive):
