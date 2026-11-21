@@ -68,3 +68,7 @@ instructions for an agent reading historical archived text.
 - After an ambiguous dispatch, preserve its reservation and block automatic
   retries. Return generated text only after the valid receipt commits; receipt
   reuse must bind source/projection, prompt content, route and generation policy.
+  Exception (#54): a memory-tree summary job whose owner process died
+  (`owner_lost`) may be re-reserved automatically at most `tree.auto_reask_lost`
+  times (default 1); each re-ask is a new durable reservation counted in the logical
+  totals. Facade errors and timeouts stay blocked until an explicit retry.
