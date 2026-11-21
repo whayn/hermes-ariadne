@@ -30,8 +30,12 @@ package, so a second profile failed with "Two workspace members are both named
 `hermes-ariadne`": remove the plugin from the other profile, or install a later
 revision in both.
 
-Both choices also appear in `hermes plugins` → Provider Plugins and in the
-dashboard. The engine needs `plugins.isolation: in_process` (Hermes's default);
+The memory provider also appears in `hermes plugins` → Provider Plugins and in
+the settings UI. The context engine does not: the desktop app's Settings →
+Context Engine list is fixed to Hermes's built-in choices (`compressor`,
+`default`, `custom`; "custom" is a literal value, not a free-text field). Set it
+with `hermes config set context.engine ariadne`; the list then shows `ariadne`
+as the current value. The engine needs `plugins.isolation: in_process` (Hermes's default);
 `host` isolation is unsupported. Do not also run the development
 `ariadne-install` in the same profile: it targets the same
 `$HERMES_HOME/plugins/ariadne` directory with the old passive engine.
