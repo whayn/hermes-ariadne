@@ -36,11 +36,8 @@ def test_satisfies_abc_and_name():
 
 def test_tool_schemas():
     schemas = AriadneMemoryProvider().get_tool_schemas()
-    assert [s["name"] for s in schemas] == [
-        "ariadne_notes",
-        "ariadne_conversations",
-        "ariadne_import",
-    ]
+    # ariadne_conversations was superseded by the engine's memory view and tools (#54).
+    assert [s["name"] for s in schemas] == ["ariadne_notes", "ariadne_import"]
     actions = schemas[0]["parameters"]["properties"]["action"]["enum"]
     assert set(actions) == {"add", "edit", "delete", "list", "search", "get"}
 

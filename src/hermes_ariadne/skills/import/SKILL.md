@@ -13,15 +13,20 @@ format-specific importer and you should not write one.
 Two kinds of things can come out of an import:
 
 - **Archived conversations** (`ariadne_import`): the messages of a chat, stored
-  exactly as you pass them, readable later with `ariadne_conversations`.
+  exactly as you pass them. They join Ariadne's memory tree: every later chat's
+  memory view shows them, and `ariadne_zoom` opens any line down to the exact
+  original message (`ariadne_search` finds exact words).
 - **Notes** (`ariadne_notes` `add`): short durable facts worth remembering in
   every future chat (preferences, identity, decisions, ongoing projects).
 
 ## Procedure
 
-1. **Confirm scope.** Work only on the files the user named. If they gave a
-   directory or a huge export, say what you found (number of conversations,
-   date range) and agree on what to import before starting.
+1. **Confirm scope and cost.** Work only on the files the user named. Say what
+   you found (number of conversations, messages, date range) and agree on what
+   to import before starting. Importing costs summary model calls, paid by the
+   user (the chat model unless they pinned `auxiliary.ariadne_summary`): about
+   one call per message plus one per message longer than ~500 bytes. For a
+   large export, give that rough figure and get a go-ahead first.
 2. **Inspect the structure** with your normal file tools (read in chunks; use
    a short script to list conversations if the file is large). Identify for
    each conversation: a stable id from the export, a title, speakers, message
@@ -39,13 +44,18 @@ Two kinds of things can come out of an import:
      conversation, and `source` (`{"file": ..., "conversation": ...}`), sent
      with the first batch.
    Content must be the original text, not a paraphrase.
+   Each result has `tree.estimate` (`calls`, `request_bytes`): the summary calls
+   that batch adds. Add them up and tell the user the total. Summaries build in
+   the background and never block the chat; new lines show as "(not summarized
+   yet: zoom it)" until then, and `ariadne_memory_status` reports progress. If a
+   result has `tree.error`, resend the same batch (it is idempotent).
 5. **Write notes** only for facts that should shape future chats, in your own
    concise words, each with `source: {"kind": "import", "conversation":
    "<id returned by ariadne_import>"}`. Search existing notes first
    (`ariadne_notes` `search`) and `edit` rather than duplicate. If sources
    disagree, keep both facts with their dates rather than guessing which wins.
-6. **Report back**: conversations archived (and skipped, with why), notes
-   added or edited, and anything uncertain.
+6. **Report back**: conversations archived (and skipped, with why), the total
+   summary-call estimate, notes added or edited, and anything uncertain.
 
 ## Rules
 
@@ -58,5 +68,6 @@ Two kinds of things can come out of an import:
   such in the note text.
 - For very large imports, work in batches and tell the user progress; do not
   silently stop partway.
-- The user can review afterwards: `ariadne_notes` `list`/`delete`, and
-  `ariadne_conversations` `list`/`open`.
+- The user can review afterwards: `ariadne_notes` `list`/`delete`, the memory
+  view with `ariadne_zoom`/`ariadne_search`, and build progress with
+  `ariadne_memory_status`.

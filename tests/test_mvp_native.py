@@ -1,11 +1,13 @@
 """Installed-host proof: real `hermes plugins install` + the host's own loaders.
 
-Synthetic and loopback-free: no model is called. Establishes discovery,
-enablement, slot selection and tool dispatch from the installed copy only.
+The first test calls no model. The second runs real AIAgent turns against a
+scripted loopback provider (no real model): plumbing evidence that the memory
+view reaches the provider request and that the engine tools are dispatched.
 """
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -172,6 +174,16 @@ def _texts(messages):
     return "\n".join(out)
 
 
+def _view_index(messages):
+    """Index of the Ariadne memory view: the first non-system message, if it is one."""
+    index = next(i for i, m in enumerate(messages) if m["role"] not in ("system", "developer"))
+    content = messages[index].get("content")
+    content = content if isinstance(content, str) else _texts([{"content": content}])
+    if messages[index]["role"] == "assistant" and "<history>" in content:
+        return index, content
+    return None, None
+
+
 class _Provider(BaseHTTPRequestHandler):
     requests, errors, observed = [], [], {}
 
@@ -187,24 +199,49 @@ class _Provider(BaseHTTPRequestHandler):
         self.observed.setdefault("deferred", set()).add(name)
         return "tool_call", {"calls": [{"name": name, "arguments": args}]}
 
+    @staticmethod
+    def _last_tool(messages):
+        for m in reversed(messages):
+            if m["role"] == "assistant" and m.get("tool_calls"):
+                call = m["tool_calls"][0]["function"]
+                name, args = call["name"], json.loads(call.get("arguments") or "{}")
+                if name == "tool_call":  # deferred dispatch wrapper
+                    name = args["calls"][0]["name"]
+                return name
+        return None
+
     def _answer(self, body):
         messages = body["messages"]
         assert all("message_uid" not in m for m in messages)
+        first = messages[0].get("content")
+        if isinstance(first, str) and first.startswith("You compress conversation history"):
+            self.observed.setdefault("summary_calls", 0)
+            self.observed["summary_calls"] += 1  # the background tree builder's ctx.llm calls
+            return {"role": "assistant", "content": "summary line"}, "stop"
         last = messages[-1]
         prompt = next((m.get("content") for m in reversed(messages) if m["role"] == "user"), "")
         prompt = prompt if isinstance(prompt, str) else _texts([{"content": prompt}])
-        # Checked first: chat B's recalled index quotes chat A's NOTE-IT preview.
         if "ASK-BIKE" in prompt:
+            index, view = _view_index(messages)
+            if index is not None:
+                self.observed["view"] = True
+                self.observed["view_then_user"] = messages[index + 1]["role"] == "user"
+                self.observed["view_has_a"] = "NOTE-IT" in view or "(not summarized yet" in view
             if last["role"] == "tool":
-                assert PROMPT_A in last["content"], last["content"][:500]
-                self.observed["read_exact_original"] = True
-                return {"role": "assistant", "content": "answered"}, "stop"
-            text = _texts(messages)
-            self.observed["recall_note"] = NOTE in text
-            self.observed["recall_index"] = f"[{SESSION_A}]" in text
-            name, args = self._call(
-                body, "ariadne_conversations", {"action": "read", "id": SESSION_A}
-            )
+                tool = self._last_tool(messages)
+                if tool == "ariadne_search":
+                    found = re.search(r'"id":\s*(\d+)', last["content"])
+                    assert found, last["content"][:500]
+                    self.observed["search_id"] = int(found[1])
+                    name, args = self._call(body, "ariadne_zoom", {"id": int(found[1])})
+                else:
+                    assert PROMPT_A in last["content"], last["content"][:500]
+                    self.observed["zoom_exact_original"] = True
+                    return {"role": "assistant", "content": "answered"}, "stop"
+            else:
+                text = _texts(messages)
+                self.observed["recall_note"] = NOTE in text
+                name, args = self._call(body, "ariadne_search", {"query": "NOTE-IT"})
         elif "NOTE-IT" in prompt:
             if last["role"] == "tool":
                 assert '"ok": true' in last["content"], last["content"]
@@ -215,7 +252,7 @@ class _Provider(BaseHTTPRequestHandler):
             self.observed["other"] += 1
             return {"role": "assistant", "content": "ok"}, "stop"
         call = {
-            "id": "call_" + name,
+            "id": "call_" + name + str(len(messages)),
             "type": "function",
             "function": {"name": name, "arguments": json.dumps(args)},
         }
@@ -271,7 +308,7 @@ class _Provider(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
-def test_new_chat_gets_notes_index_and_reads_previous_chat(installed_home, tmp_path):
+def test_new_chat_gets_notes_and_the_view_and_zooms_the_previous_chat(installed_home, tmp_path):
     home = installed_home
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Provider)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -306,12 +343,17 @@ def test_new_chat_gets_notes_index_and_reads_previous_chat(installed_home, tmp_p
     assert a["engine"] == b["engine"] == "ariadne" and a["pid"] != b["pid"]
     assert (a["final_response"], b["final_response"]) == ("noted", "answered")
     seen = _Provider.observed
-    assert seen.get("recall_note") and seen.get("recall_index"), seen
-    assert seen.get("read_exact_original"), seen
+    assert seen.get("recall_note"), seen
+    # The memory view is the first non-system message of chat B's request, an assistant
+    # message followed by the user's turn, and it covers chat A (summarized or WAIT).
+    assert seen.get("view") and seen.get("view_then_user") and seen.get("view_has_a"), seen
+    # ariadne_search found chat A's message in the log; ariadne_zoom returned it exactly.
+    assert seen.get("search_id") == 0 and seen.get("zoom_exact_original"), seen
     print(
         json.dumps(
             {
                 "exposure": {k: sorted(v) for k, v in seen.items() if isinstance(v, set)},
+                "observed": {k: v for k, v in seen.items() if not isinstance(v, set)},
                 "requests": len(_Provider.requests),
                 "other": seen.get("other", 0),
             }

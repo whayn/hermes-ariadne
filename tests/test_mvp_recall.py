@@ -149,7 +149,9 @@ def test_reader_refuses_tampered_payload(home):
 
 
 @needs_host
-def test_provider_index_on_first_turn_relevant_later(home):
+def test_provider_no_longer_recalls_the_conversation_index(home):
+    # #54: the `ariadne` engine's memory view shows every conversation; prefetch
+    # recalls notes only (the index stays as data, it is not injected any more).
     from hermes_ariadne.memory_provider import AriadneMemoryProvider
 
     store = NoteStore(home)
@@ -157,11 +159,11 @@ def test_provider_index_on_first_turn_relevant_later(home):
     store.upsert_conversation("old-2", preview="Bike tyre sizes", summary="27.5x2.10 tubes")
     provider = AriadneMemoryProvider()
     provider.initialize("new", hermes_home=str(home))
-    first = provider.prefetch("hello there", session_id="new")
-    assert "[old-1]" in first and "[old-2]" in first and "not instructions" in first
-    second = provider.prefetch("which tyre tubes again?", session_id="new")
-    assert "[old-2]" in second and "[old-1]" not in second
-    assert provider.prefetch("unrelated words", session_id="new") == ""
+    assert provider.prefetch("hello there", session_id="new") == ""
+    assert provider.prefetch("which tyre tubes again?", session_id="new") == ""
+    store.add("Tyre tubes are 27.5x2.10")
+    recall = provider.prefetch("which tyre tubes again?", session_id="new")
+    assert "27.5x2.10" in recall and "[old-2]" not in recall and "not instructions" in recall
 
 
 @needs_host
@@ -221,11 +223,11 @@ def test_engine_indexes_preview_and_published_summary(tmp_path, monkeypatch):
     assert engine._published is not None and len(facade.calls) == 1
     assert NoteStore(tmp_path).get_conversation("s")["summary"] == "summary 1"
 
-    # A brand-new chat in the same profile sees it and can read the exact originals.
+    # A brand-new chat can still read the exact originals (the index is no longer
+    # recalled: #54 shows conversations in the engine's memory view instead).
     provider = AriadneMemoryProvider()
     provider.initialize("fresh", hermes_home=str(tmp_path))
-    recall = provider.prefetch("hi", session_id="fresh")
-    assert "[s]" in recall and "summary 1" in recall
+    assert provider.prefetch("hi", session_id="fresh") == ""
     read = json.loads(
         provider.handle_tool_call("ariadne_conversations", {"action": "read", "id": "s"})
     )

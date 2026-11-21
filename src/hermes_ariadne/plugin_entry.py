@@ -11,6 +11,13 @@ context (verified against the installed host; see docs/mvp-plugin.md):
 
 The engine needs Hermes's LLM facade for summaries, so it is registered only
 when that facade is present. Import and construction perform no I/O.
+
+The ``ariadne`` engine is the profile memory-tree engine (``tree_engine``, issue
+#54), configured by the plugin's ``tree`` settings; summary calls run under the
+plugin-owned auxiliary task ``ariadne_summary``. The ``rolling`` block is still
+validated (an invalid value refuses registration) and passed to the base class's
+archive helpers; rolling summaries remain the development ``ariadne-rolling``
+engine's.
 """
 
 
@@ -43,8 +50,15 @@ def register(ctx):
     _register_skill(ctx)
     if llm is None:
         return None
-    from .mvp_engine import AriadneEngine
     from .rolling import RollingSettings
+    from .tree_builder import TreeSettings, register_summary_task
+    from .tree_engine import TreeAriadneEngine
 
     settings = RollingSettings(**ctx.get_config("rolling", {}))
-    return ctx.register_context_engine(AriadneEngine(llm=llm, settings=settings))
+    tree = TreeSettings.from_config(ctx.get_config("tree", None))
+    register_task = getattr(ctx, "register_auxiliary_task", None)
+    if callable(register_task):
+        register_summary_task(ctx)
+    return ctx.register_context_engine(
+        TreeAriadneEngine(llm=llm, settings=settings, tree_settings=tree)
+    )
