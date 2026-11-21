@@ -161,6 +161,13 @@ NEWCHAT_TURNS = [
     "memory and conversation tools; do not guess.",
     "Please save to your built-in memory (the `memory` tool, user profile) that I "
     "prefer metric units.",
+    # Only in the imported conversation's originals, never in a note.
+    "In the e-bike conversation I imported earlier, on which street is the shop where "
+    "I said I would buy the tubes? Check that conversation's original messages with "
+    "your Ariadne tools; do not guess.",
+    "In your built-in memory (user profile), update that units entry so it also says "
+    "I use 24-hour time.",
+    "Now remove that units entry from your built-in memory entirely.",
 ]
 
 

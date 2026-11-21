@@ -152,6 +152,7 @@ class AriadneMemoryProvider(MemoryProvider):
         self._archive = None
         self._importer = None
         self._session_id = ""
+        self._primary = True
         self._indexed_sessions = set()
 
     @property
@@ -171,6 +172,10 @@ class AriadneMemoryProvider(MemoryProvider):
         self._archive = ArchiveReader(home)
         self._importer = Importer(home)
         self._session_id = session_id
+        context = kwargs.get("agent_context")
+        # Hermes asks providers to skip automatic writes outside the primary agent
+        # (subagent, cron, flush). Older hosts omit the key: treat as primary.
+        self._primary = not isinstance(context, str) or context in ("", "primary")
 
     def system_prompt_block(self):
         return (
@@ -305,7 +310,7 @@ class AriadneMemoryProvider(MemoryProvider):
             return _err("unavailable")
 
     def on_memory_write(self, action, target, content, metadata=None):
-        if self._store is None:
+        if self._store is None or not self._primary:
             return
         previous = (metadata or {}).get("previous_content")
         try:

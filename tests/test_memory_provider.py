@@ -130,3 +130,22 @@ def test_store_is_profile_scoped(tmp_path):
 def test_multiword_tags_match_query_words(provider):
     call(provider, action="add", text="Prefers short examples", tags=["machine learning"])
     assert "short examples" in provider.prefetch("Explain machine learning")
+
+
+@pytest.mark.parametrize("context", ["subagent", "cron", "flush"])
+def test_mirror_skips_non_primary_agents(tmp_path, context):
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    p = AriadneMemoryProvider()
+    p.initialize("s1", hermes_home=str(home), agent_context=context)
+    p.on_memory_write("add", "user", "written by a background agent")
+    assert call(p, action="list")["notes"] == []
+
+
+def test_mirror_defaults_to_primary_when_host_omits_context(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    p = AriadneMemoryProvider()
+    p.initialize("s1", hermes_home=str(home))  # older Hermes: no agent_context
+    p.on_memory_write("add", "user", "fact")
+    assert [n["text"] for n in call(p, action="list")["notes"]] == ["fact"]
