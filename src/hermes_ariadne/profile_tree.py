@@ -31,6 +31,9 @@ integers). Deliberate choices beyond the plan, all in service of its invariants:
   restricted (fail closed), so a stale flag can never leak text.
 * ``Selection``/``select_view``/``check_selection``/``history_lines`` are the
   coverage/budget/identity/cache checker for tests and the simulator.
+* Unbuilt history is bounded: every maximal run of consecutive unbuilt view parts renders
+  as ONE range line (``view_lines``), so a fresh backfill or import, when most leaves
+  are unbuilt, still fits the view's byte bound instead of one WAIT line per part.
 
 A ``View`` may legitimately exceed ``high`` (parents unbuilt); the checker reports that
 as a ``budget`` violation so the caller must decline rather than send it.
@@ -51,7 +54,11 @@ from .tree import Part, View, advance_view, flat, render_lines, roots, utf8_size
 NODE_BYTES = 512
 HIGH = 128000
 SEEN_HIGH = 32000
+# One unbuilt part keeps the single line ``id+n|WAIT``; two or more CONSECUTIVE unbuilt
+# parts are ONE range line ``first..last|(N messages not summarized yet: search, or zoom
+# an id)`` (first and last are inclusive global positions, N = last - first + 1).
 WAIT = "(not summarized yet: zoom it)"
+WAIT_RUN = "({count} messages not summarized yet: search, or zoom an id)"
 RESTRICTED = "[restricted message: not summarized]"
 HISTORY_OPEN = "<history>"
 HISTORY_CLOSE = "</history>"
@@ -62,6 +69,8 @@ _MAX_COUNT = (1 << 31) - 1
 _TAG = re.compile(r"[0-9a-f]{8}(?:[0-9a-f]{4}){0,14}")
 _TAG_IN_TEXT = re.compile(r"(?<![0-9a-f])[0-9a-f]{8,64}(?![0-9a-f])")
 _WHITESPACE = re.compile(r"\s")
+_RUN_LINE = re.compile(r"(\d+)\.\.(\d+)\|" + re.escape(WAIT_RUN).replace(r"\{count\}", r"(\d+)"))
+_PART_LINE = re.compile(r"(\d+)\+(\d+)\|")
 _PART_TYPE = re.compile(r"[A-Za-z0-9_.-]{1,40}")
 _ROLES = {
     "user": "user",
@@ -79,13 +88,17 @@ VIEW_LINES = f"""The view: the history of everything this profile's user has dis
 agent, across every conversation, oldest first, as one-line summaries. Each line is
 
   id+n|text   the n messages from id on, summarized (newlines shown as spaces)
+  first..last|(N messages not summarized yet: search, or zoom an id)
+              a range line: messages first to last, every id in between, N of them,
+              have no summary yet
 
 A summary tags each item with its conversation (8 hex characters, listed with its
 title and dates after the lines), its date and its kind: user (the user's words),
 assistant (the agent's replies), call name(args) (the agent's tool calls), result
 name (their results) or system. A short message is its own line, word for word.
 Recent lines cover one message each; the older the messages, the more a line covers.
-A message not summarized yet shows as "{WAIT}". A message
+One message not summarized yet shows as "{WAIT}"; a run of
+two or more in a row is a single range line. A message
 that carries a data-use restriction is never summarized: its line says so."""
 
 VIEW_DOC = (
@@ -101,7 +114,12 @@ Navigating: ariadne_zoom(id, n) opens line id+n into the two lines of n/2 messag
 was made from; ariadne_zoom(id, 1) gives message id in full (a long one a page at a
 time: at is where the page starts, 0 by default). Zoom whenever a summary only
 mentions something you need, such as what a past reply said, a decision, a past
-attempt or where a file is, before you act, guess or ask."""
+attempt or where a file is, before you act, guess or ask.
+
+A range line has no summary to read. Inside a range every id is a real message: find it
+with ariadne_search(query), or open an id with ariadne_zoom(id, 1) or a block of
+messages with ariadne_zoom(id, n) (n a power of two, id a multiple of n). Zoom works
+inside a range just like on any other line. Ranges shrink on their own as summaries are built."""
 )
 
 COMPACTION_RULES = """You compress conversation history for a memory tree. Each request holds a <chat>
@@ -679,6 +697,94 @@ def _legend_line(tag: str, item: LegendEntry) -> str:
     return _escape(f"{tag} = {title} ({first} .. {last})")
 
 
+def wait_run(count: int) -> str:
+    """The text of a range line over ``count`` (at least 2) unbuilt messages."""
+    _integer("count", count, minimum=1)
+    return WAIT_RUN.format(count=count)
+
+
+@dataclass(frozen=True)
+class ViewLine:
+    """One rendered line: a built part, one unbuilt part, or a run of unbuilt parts.
+
+    ``parts`` are the view parts it covers, contiguous; ``ref`` is ``id+n`` for one part
+    and ``first..last`` (inclusive positions) for a run of two or more.
+    """
+
+    ref: str
+    parts: tuple[Part, ...]
+    text: str
+    built: bool
+
+    @property
+    def line(self) -> str:
+        return f"{self.ref}|{self.text}"
+
+    @property
+    def span(self) -> tuple[int, int]:
+        """``(first, last)`` inclusive global positions the line covers."""
+        return self.parts[0].start, self.parts[-1].stop - 1
+
+
+def view_lines(
+    view: View, nodes: Mapping[Part, str], exclude_positions: AbstractSet[int]
+) -> tuple[ViewLine, ...]:
+    """The lines of a view, in order: the single source of truth for what is rendered.
+
+    A built part is ``id+n|flat(text)``. A maximal run of CONSECUTIVE unbuilt parts is
+    one line: ``id+n|WAIT`` for a single part, else ``first..last|`` plus ``wait_run``.
+    A verbatim level-0 position in ``exclude_positions`` is omitted and ends a run, so
+    ids around it stay exact. Size is one line per built part or verbatim position, plus
+    one per run: with nothing built, the lines are O(1) however many messages are logged.
+    """
+    lines: list[ViewLine] = []
+    run: list[Part] = []
+
+    def flush() -> None:
+        if len(run) == 1:
+            lines.append(ViewLine(f"{run[0].start}+{run[0].count}", (run[0],), WAIT, False))
+        elif run:
+            first, last = run[0].start, run[-1].stop - 1
+            lines.append(
+                ViewLine(f"{first}..{last}", tuple(run), wait_run(last - first + 1), False)
+            )
+        run.clear()
+
+    for part in view.parts:
+        if part.level == 0 and part.start in exclude_positions:
+            flush()
+            continue
+        if part in nodes:
+            flush()
+            lines.append(ViewLine(f"{part.start}+{part.count}", (part,), flat(nodes[part]), True))
+        else:
+            if run and run[-1].stop != part.start:
+                flush()
+            run.append(part)
+    flush()
+    return tuple(lines)
+
+
+def line_span(line: str) -> tuple[int, int] | None:
+    """``(first, last)`` inclusive positions a rendered line names, or None.
+
+    Reads ``id+n|text`` (n a power of two, id a multiple of n) and the range form
+    ``first..last|`` plus its exact ``wait_run`` text (N must equal last - first + 1).
+    """
+    if not isinstance(line, str):
+        return None
+    found = _RUN_LINE.fullmatch(line)
+    if found:
+        first, last, count = (int(group) for group in found.groups())
+        return (first, last) if first < last and count == last - first + 1 else None
+    found = _PART_LINE.match(line)
+    if found:
+        start, count = int(found.group(1)), int(found.group(2))
+        if count >= 1 and not count & (count - 1) and start % count == 0:
+            return start, start + count - 1
+    return None
+
+
 def render_view(
     view: View,
     nodes: Mapping[Part, str],
@@ -688,7 +794,10 @@ def render_view(
 ) -> str:
     """The view as one deterministic text: ``VIEW_DOC``, ``<history>`` lines, legend.
 
-    One line per view part: ``id+n|flat(text)`` when built, ``id+n|WAIT`` when not.
+    Lines are those of ``view_lines``: ``id+n|flat(text)`` per built part, ``id+n|WAIT``
+    for a lone unbuilt part and ONE ``first..last|(N messages not summarized yet: ...)``
+    line per maximal run of consecutive unbuilt parts, so a profile that is mostly
+    unbuilt (a fresh backfill or import) still renders in bounded size.
     Only level-0 parts whose position is in ``exclude_positions`` (sent verbatim) are
     omitted; nothing else is ever dropped. The legend follows the lines and lists, sorted
     by tag, the legend tags that occur in the rendered lines.
@@ -711,12 +820,7 @@ def render_view(
         raise TypeError("exclude_positions must be a set of positions")
     for position in exclude_positions:
         _integer("exclude position", position)
-    lines = []
-    for part in view.parts:
-        if part.level == 0 and part.start in exclude_positions:
-            continue
-        text = flat(nodes[part]) if part in nodes else WAIT
-        lines.append(f"{part.start}+{part.count}|{text}")
+    lines = [item.line for item in view_lines(view, nodes, exclude_positions)]
     present = sorted({tag for line in lines for tag in _TAG_IN_TEXT.findall(line)} & legend.keys())
     out = VIEW_DOC + "\n\n" + HISTORY_OPEN + "\n" + "".join(line + "\n" for line in lines)
     out += HISTORY_CLOSE
@@ -851,6 +955,7 @@ class SelectionReport:
     rendered_bytes: int
     summary_bytes: int
     cache_checked: bool
+    wait_bytes: int = 0  # bytes of the unbuilt lines (single WAIT and range lines)
 
     @property
     def ok(self) -> bool:
@@ -867,12 +972,23 @@ def select_view(
     sizes: tuple[int, ...],
     tail_bytes: int,
     request: Sequence,
+    pin_boundary: int | None = None,
 ) -> Selection:
-    """Plan a request: boundary, deterministic render and verbatim tail in one value."""
+    """Plan a request: boundary, deterministic render and verbatim tail in one value.
+
+    ``pin_boundary`` is the boundary an earlier request of the same tool loop used. It
+    is kept while it is still an allowed boundary no later than the fresh one (so every
+    message it retires is still covered): the count then does not move within a loop,
+    and neither does the verbatim tail. Otherwise the fresh boundary is used.
+    """
     request = tuple(request)
     if len(request) != len(own_positions):
         raise ValueError("request and own_positions must describe the same messages")
     boundary = retirement_boundary(own_positions, exchange_starts, sizes, view, nodes, tail_bytes)
+    if pin_boundary is not None:
+        _integer("pin_boundary", pin_boundary)
+        if pin_boundary <= boundary and pin_boundary in _allowed_boundaries(exchange_starts):
+            boundary = pin_boundary
     exclude = frozenset(p for p in own_positions[boundary:] if p is not None)
     rendered = render_view(view, nodes, legend, exclude_positions=exclude)
     return Selection(
@@ -922,18 +1038,54 @@ def _cache_comparable(before: Selection, after: Selection) -> bool:
     )
 
 
+def _extends(old: Sequence[str], new: Sequence[str]) -> bool:
+    """Whether ``old`` is a prefix of ``new``, except that an unbuilt LAST line may grow.
+
+    New messages appended after a trailing unbuilt line extend its run (``first`` stays,
+    ``last`` grows): the one rewrite that needs no merge or build, and it sits at the end,
+    so everything before it still hits the cache.
+    """
+    if len(new) < len(old):
+        return False
+    if not old:
+        return True
+    if tuple(new[: len(old) - 1]) != tuple(old[:-1]):
+        return False
+    before, after = old[-1], new[len(old) - 1]
+    if before == after:
+        return True
+    if not (before.endswith("|" + WAIT) or _RUN_LINE.fullmatch(before)):
+        return False
+    old_span, new_span = line_span(before), line_span(after)
+    return (
+        _RUN_LINE.fullmatch(after) is not None
+        and old_span is not None
+        and new_span is not None
+        and new_span[0] == old_span[0]
+        and new_span[1] > old_span[1]
+    )
+
+
 def check_selection(selection: Selection, previous: Selection | None = None) -> SelectionReport:
     """Check coverage, budget, identity and (given ``previous``) cache stability.
 
     * coverage: every retired message has a position inside a built view part that is
-      rendered; every view part has exactly one line (WAIT when unbuilt) except
-      verbatim level-0 positions; only this conversation's verbatim positions are omitted.
+      rendered; every view part is covered by exactly one line except verbatim level-0
+      positions: a built part by its own, a lone unbuilt part by ``id+n|WAIT`` and a
+      maximal run of consecutive unbuilt parts by one range line ``first..last|...``
+      that covers exactly those positions; only this conversation's verbatim positions
+      are omitted.
     * boundary/identity: the boundary is 0 or an exchange start before the current
       exchange and the verbatim tail is exactly ``request[boundary:]``.
     * render: the text is the deterministic ``render_view`` of its inputs.
-    * budget: the view's built summary bytes are at most ``view.high``.
+    * budget: the view's built summary bytes are at most ``view.high``;
+      ``wait_bytes`` reports the bytes of the unbuilt lines and ``rendered_bytes`` counts
+      every line, so the caller's byte bound sees them.
     * cache: when no merge or build changed the earlier parts, the previous line
       section is an exact prefix of this one (``cache_checked`` says whether it ran).
+      A trailing unbuilt line may grow into a longer run as messages are appended.
+      Building a part inside a run (like a merge batch) changes the view at that run,
+      so the check is not run (``cache_checked`` False) rather than failed.
     """
     if not isinstance(selection, Selection):
         raise TypeError("selection must be Selection")
@@ -961,15 +1113,19 @@ def check_selection(selection: Selection, previous: Selection | None = None) -> 
     kept = {p for p in s.own_positions[s.boundary :] if p is not None}
     for position in sorted(s.exclude_positions - kept):
         bad.append(f"coverage: position {position} is omitted but is not a verbatim message")
-    expected = [p for p in s.view.parts if not (p.level == 0 and p.start in s.exclude_positions)]
+    expected = view_lines(s.view, s.nodes, s.exclude_positions)
     if len(lines) != len(expected) or any(
-        not line.startswith(f"{p.start}+{p.count}|") for line, p in zip(lines, expected)
+        not line.startswith(item.ref + "|") for line, item in zip(lines, expected)
     ):
         bad.append("coverage: rendered lines do not match the view parts")
     else:
-        for line, part in zip(lines, expected):
-            if part not in s.nodes and line != f"{part.start}+{part.count}|{WAIT}":
-                bad.append(f"coverage: unbuilt part {part.start}+{part.count} is not WAIT")
+        for line, item in zip(lines, expected):
+            # A line covers exactly the positions of its parts: ranges are read back,
+            # never trusted, and an unbuilt line must be the exact fixed text.
+            if line_span(line) != item.span:
+                bad.append(f"coverage: line {item.ref} does not cover exactly its positions")
+            elif not item.built and line != item.line:
+                bad.append(f"coverage: unbuilt line {item.ref} is not the fixed unbuilt text")
     rendered_refs = {line.split("|", 1)[0] for line in lines}
     for index, position in enumerate(s.own_positions[: s.boundary]):
         part = _covering(s.view, position)
@@ -991,6 +1147,7 @@ def check_selection(selection: Selection, previous: Selection | None = None) -> 
 
     # budget
     summary = sum(utf8_size(s.nodes[p]) for p in s.view.parts if p in s.nodes)
+    waiting = sum(utf8_size(item.line) + 1 for item in expected if not item.built)
     if summary > s.view.high:
         bad.append(f"budget: summary bytes {summary} exceed high {s.view.high}")
 
@@ -1002,6 +1159,6 @@ def check_selection(selection: Selection, previous: Selection | None = None) -> 
             old = history_lines(previous.rendered)
         except ValueError:
             old = None
-        if old is None or lines[: len(old)] != old:
+        if old is None or not _extends(old, lines):
             bad.append("cache: the previous line section is not a prefix of this render")
-    return SelectionReport(tuple(bad), utf8_size(s.rendered), summary, checked)
+    return SelectionReport(tuple(bad), utf8_size(s.rendered), summary, checked, waiting)

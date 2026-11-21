@@ -1124,3 +1124,247 @@ def test_roots_cover_log_positions_after_every_advance():
         world.build(1.0)
         assert tuple(p for p in world.view.parts)[-1].stop == len(world.log)
         assert sum(p.count for p in roots(len(world.log))) == len(world.log)
+
+
+# --------------------------------------------------------------------------- #
+# Collapsed runs of unbuilt parts (bounded view while building)
+# --------------------------------------------------------------------------- #
+
+
+def leaves(count):
+    return View(parts=tuple(Part(0, i) for i in range(count)))
+
+
+def run_line(first, last):
+    return (
+        f"{first}..{last}|("
+        + f"{last - first + 1} messages not summarized yet: search, or zoom an id)"
+    )
+
+
+def test_run_line_format_is_documented_and_explained_to_the_model():
+    assert pt.wait_run(5) == "(5 messages not summarized yet: search, or zoom an id)"
+    assert run_line(3, 7) == f"3..7|{pt.wait_run(5)}"
+    for text in (pt.VIEW_LINES, pt.VIEW_DOC):
+        assert "first..last|" in text and "not summarized yet" in text
+        assert "range line" in text
+    assert "ariadne_search" in pt.VIEW_DOC and "ariadne_zoom(id, 1)" in pt.VIEW_DOC
+    assert "inside a range" in pt.VIEW_DOC
+    assert pt.WAIT in pt.VIEW_LINES  # a single unbuilt line keeps its own form
+
+
+def test_consecutive_unbuilt_parts_collapse_into_one_range_line():
+    nodes = {Part(0, 1): f"{T1} one", Part(0, 4): f"{T2} four"}
+    out = pt.render_view(leaves(8), nodes, legend(T1, T2), exclude_positions=frozenset())
+    assert pt.history_lines(out) == (
+        f"0+1|{pt.WAIT}",
+        f"1+1|{T1} one",
+        run_line(2, 3),
+        f"4+1|{T2} four",
+        run_line(5, 7),
+    )
+    assert pt.render_view(leaves(8), nodes, {}, exclude_positions=frozenset()) == pt.render_view(
+        leaves(8), nodes, {}, exclude_positions=set()
+    )
+
+
+def test_a_run_spans_parts_of_every_level_and_a_lone_part_keeps_its_line():
+    view = View(parts=(Part(2, 0), Part(1, 2), Part(0, 6), Part(0, 7)))
+    assert pt.history_lines(pt.render_view(view, {}, {}, exclude_positions=frozenset())) == (
+        run_line(0, 7),
+    )
+    nodes = {Part(1, 2): "m"}
+    assert pt.history_lines(pt.render_view(view, nodes, {}, exclude_positions=frozenset())) == (
+        f"0+4|{pt.WAIT}",
+        "4+2|m",
+        run_line(6, 7),
+    )
+
+
+def test_a_verbatim_position_ends_a_run_and_ids_stay_exact():
+    out = pt.render_view(leaves(6), {}, {}, exclude_positions={2, 5})
+    assert pt.history_lines(out) == (run_line(0, 1), run_line(3, 4))
+    out = pt.render_view(leaves(4), {}, {}, exclude_positions={1})
+    assert pt.history_lines(out) == (f"0+1|{pt.WAIT}", run_line(2, 3))
+
+
+def test_line_span_reads_both_line_forms():
+    assert pt.line_span(run_line(10, 4999)) == (10, 4999)
+    assert pt.line_span("8+4|text") == (8, 11)
+    assert pt.line_span(f"3+1|{pt.WAIT}") == (3, 3)
+    for bad in ("", "3|x", "a..b|x", "7..3|x", "0+3|x", "1+2|x", "x"):
+        assert pt.line_span(bad) is None, bad
+
+
+def unbuilt_selection(count=40, built=(), **kw):
+    nodes = {Part(0, i): f"{T1} t{i}" for i in built}
+    return pt.select_view(
+        view=advance_view(View(high=10**6), count, nodes),
+        nodes=nodes,
+        legend=legend(T1),
+        own_positions=kw.get("own_positions", ()),
+        exchange_starts=kw.get("exchange_starts", ()),
+        sizes=kw.get("sizes", ()),
+        tail_bytes=0,
+        request=kw.get("request", ()),
+    )
+
+
+def test_checker_accepts_run_lines_as_exact_coverage_and_counts_their_bytes():
+    sel = unbuilt_selection(built=[3, 4])
+    report = pt.check_selection(sel)
+    assert report.ok, report.violations
+    assert pt.history_lines(sel.rendered) == (
+        run_line(0, 2),
+        f"3+1|{T1} t3",
+        f"4+1|{T1} t4",
+        run_line(5, 39),
+    )
+    spans = [pt.line_span(line) for line in pt.history_lines(sel.rendered)]
+    assert spans[0] == (0, 2) and spans[-1] == (5, 39)
+    assert report.rendered_bytes == utf8_size(sel.rendered)
+    assert report.wait_bytes == utf8_size(run_line(0, 2) + "\n") + utf8_size(run_line(5, 39) + "\n")
+    assert report.summary_bytes == sum(utf8_size(t) for t in sel.nodes.values())
+
+
+def test_checker_rejects_a_run_that_does_not_cover_exactly_its_positions():
+    sel = unbuilt_selection(built=[3])
+    lines = pt.history_lines(sel.rendered)
+    body = "\n".join(lines) + "\n"
+    forged = {
+        "last too far": lines[0].replace("0..2", "0..3"),
+        "count wrong": lines[0].replace("(3 messages", "(4 messages"),
+        "swallows a built part": run_line(0, 3),
+        "split run": run_line(0, 1) + "\n" + run_line(2, 2),
+    }
+    for name, line in forged.items():
+        text = sel.rendered.replace(body, body.replace(lines[0], line, 1))
+        report = pt.check_selection(replace(sel, rendered=text))
+        assert any(v.startswith("coverage") for v in report.violations), name
+    # a run line standing where a built part must be shown
+    wrong = body.replace(lines[1], run_line(3, 3).replace("3..3", "3+1"), 1)
+    report = pt.check_selection(replace(sel, rendered=sel.rendered.replace(body, wrong)))
+    assert not report.ok
+
+
+def test_checker_rejects_two_adjacent_runs_instead_of_one_maximal_run():
+    sel = unbuilt_selection(count=6)
+    body = "\n".join(pt.history_lines(sel.rendered)) + "\n"
+    text = sel.rendered.replace(body, run_line(0, 2) + "\n" + run_line(3, 5) + "\n")
+    report = pt.check_selection(replace(sel, rendered=text))
+    assert any(v.startswith("coverage") for v in report.violations)
+
+
+def test_a_retired_message_inside_a_run_is_not_covered():
+    sel = unbuilt_selection(
+        count=6,
+        own_positions=(0, 1, 2, 3),
+        exchange_starts=(0, 2),
+        sizes=(10,) * 4,
+        request=tuple({"role": "user", "content": str(i)} for i in range(4)),
+    )
+    assert sel.boundary == 0  # nothing built: nothing may be retired
+    forced = replace(sel, boundary=2, tail=sel.request[2:], exclude_positions=frozenset({2, 3}))
+    forced = replace(
+        forced, rendered=pt.render_view(sel.view, {}, sel.legend, exclude_positions={2, 3})
+    )
+    report = pt.check_selection(forced)
+    assert any("not built" in v for v in report.violations)
+
+
+def test_cache_prefix_holds_when_nothing_changes_and_when_a_trailing_run_grows():
+    first = unbuilt_selection(count=1)
+    assert pt.history_lines(first.rendered) == (f"0+1|{pt.WAIT}",)
+    same = unbuilt_selection(count=1)
+    report = pt.check_selection(same, previous=first)
+    assert report.ok and report.cache_checked
+    grown = unbuilt_selection(count=2)  # the lone WAIT line becomes a run
+    assert pt.history_lines(grown.rendered) == (run_line(0, 1),)
+    report = pt.check_selection(grown, previous=first)
+    assert report.ok and report.cache_checked, report.violations
+    more = unbuilt_selection(count=9)
+    report = pt.check_selection(more, previous=grown)
+    assert report.ok and report.cache_checked, report.violations
+    # earlier lines are still an exact prefix when the run is not the first line
+    base = unbuilt_selection(count=5, built=[0, 1])
+    after = unbuilt_selection(count=8, built=[0, 1])
+    report = pt.check_selection(after, previous=base)
+    assert report.ok and report.cache_checked, report.violations
+    assert pt.history_lines(after.rendered)[:3] == pt.history_lines(base.rendered)[:2] + (
+        run_line(2, 7),
+    )
+
+
+def test_a_run_may_only_extend_never_rewrite_what_came_before():
+    base = unbuilt_selection(count=5, built=[0, 1])
+    after = unbuilt_selection(count=8, built=[0, 1])
+    old = pt.history_lines(base.rendered)
+    for text in (
+        after.rendered.replace(old[0], old[0] + "~", 1),  # an earlier line moved
+        after.rendered.replace(run_line(2, 7), run_line(3, 7).replace("5 mess", "6 mess"), 1),
+        after.rendered.replace(run_line(2, 7), run_line(2, 7)[:-1] + " ", 1),
+    ):
+        report = pt.check_selection(replace(after, rendered=text), previous=base)
+        assert any(v.startswith("cache") for v in report.violations), text[-200:]
+
+
+def test_building_inside_a_run_changes_the_view_there_and_skips_the_prefix_check():
+    before = unbuilt_selection(count=9, built=[0])
+    after = unbuilt_selection(count=9, built=[0, 4])  # a leaf inside the run is built
+    assert pt.history_lines(after.rendered)[1:] == (
+        run_line(1, 3), f"4+1|{T1} t4", run_line(5, 8)
+    )  # fmt: skip
+    report = pt.check_selection(after, previous=before)
+    assert report.ok and not report.cache_checked
+
+
+def test_a_fresh_backfill_of_ten_thousand_messages_fits_the_view_bound():
+    count, high = 10_000, 128000
+    sel = unbuilt_selection(count=count)
+    report = pt.check_selection(sel)
+    assert report.ok, report.violations
+    assert pt.history_lines(sel.rendered) == (run_line(0, count - 1),)
+    assert report.rendered_bytes <= 2 * high + 4096
+    assert report.wait_bytes < 100 and report.summary_bytes == 0
+    # a conversation that owns the tail: its positions are verbatim and split the run
+    own = tuple(range(count - 6, count))
+    sel = unbuilt_selection(
+        count=count,
+        own_positions=own,
+        exchange_starts=(0, 3),
+        sizes=(10,) * 6,
+        request=tuple({"role": "user", "content": str(i)} for i in range(6)),
+    )
+    assert pt.check_selection(sel).ok and sel.boundary == 0
+    assert pt.history_lines(sel.rendered) == (run_line(0, count - 7),)
+
+
+def test_runs_are_bounded_by_the_built_parts_and_verbatim_positions_between_them():
+    built = list(range(1, 400, 2))  # every other leaf: the worst alternation
+    sel = unbuilt_selection(count=400, built=built)
+    lines = pt.history_lines(sel.rendered)
+    assert pt.check_selection(sel).ok
+    assert len(lines) == 400  # alternation is the bound: one line per built part or hole
+    assert all(pt.line_span(line) is not None for line in lines)
+    runs = [line for line in lines if ".." in line.split("|", 1)[0]]
+    assert runs == []  # single unbuilt parts keep their own form
+
+
+def test_select_view_pin_keeps_an_earlier_boundary_only_while_it_is_valid():
+    params = scenario(tail_bytes=0)  # fresh boundary: the last retirable exchange start
+    fresh = pt.select_view(**params)
+    allowed = [0, *fresh.exchange_starts[:-1]]
+    assert fresh.boundary == fresh.exchange_starts[-2] > 0
+    pinned = pt.select_view(**params, pin_boundary=allowed[1])
+    assert pinned.boundary == allowed[1] < fresh.boundary
+    assert pt.check_selection(pinned).ok
+    assert pinned.tail == pinned.request[allowed[1] :]
+    # not an exchange start, past the fresh boundary, or None: the fresh boundary wins
+    for pin in (1, fresh.boundary + 3, None, 10**6):
+        assert pt.select_view(**params, pin_boundary=pin).boundary == fresh.boundary
+    unbuilt = pt.select_view(**scenario(tail_bytes=0, built=[0, 1, 2, 3, 4, 5]), pin_boundary=6)
+    assert unbuilt.boundary < 6 and pt.check_selection(unbuilt).ok  # coverage beats the pin
+    with pytest.raises((TypeError, ValueError)):
+        pt.select_view(**params, pin_boundary=True)
+    with pytest.raises((TypeError, ValueError)):
+        pt.select_view(**params, pin_boundary=-1)

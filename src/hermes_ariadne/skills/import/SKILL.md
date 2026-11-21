@@ -46,9 +46,10 @@ Two kinds of things can come out of an import:
    Content must be the original text, not a paraphrase.
    Each result has `tree.estimate` (`calls`, `request_bytes`): the summary calls
    that batch adds. Add them up and tell the user the total. Summaries build in
-   the background and never block the chat; new lines show as "(not summarized
-   yet: zoom it)" until then, and `ariadne_memory_status` reports progress. If a
-   result has `tree.error`, resend the same batch (it is idempotent).
+   the background and never block the chat; unsummarized messages show as "(not
+   summarized yet: zoom it)" or as one range line "first..last|(N messages not
+   summarized yet: search, or zoom an id)" until then, and `ariadne_memory_status`
+   reports progress. If a result has `tree.error`, resend the same batch (it is idempotent).
 5. **Write notes** only for facts that should shape future chats, in your own
    concise words, each with `source: {"kind": "import", "conversation":
    "<id returned by ariadne_import>"}`. Search existing notes first

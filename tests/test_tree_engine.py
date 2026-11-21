@@ -270,10 +270,11 @@ def test_declines_unknown_budget_over_budget_and_unsupported_shapes(home, monkey
 
 
 def test_view_byte_bound_is_explicit(home, monkeypatch):
+    monkeypatch.setattr(tree_engine, "VIEW_OVERHEAD", 0)  # so the fixed text alone is over 400
     world = World(home, monkeypatch, TreeSettings(high=200))
     a = world.engine("chat-a")
     for index in range(30):
-        world.turn(a, "chat-a", f"T{index}")  # unbuilt: 120 WAIT lines
+        world.turn(a, "chat-a", f"T{index}")  # unbuilt: one range line
     b = world.engine("chat-b")
     world.ask("chat-b", "N")
     result, _ = world.select(b, "chat-b", "N")
@@ -665,3 +666,129 @@ def test_leaf_source_takes_the_stored_tag():
     nodes = {Part(0, 0): "abcdef0123456789 ? user: hi"}
     out = pt.render_view(View((Part(0, 0),), 0), nodes, legend, exclude_positions=frozenset())
     assert out.endswith("abcdef0123456789 = T (? .. ?)\n" + pt.CONVERSATIONS_CLOSE)
+
+
+# --------------------------------------------------------------------------- #
+# Unbuilt history stays selectable: runs collapse into one range line
+# --------------------------------------------------------------------------- #
+
+
+def _range_lines(result):
+    return [line for line in pt.history_lines(result[2]["content"]) if ".." in line.split("|")[0]]
+
+
+def test_unbuilt_history_collapses_into_a_range_line_and_selection_succeeds(home, monkeypatch):
+    world = World(home, monkeypatch, TreeSettings(high=200))
+    a = world.engine("chat-a")
+    for index in range(30):
+        world.turn(a, "chat-a", f"T{index}")  # 120 messages, none built
+    b = world.engine("chat-b")
+    world.ask("chat-b", "N")
+    result, _ = world.select(b, "chat-b", "N")
+    assert result is not None, b.get_status()
+    lines = pt.history_lines(result[2]["content"])
+    assert len(lines) <= 2 and _range_lines(result) == [
+        "0..119|(120 messages not summarized yet: search, or zoom an id)"
+    ]
+    selection = b.get_status()["selection"]
+    assert selection["status"] == "selected" and selection["view_parts"] == 120
+    assert selection["rendered_bytes"] <= selection["max_view_bytes"]
+
+
+def test_zoom_accepts_any_position_inside_a_collapsed_run(home, monkeypatch):
+    world = World(home, monkeypatch, TreeSettings(high=200))
+    a = world.engine("chat-a")
+    for index in range(8):
+        world.turn(a, "chat-a", f"T{index}")
+    b = world.engine("chat-b")
+    world.ask("chat-b", "N")
+    result, _ = world.select(b, "chat-b", "N")
+    assert _range_lines(result) == ["0..31|(32 messages not summarized yet: search, or zoom an id)"]
+    exact = call(b, "ariadne_zoom", id=12)  # one message, in full
+    assert exact["ok"] and exact["id"] == 12 and "question T3" in exact["content"]
+    pair = call(b, "ariadne_zoom", id=12, n=2)  # an aligned part inside the run
+    assert [line.split("|")[0] for line in pair["lines"]] == ["12+1", "13+1"]
+    assert all(line.endswith(pt.WAIT) for line in pair["lines"])
+    deep = call(b, "ariadne_zoom", id=16, n=16)
+    assert [line.split("|")[0] for line in deep["lines"]] == ["16+8", "24+8"]
+    assert call(b, "ariadne_zoom", id=31)["ok"]
+    assert call(b, "ariadne_zoom", id=32)["error"] == "not_found"
+    found = call(b, "ariadne_search", query="question T3")
+    assert found["ok"] and [r["id"] for r in found["results"]] == [12]
+
+
+def test_building_inside_a_run_changes_the_view_at_that_run_only(home, monkeypatch):
+    world = World(home, monkeypatch, TreeSettings(high=10**6))
+    a = world.engine("chat-a")
+    for tag in "ABC":
+        world.turn(a, "chat-a", tag)
+    b = world.engine("chat-b")
+    world.ask("chat-b", "N")
+    first, _ = world.select(b, "chat-b", "N")
+    assert _range_lines(first) == ["0..11|(12 messages not summarized yet: search, or zoom an id)"]
+    world.build(a)
+    again, _ = world.select(b, "chat-b", "N")
+    assert again is not None and _range_lines(again) == []
+    assert b.get_status()["selection"]["cache_checked"] is False  # the run itself changed
+
+
+def test_the_view_stays_within_its_bound_while_ten_thousand_messages_are_unbuilt(home, monkeypatch):
+    world = World(home, monkeypatch)
+    a = world.engine("chat-a")
+    world.turn(a, "chat-a", "A")
+    count = 10_000
+    entries = [
+        {
+            "event_id": hashlib.sha256(f"imp-{i}".encode()).hexdigest(),
+            "message_uid": f"imp-{i}",
+            "role": "user" if i % 2 == 0 else "assistant",
+            "date": "2026-01-01",
+            "restricted": False,
+        }
+        for i in range(count)
+    ]
+    world.store().append("imported-chat", entries, origin="import", title="Imported")
+    b = world.engine("chat-b")
+    world.ask("chat-b", "N")
+    result, _ = world.select(b, "chat-b", "N")
+    assert result is not None, b.get_status()
+    total = world.store().count()
+    assert total == count + 4
+    assert _range_lines(result) == [
+        f"0..{total - 1}|({total} messages not summarized yet: search, or zoom an id)"
+    ]
+    selection = b.get_status()["selection"]
+    assert selection["rendered_bytes"] <= selection["max_view_bytes"]
+    again, _ = world.select(b, "chat-b", "N")  # nothing changed: same view, prefix holds
+    assert again is not None and again[2] == result[2]
+    assert b.get_status()["selection"]["cache_checked"] is True
+
+
+def test_the_retirement_count_is_pinned_within_one_tool_loop(home, monkeypatch):
+    world = World(home, monkeypatch, TreeSettings(tail_bytes=0))
+    a = world.engine("chat-a")
+    for tag in "AB":
+        world.turn(a, "chat-a", tag)
+    world.build(a)
+    for tag in "CD":
+        world.turn(a, "chat-a", tag)  # appended, not built yet
+    world.ask("chat-a", "E")
+    first, request = world.select(a, "chat-a", "E")
+    assert assert_shape(first, request) == 8  # A and B retire; C and D wait for their summaries
+    world.build(a)  # the builder catches up between two calls of the same tool loop
+    second, request = world.select(a, "chat-a", "E")
+    assert assert_shape(second, request) == 8  # same incoming message: the count does not move
+    assert second[2] == first[2]  # the very same view: the cache prefix did not move
+    assert a.get_status()["selection"]["cache_checked"] is True
+    # a tool round of the same exchange keeps it too
+    world.db.rows += rows_for("chat-a", "E", complete=False)[1:]
+    history = restored(world.history_rows("chat-a"))
+    third, request = world.select(a, "chat-a", "E", history=history)
+    assert assert_shape(third, request) == 8
+    # the next user message is a new loop: now C and D may retire
+    world.db.rows += rows_for("chat-a", "E")[3:]
+    world.complete(a, "chat-a", "E")
+    world.build(a)
+    world.ask("chat-a", "F")
+    fourth, request = world.select(a, "chat-a", "F")
+    assert assert_shape(fourth, request) > 8
