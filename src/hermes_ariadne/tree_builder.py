@@ -471,8 +471,8 @@ class TreeBuilder:
             if position in self._nonfit:
                 continue
             part = Part(0, position)
-            if part in nodes or part in blocked:
-                continue
+            if part in nodes or part in blocked or self._cooling(position):
+                continue  # a cooling (unreadable) leaf must not use up the read budget
             if budget == 0:
                 break
             budget -= 1

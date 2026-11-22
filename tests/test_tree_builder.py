@@ -1039,3 +1039,24 @@ def wait_for(check, timeout=5):
     while not check() and time.time() < deadline:
         time.sleep(0.01)
     assert check()
+
+
+def test_unavailable_prefix_does_not_stall_the_fit_sweep(home, log):
+    now = [1000.0]
+    n_missing = tree_builder.SWEEP_READS + 10
+    for n in range(n_missing):  # more than the sweep's read budget, none archived
+        item = {
+            "event_id": hashlib.sha256(f"missing-{n}".encode()).hexdigest(),
+            "message_uid": f"missing-{n}",
+            "role": "user",
+            "date": DATE,
+            "restricted": False,
+        }
+        log.store.append("s1", [item], origin="live")
+    short = log.add("fits without a call")
+    b = TreeBuilder(home, FakeLlm(), TreeSettings(), clock=lambda: now[0])
+    for _ in range(5):
+        b.step()
+        if Part(0, short) in log.store.nodes():
+            break
+    assert Part(0, short) in log.store.nodes()
