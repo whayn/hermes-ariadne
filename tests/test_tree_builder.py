@@ -649,6 +649,76 @@ def wait_idle(b, timeout=10):
     raise AssertionError("worker did not go idle")
 
 
+def test_live_job_is_reserved_before_an_import_when_the_cap_fits_only_one(home, log):
+    imported = log.add(long("i"), session="old", origin="import")
+    live = log.add(long("L"), session="now", origin="live")
+    llm = FakeLlm()
+    b = builder(home, llm, jobs=1, max_jobs=1)  # one logical job in total
+    gate = threading.Event()
+    execute = b._execute
+
+    def delayed(job, *args, **kwargs):
+        if job.lane == "live":
+            assert gate.wait(10)  # the live thread is slow to get going
+        return execute(job, *args, **kwargs)
+
+    b._execute = delayed
+    b.start()
+    try:
+        wait_for(lambda: log.store.jobs())
+        assert set(log.store.jobs()) == {Part(0, live)}  # reserved by the planner, in priority
+    finally:
+        gate.set()
+    wait_idle(b)
+    assert llm.what() == [("leaf", live)]
+    assert Part(0, imported) not in log.store.jobs()
+    b.stop()
+
+
+def test_worker_exit_and_a_late_kick_cannot_lose_a_wake(home, log):
+    log.add("short")  # stored without a call: the worker then goes idle
+    llm = FakeLlm()
+    b = builder(home, llm)
+    late = []
+
+    class Hooked:
+        """A lock that runs a hook right after the worker releases it."""
+
+        def __init__(self, real):
+            self.real, self.hook = real, None
+
+        def __enter__(self):
+            self.real.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self.real.release()
+            hook, self.hook = self.hook, None
+            if hook:
+                hook()
+
+    class Wake(threading.Event):
+        def is_set(self):  # only the worker's idle check asks
+            found = super().is_set()
+            if not found and not late:
+                late.append(True)
+
+                def new_entries_arrive():
+                    log.add(long("n"))
+                    b.kick()  # lands after the idle check, before the worker is gone
+
+                b._lock.hook = new_entries_arrive
+            return found
+
+    b._lock = Hooked(b._lock)
+    b._wake = Wake()
+    b.start()
+    wait_for(lambda: Part(0, 1) in log.store.nodes(), timeout=3)  # the late entry is built
+    wait_idle(b)
+    assert late
+    b.stop()
+
+
 def test_start_kick_stop_never_block_and_the_work_gets_done(home, log):
     for i in range(4):
         log.add(long(str(i)))
@@ -844,10 +914,13 @@ def test_start_on_an_empty_home_creates_nothing(home):
 
 
 def wait_running(b, count=1, timeout=5):
-    deadline = time.time() + timeout
-    while b.status()["running"] < count and time.time() < deadline:
-        time.sleep(0.01)
-    assert b.status()["running"] >= count
+    """``count`` jobs are in flight and their calls have been sent (reservation is past)."""
+
+    def sent():
+        status = b.status()
+        return status["running"] >= count and status["calls"] >= count
+
+    wait_for(sent, timeout)
 
 
 def test_stop_waits_for_an_inflight_call_to_commit_and_schedules_nothing_new(home, log):

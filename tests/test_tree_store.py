@@ -280,7 +280,7 @@ def test_reserve_is_exclusive_and_accounted(home):
     store = TreeStore(home)
     _log(store, 4)
     caps = {"max_jobs": 10, "max_total_bytes": 1000}
-    assert store.reserve(Part(1, 0), 100, "builder-1", **caps) is True
+    assert store.reserve(Part(1, 0), 100, "builder-1", **caps) == 1
     assert store.reserve(Part(1, 0), 100, "builder-2", **caps) is False  # reserved
     assert store.counters() == {"logical_jobs": 1, "request_bytes": 100}
     job = store.jobs()[Part(1, 0)]
@@ -290,7 +290,7 @@ def test_reserve_is_exclusive_and_accounted(home):
         100,
         "builder-1",
     )
-    store.finish(Part(1, 0), "summary")
+    store.finish(Part(1, 0), "summary", owner="builder-1", attempt=1)
     assert store.nodes()[Part(1, 0)] == "summary"
     assert store.jobs()[Part(1, 0)].state == "done"
     assert store.reserve(Part(1, 0), 100, "builder-1", **caps) is False  # done
@@ -300,9 +300,9 @@ def test_reserve_is_exclusive_and_accounted(home):
 def test_reserve_refuses_when_caps_would_be_exceeded(home):
     store = TreeStore(home)
     _log(store, 8)
-    assert store.reserve(Part(0, 0), 60, "b", max_jobs=2, max_total_bytes=100) is True
+    assert store.reserve(Part(0, 0), 60, "b", max_jobs=2, max_total_bytes=100) == 1
     assert store.reserve(Part(0, 1), 41, "b", max_jobs=2, max_total_bytes=100) is False
-    assert store.reserve(Part(0, 1), 40, "b", max_jobs=2, max_total_bytes=100) is True
+    assert store.reserve(Part(0, 1), 40, "b", max_jobs=2, max_total_bytes=100) == 1
     assert store.reserve(Part(0, 2), 0, "b", max_jobs=2, max_total_bytes=100) is False
     assert store.counters() == {"logical_jobs": 2, "request_bytes": 100}
     assert Part(0, 2) not in store.jobs()
@@ -326,10 +326,10 @@ def test_refused_attempt_can_be_reserved_again_and_counts_every_attempt(home):
     store = TreeStore(home)
     _log(store, 2)
     caps = {"max_jobs": 10, "max_total_bytes": 1000}
-    assert store.reserve(Part(0, 0), 50, "b", **caps)
-    store.mark(Part(0, 0), "refused", "over_length")
+    assert store.reserve(Part(0, 0), 50, "b", **caps) == 1
+    store.mark(Part(0, 0), "refused", "over_length", owner="b", attempt=1)
     assert store.jobs()[Part(0, 0)].error_type == "over_length"
-    assert store.reserve(Part(0, 0), 70, "b", **caps)
+    assert store.reserve(Part(0, 0), 70, "b", **caps) == 2
     job = store.jobs()[Part(0, 0)]
     assert (job.state, job.attempts, job.request_bytes) == ("reserved", 2, 120)
     assert store.counters() == {"logical_jobs": 2, "request_bytes": 120}
@@ -341,12 +341,12 @@ def test_uncertain_job_stays_blocked_until_retry(home):
     caps = {"max_jobs": 10, "max_total_bytes": 1000}
     assert store.reserve(Part(0, 0), 10, "b", **caps)
     assert store.reserve(Part(0, 1), 10, "b", **caps)
-    store.mark(Part(0, 0), "uncertain", "TimeoutError")
-    store.mark(Part(0, 1), "uncertain", "ConnectionError")
+    store.mark(Part(0, 0), "uncertain", "TimeoutError", owner="b", attempt=1)
+    store.mark(Part(0, 1), "uncertain", "ConnectionError", owner="b", attempt=1)
     assert store.reserve(Part(0, 0), 10, "b", **caps) is False  # never resubmitted
     assert store.retry([Part(0, 0)]) == [Part(0, 0)]
     assert store.jobs()[Part(0, 1)].state == "uncertain"
-    assert store.reserve(Part(0, 0), 10, "b", **caps) is True
+    assert store.reserve(Part(0, 0), 10, "b", **caps) == 2
     assert store.retry() == [Part(0, 1)]  # all uncertain jobs
     assert store.retry() == []
     assert store.counters() == {"logical_jobs": 3, "request_bytes": 30}  # never decrease
@@ -356,15 +356,15 @@ def test_mark_and_finish_require_a_reservation(home):
     store = TreeStore(home)
     _log(store, 2)
     with pytest.raises(ValueError):
-        store.finish(Part(0, 0), "never reserved")
+        store.finish(Part(0, 0), "never reserved", owner="b", attempt=1)
     with pytest.raises(ValueError):
-        store.mark(Part(0, 0), "uncertain", "X")
+        store.mark(Part(0, 0), "uncertain", "X", owner="b", attempt=1)
     store.reserve(Part(0, 0), 1, "b", max_jobs=5, max_total_bytes=5)
     with pytest.raises(ValueError):
-        store.mark(Part(0, 0), "done", None)  # done only through finish()
-    store.mark(Part(0, 0), "uncertain", "X")
+        store.mark(Part(0, 0), "done", None, owner="b", attempt=1)  # only through finish()
+    store.mark(Part(0, 0), "uncertain", "X", owner="b", attempt=1)
     with pytest.raises(ValueError):
-        store.finish(Part(0, 0), "late answer after an ambiguous call")
+        store.finish(Part(0, 0), "late answer after an ambiguous call", owner="b", attempt=1)
     assert dict(store.nodes()) == {}
 
 
@@ -381,6 +381,34 @@ def test_stale_reservations_become_uncertain_never_free(home):
     assert jobs[Part(0, 1)].state == "reserved"
     assert store.reserve(Part(0, 0), 1, "live-owner", **caps) is False
     assert store.stale_reserved({"live-owner"}) == []  # a collection of live owners
+
+
+def test_late_calls_from_a_replaced_reservation_are_fenced(home):
+    store = TreeStore(home)
+    _log(store, 2)
+    caps = {"max_jobs": 10, "max_total_bytes": 1000}
+    part = Part(0, 0)
+    first = store.reserve(part, 10, "old", **caps)
+    assert first == 1
+    assert store.stale_reserved(lambda owner: False) == [part]
+    assert store.retry([part]) == [part]
+    second = store.reserve(part, 10, "new", **caps)
+    assert second == 2
+    # the original worker comes back late: refused, nothing written, new job untouched
+    with pytest.raises(ValueError):
+        store.finish(part, "stale answer", owner="old", attempt=first)
+    with pytest.raises(ValueError):
+        store.mark(part, "uncertain", "Late", owner="old", attempt=first)
+    with pytest.raises(ValueError):  # right attempt, wrong owner
+        store.finish(part, "x", owner="old", attempt=second)
+    with pytest.raises(ValueError):  # right owner, wrong attempt
+        store.mark(part, "refused", "x", owner="new", attempt=first)
+    assert dict(store.nodes()) == {}
+    job = store.jobs()[part]
+    assert (job.state, job.owner, job.attempts) == ("reserved", "new", 2)
+    store.finish(part, "fresh answer", owner="new", attempt=second)
+    assert store.nodes()[part] == "fresh answer"
+    assert store.jobs()[part].state == "done"
 
 
 # -- views --------------------------------------------------------------------------
@@ -545,7 +573,7 @@ def _lost(store, n, *, other=()):
     for i in range(n):
         assert store.reserve(Part(0, i), 10, "dead", **CAPS)
     for i in other:
-        store.mark(Part(0, i), "uncertain", "TimeoutError")
+        store.mark(Part(0, i), "uncertain", "TimeoutError", owner="dead", attempt=1)
     store.stale_reserved(lambda owner: False)
 
 
@@ -569,7 +597,7 @@ def test_rearmed_job_is_reserved_again_as_a_new_charged_reservation(home):
     _lost(store, 1)
     assert store.reserve(Part(0, 0), 10, "b", **CAPS) is False  # blocked until re-armed
     store.rearm_lost(1)
-    assert store.reserve(Part(0, 0), 10, "b", **CAPS) is True
+    assert store.reserve(Part(0, 0), 10, "b", **CAPS) == 2
     job = store.jobs()[Part(0, 0)]
     assert (job.state, job.attempts, job.auto_retries) == ("reserved", 2, 1)
     assert store.counters() == {"logical_jobs": 2, "request_bytes": 20}
@@ -737,6 +765,30 @@ def test_backfill_refuses_unsafe_archive_paths(home, tmp_path):
     with pytest.raises(StorageRefused):
         store.backfill(home / "ariadne" / "events.sqlite3")
     assert store.count() == 0
+
+
+def test_backfill_refuses_another_profiles_archive(home, tmp_path):
+    other = tmp_path / "other-home"
+    other.mkdir()
+    os.chmod(other, 0o700)
+    from hermes_ariadne.store import EventStore
+
+    EventStore(other / "ariadne" / "events.sqlite3").ingest(
+        "foreign", [msg("f0", "someone else's chat")], origin="hermes_db"
+    )
+    store = TreeStore(home)
+    with pytest.raises(StorageRefused):
+        store.backfill(other / "ariadne" / "events.sqlite3")
+    with pytest.raises(StorageRefused):  # unresolved spelling of the foreign file
+        store.backfill(home / ".." / other.name / "ariadne" / "events.sqlite3")
+    assert store.count() == 0
+
+
+def test_backfill_accepts_the_home_archive_spelled_indirectly(home):
+    _archive(home).ingest("conv", [msg("m", "hi")], origin="hermes_db")
+    store = TreeStore(home)
+    outcome = store.backfill(home / "ariadne" / ".." / "ariadne" / "events.sqlite3")
+    assert outcome["appended"] == 1
 
 
 def test_backfill_refuses_a_foreign_database(home):
