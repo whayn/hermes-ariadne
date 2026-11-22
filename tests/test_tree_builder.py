@@ -472,6 +472,19 @@ def test_oversized_source_is_clipped_to_the_request_cap(home, log):
     assert log.store.nodes()[Part(0, 0)] == "summary 1"
 
 
+def test_source_with_many_escaped_characters_is_clipped_by_serialized_size(home, log):
+    log.add('"' * 70_000)  # every quote doubles in the request JSON
+    llm = FakeLlm()
+    b = builder(home, llm)  # default settings
+    drain(b)
+    ((messages, _),) = llm.calls
+    size = len(tree_builder._request_json(messages))
+    assert size <= b.settings.max_request_bytes
+    assert log.store.jobs()[Part(0, 0)].request_bytes == size
+    assert "clipped" in messages[1]["content"]
+    assert log.store.nodes()[Part(0, 0)] == "summary 1"
+
+
 def test_missing_message_leaves_the_leaf_pending_and_creates_no_archive(home):
     store = TreeStore(home)
     store.append(
@@ -1019,6 +1032,32 @@ def test_stop_does_not_send_the_over_limit_re_ask(home, log):
     assert len(llm.calls) == 1  # no second ask once stopped
     job = log.store.jobs()[Part(0, 0)]
     assert job.state == "refused" and log.store.nodes() == {}  # reservable again later
+
+
+def test_stop_during_the_re_ask_reservation_sends_no_second_call(home, log):
+    log.add(long())
+    llm = FakeLlm(lambda n, m, k: "y" * 600)  # over node_bytes: asks again
+    b = builder(home, llm)
+    reserve = b._reserve
+    entered, release, count = threading.Event(), threading.Event(), []
+
+    def slow(part, size):
+        count.append(1)
+        if len(count) == 2:  # the re-ask, past its stop check
+            entered.set()
+            release.wait(10)
+        return reserve(part, size)
+
+    b._reserve = slow
+    b.start()
+    assert entered.wait(10)
+    b.stop(timeout=0)
+    release.set()
+    wait_for(lambda: b.status()["running"] == 0)
+    time.sleep(0.2)
+    assert len(llm.calls) == 1  # the reserved re-ask was released, not sent
+    job = log.store.jobs()[Part(0, 0)]
+    assert job.state == "refused" and log.store.nodes() == {}
 
 
 def test_a_job_launched_after_stop_is_never_sent_or_reserved(home, log):
