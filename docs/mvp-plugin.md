@@ -7,7 +7,7 @@ One Hermes plugin, `ariadne`, that you select in **both** settings slots:
 | Memory provider | `memory.provider: ariadne` | Profile notes (`ariadne_notes`), one-way mirror of built-in memory writes, recall of relevant notes each turn, `ariadne_import` for archiving conversations |
 | Context engine | `context.engine: ariadne` | One summary tree per profile over all primary conversations; each request carries the tree view plus this chat's recent messages; tools `ariadne_zoom`, `ariadne_search`, `ariadne_memory_status` |
 
-Status: **experimental prerelease; use a dedicated development profile**. The
+Status: **experimental prerelease (v0.3.0); use a dedicated development profile**. The
 tree (#54) replaces the v0.2 rolling summary and past-conversation index. The
 dev-profile ship gate with a real model (one provider) is in
 [Ship gate](#ship-gate); read [Limitations](#limitations) and
