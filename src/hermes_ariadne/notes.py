@@ -168,6 +168,11 @@ def conversation_fields(*, title=None, preview=None, summary=None, source=None):
 class NoteStore:
     """Short-lived connections per operation; safe to share across threads."""
 
+    # Per-store names inside the shared ``ariadne`` directory (``tree_store`` reuses
+    # this admission with its own lock and temporaries).
+    _LOCK_NAME = ".notes.lock"
+    _INIT_PREFIX = ".notes-init-"
+
     def __init__(self, home):
         self.home = Path(home)
         self.directory = self.home / "ariadne"
@@ -205,7 +210,7 @@ class NoteStore:
     @contextmanager
     def _init_lock(self):
         """Serialize initialization and leftover cleanup across threads and processes."""
-        lock = self.directory / ".notes.lock"
+        lock = self.directory / self._LOCK_NAME
         if lock.is_symlink():
             raise StorageRefused("ariadne paths must not be symlinks")
         fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -233,7 +238,7 @@ class NoteStore:
             published = os.lstat(self.path)
         except FileNotFoundError:
             published = None
-        for leftover in self.directory.glob(".notes-init-*"):
+        for leftover in self.directory.glob(self._INIT_PREFIX + "*"):
             info = leftover.lstat()
             residual = (
                 published is not None
@@ -245,7 +250,7 @@ class NoteStore:
             leftover.unlink()
 
     def _initialize(self):
-        fd, name = tempfile.mkstemp(prefix=".notes-init-", dir=self.directory)
+        fd, name = tempfile.mkstemp(prefix=self._INIT_PREFIX, dir=self.directory)
         os.close(fd)
         try:
             conn = sqlite3.connect(name)
