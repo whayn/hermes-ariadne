@@ -865,3 +865,46 @@ def test_log_entry_for_matches_the_backfill_rules():
     }
     restricted = {"role": "user", "message_uid": "u", "data_use": ["x"]}
     assert log_entry_for(event, restricted)["restricted"] is True
+
+
+# -- lossless identifiers -----------------------------------------------------------
+
+
+def test_backfill_keeps_lone_surrogate_uids_exact(home):
+    archive = _archive(home)
+    uid = "uid-\ud800"
+    archive.ingest("conv", [msg(uid, "x"), msg("plain", "y")], origin="hook")
+    store = TreeStore(home)
+    assert store.backfill(home / "ariadne" / "events.sqlite3")["appended"] == 2
+    assert [r.message_uid for r in store.entries(0, 10)] == [uid, "plain"]
+    assert store.backfill(home / "ariadne" / "events.sqlite3")["appended"] == 0
+
+
+def test_append_keeps_lone_surrogate_text_exact_and_idempotent(home):
+    store = TreeStore(home)
+    sid, uid, date = "sess-\udfff", "uid-\ud800", "2026-\ud800"
+    item = {**entry("a"), "message_uid": uid, "date": date}
+    assert store.append(sid, [item], origin="live", title="t\ud800", source="s\udc00") == [0]
+    assert store.append(sid, [item], origin="live") == [0]
+    row = store.entries(0, 1)[0]
+    assert (row.session_id, row.message_uid, row.date) == (sid, uid, date)
+    legend = TreeStore(home).sessions()
+    assert list(legend) == [sid]
+    assert (legend[sid].title, legend[sid].source) == ("t\ud800", "s\udc00")
+
+
+def test_plain_text_rows_stay_text_and_still_read(home):
+    store = TreeStore(home)
+    store.append("s", [entry("a", date="2026-01-01")], origin="live", title="T", source="cli")
+    conn = sqlite3.connect(home / "ariadne" / "tree.sqlite3")
+    kinds = conn.execute(
+        "SELECT typeof(session_id),typeof(message_uid),typeof(date) FROM log"
+    ).fetchone()
+    assert kinds == ("text", "text", "text")
+    assert conn.execute("SELECT typeof(title),typeof(source) FROM sessions").fetchone() == (
+        "text",
+        "text",
+    )
+    conn.close()
+    row = TreeStore(home).entries(0, 1)[0]
+    assert (row.session_id, row.message_uid, row.date) == ("s", "uid-a", "2026-01-01")
