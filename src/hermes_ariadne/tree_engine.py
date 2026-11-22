@@ -78,9 +78,19 @@ A session is primary when SessionDB knows it and its ``source`` is not ``subagen
 One ``TreeStore`` + ``TreeBuilder`` per Hermes home per process, shared by every
 engine clone and the memory provider through a registry kept in ``sys.modules`` (the
 host may load this package twice under different module names). The first engine
-of a home (when its session is primary) backfills the log from the archive once,
-excluding subagent/cron sessions (and archive sessions SessionDB does not know,
-unless they are imports); live appends wait until that backfill has completed, then
+of a home (when its session is primary) reconciles the log with the archive on a
+background thread, at every process start: it appends archived rows of POSITIVELY
+classified sessions (primary per SessionDB, plus imports) that the log misses, so a crash
+between archiving and appending is repaired even for a session that never speaks again.
+Admission is an allowlist (``include_sessions``): subagent/cron sessions, sessions
+SessionDB does not know (unless imports) and sessions archived after the classification
+snapshot are never admitted; the next reconcile classifies them. The reconcile is
+incremental: the tree store keeps an archive-rowid high-water mark (``reconciled``)
+that only moves up to the classification snapshot and stops below the first session
+that could not be classified yet, so later starts read only the rows archived since
+(a session SessionDB never learns keeps the mark below its rows: their sessions are
+rescanned each start, idempotently, which is bounded by the archive size). The first
+run reads everything. Live appends wait until the reconcile has completed, then
 catch up (appends are idempotent and every turn appends all missing active rows).
 
 Waiting for in-flight summaries (``tree.exit_wait``): a turn never blocks on the builder.
@@ -279,18 +289,21 @@ class _Home:
         archive = Path(self.home) / "ariadne" / "events.sqlite3"
         try:
             backfilled = self.store.backfilled()
-            if not backfilled and archive.is_file():
-                included, excluded = _classify_archive(self.home, db)
+            if archive.is_file():
+                mark = self.store.reconciled()
+                included, _excluded, floor = _classify_archive(self.home, db, mark)
                 titles = _titles(self.home, db, included)
-                self.store.backfill(archive, exclude_sessions=excluded, titles=titles)
+                self.store.backfill(
+                    archive, include_sessions=included, after_rowid=mark, titles=titles
+                )
+                self.store.mark_reconciled(floor)
             while True:  # catch up the primary sessions whose turns were deferred meanwhile
                 with self.lock:
                     pending, self.deferred = self.deferred, set()
                 if pending:
                     if archive.is_file():
-                        others = _archive_sessions(self.home) - pending
                         titles = _titles(self.home, db, pending)
-                        self.store.backfill(archive, exclude_sessions=others, titles=titles)
+                        self.store.backfill(archive, include_sessions=pending, titles=titles)
                     continue
                 if not backfilled:
                     # Marked only after the catch-up: an interrupted run is redone (idempotent).
@@ -397,37 +410,39 @@ def _session_row(db, session_id):
     return row if isinstance(row, dict) else None
 
 
-def _archive_sessions(home):
+def _classify_archive(home, db, after_rowid=0):
+    """``(included, excluded, floor)`` for the archive sessions with rows after ``after_rowid``.
+
+    ``included`` are positively classified: SessionDB knows them and their ``source`` is
+    not subagent/cron, or SessionDB does not know them but they are imports. Everything
+    else is ``excluded``. ``floor`` is the archive rowid up to which this snapshot decided
+    every session for good: the snapshot's last rowid, lowered below the first session that
+    is unclassified (SessionDB lacks it or its source), which a later start may classify.
+    """
     conn = ArchiveReader(home)._connect()
     if conn is None:
-        return set()
-    try:
-        return {row[0] for row in conn.execute("SELECT DISTINCT session_id FROM observations")}
-    finally:
-        conn.close()
-
-
-def _classify_archive(home, db):
-    """``(included, excluded)`` archive sessions: subagent/cron and sessions SessionDB
-    does not know (unless they are imports) are excluded."""
-    conn = ArchiveReader(home)._connect()
-    if conn is None:
-        return set(), set()
+        return set(), set(), after_rowid
     try:
         rows = conn.execute(
-            "SELECT session_id, max(origin = 'import') FROM observations GROUP BY session_id"
+            "SELECT session_id, max(origin = 'import'), min(rowid), max(rowid) "
+            "FROM observations GROUP BY session_id"
         ).fetchall()
     finally:
         conn.close()
-    included, excluded = set(), set()
-    for session_id, imported in rows:
+    included, excluded, floor = set(), set(), max((row[3] for row in rows), default=0)
+    for session_id, imported, first, last in rows:
+        if last <= after_rowid:
+            continue  # nothing new: already reconciled
         row = _session_row(db, session_id)
-        if row is not None:
-            primary = row.get("source") not in NON_PRIMARY and isinstance(row.get("source"), str)
+        source = row.get("source") if row is not None else None
+        if isinstance(source, str):
+            primary = source not in NON_PRIMARY
         else:
-            primary = bool(imported)
+            primary = bool(imported) and row is None
+            if not primary:
+                floor = min(floor, first - 1)  # unclassified (not a definitive non-primary)
         (included if primary else excluded).add(session_id)
-    return included, excluded
+    return included, excluded, floor
 
 
 def _titles(home, db, sessions):

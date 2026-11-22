@@ -573,6 +573,27 @@ class TreeStore:
         with self._connect(write=True) as conn:
             conn.execute("INSERT OR REPLACE INTO counters VALUES ('backfill_done', 1)")
 
+    def reconciled(self):
+        """The archive rowid up to which every classified session was reconciled (0: none)."""
+        with self._connect(write=False) as conn:
+            if conn is None:
+                return 0
+            row = conn.execute(
+                "SELECT value FROM counters WHERE name='reconciled_rowid'"
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    def mark_reconciled(self, rowid):
+        """Raise (never lower) the reconciliation high-water mark, durably."""
+        if type(rowid) is not int or rowid < 0:
+            raise ValueError("invalid archive rowid")
+        with self._connect(write=True) as conn:
+            conn.execute(
+                "INSERT INTO counters VALUES ('reconciled_rowid', ?) "
+                "ON CONFLICT(name) DO UPDATE SET value=max(value, excluded.value)",
+                (rowid,),
+            )
+
     # -- summary nodes ---------------------------------------------------------------
 
     def nodes(self):
@@ -846,7 +867,15 @@ class TreeStore:
 
     # -- backfill from the exact archive ---------------------------------------------
 
-    def backfill(self, archive_path, *, exclude_sessions=frozenset(), titles=None):
+    def backfill(
+        self,
+        archive_path,
+        *,
+        exclude_sessions=frozenset(),
+        include_sessions=None,
+        after_rowid=0,
+        titles=None,
+    ):
         """Append every archived conversation's events not yet in the log.
 
         ``archive_path`` must be this store's own home archive,
@@ -859,9 +888,16 @@ class TreeStore:
         ``titles`` or, when None, the notes conversation index. Rerunning appends only
         events that are new since; existing positions never move. Every payload is
         rehashed and the whole archive is read before the first append.
+
+        ``include_sessions`` (None: every session) is an allowlist: only those sessions
+        are read, so a session the caller has not classified (e.g. archived after its
+        classification) is never admitted. ``after_rowid`` (a high-water mark, see
+        ``reconciled``) reads only observations with a larger archive rowid, which bounds
+        a repeated reconciliation to the rows archived since.
         """
         excluded = frozenset(exclude_sessions)
-        plan = self._read_archive(archive_path, excluded)
+        included = None if include_sessions is None else frozenset(include_sessions)
+        plan = self._read_archive(archive_path, excluded, included, after_rowid)
         outcome = {"sessions": 0, "appended": 0, "skipped": 0}
         if not plan:
             return outcome
@@ -883,7 +919,7 @@ class TreeStore:
         outcome["appended"] = self.count() - before
         return outcome
 
-    def _read_archive(self, archive_path, excluded):
+    def _read_archive(self, archive_path, excluded, included=None, after_rowid=0):
         """``[(session_id, [(origin, entry), ...], skipped)]`` from one read snapshot."""
         from .store import APPLICATION_ID as ARCHIVE_ID
 
@@ -900,20 +936,22 @@ class TreeStore:
                 raise StorageRefused("not an ariadne archive")
             conn.execute("BEGIN")
             sessions = conn.execute(
-                "SELECT session_id FROM observations GROUP BY session_id ORDER BY min(rowid)"
+                "SELECT session_id FROM observations WHERE rowid > ? "
+                "GROUP BY session_id ORDER BY min(rowid)",
+                (after_rowid,),
             ).fetchall()
             plan = []
             for (session_id,) in sessions:
-                if session_id in excluded:
+                if session_id in excluded or (included is not None and session_id not in included):
                     continue
                 rows, skipped = [], 0
                 for event_id, payload, origin in conn.execute(
                     "SELECT e.event_id, e.payload_json, (SELECT o2.origin FROM observations o2 "
                     "WHERE o2.event_id=e.event_id AND o2.session_id=o.session_id "
                     "ORDER BY o2.rowid LIMIT 1) FROM events e JOIN observations o "
-                    "USING (event_id) WHERE o.session_id=? GROUP BY e.event_id "
+                    "USING (event_id) WHERE o.session_id=? AND o.rowid > ? GROUP BY e.event_id "
                     "ORDER BY min(o.position), min(o.rowid), e.event_id",
-                    (session_id,),
+                    (session_id, after_rowid),
                 ):
                     if hashlib.sha256(payload).hexdigest() != event_id:
                         raise ValueError("archived event payload does not match its identity")

@@ -718,6 +718,45 @@ def test_backfill_skips_excluded_sessions(home):
     assert list(store.sessions()) == ["primary"]
 
 
+def test_backfill_include_sessions_is_an_allowlist(home):
+    archive = _archive(home)
+    archive.ingest("primary", [msg("p0", "hello")], origin="hermes_db")
+    archive.ingest("newcomer", [msg("n0", "unclassified")], origin="hermes_db")
+    store = TreeStore(home)
+    path = home / "ariadne" / "events.sqlite3"
+    assert store.backfill(path, include_sessions={"primary"})["sessions"] == 1
+    assert list(store.sessions()) == ["primary"]
+    assert store.backfill(path, include_sessions=set())["appended"] == 0
+
+
+def test_backfill_after_rowid_reads_only_later_observations(home):
+    archive = _archive(home)
+    archive.ingest("a", [msg("a0", "one")], origin="hermes_db")
+    store = TreeStore(home)
+    path = home / "ariadne" / "events.sqlite3"
+    store.backfill(path)
+    conn = sqlite3.connect(path)
+    high = conn.execute("SELECT max(rowid) FROM observations").fetchone()[0]
+    conn.close()
+    archive.ingest("a", [msg("a1", "two")], origin="hermes_db")
+    archive.ingest("b", [msg("b0", "three")], origin="hermes_db")
+    outcome = store.backfill(path, after_rowid=high)
+    assert outcome["appended"] == 2
+    assert [r.message_uid for r in store.entries(0, 10)] == ["a0", "a1", "b0"]
+    assert store.backfill(path, after_rowid=high + 10)["appended"] == 0
+
+
+def test_reconciled_mark_is_durable_and_only_rises(home):
+    store = TreeStore(home)
+    assert store.reconciled() == 0
+    store.mark_reconciled(7)
+    store.mark_reconciled(3)
+    assert TreeStore(home).reconciled() == 7
+    assert store.counters() == {"logical_jobs": 0, "request_bytes": 0}
+    with pytest.raises(ValueError):
+        store.mark_reconciled(-1)
+
+
 def test_backfill_marks_restricted_records_without_dropping_them(home):
     archive = _archive(home)
     secret = msg("r0", "do not summarize", data_use=["no_training"])

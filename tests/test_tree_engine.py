@@ -372,6 +372,64 @@ def test_first_start_backfills_the_archive_without_subagent_or_cron(home, monkey
     assert store.count() == count
 
 
+def test_a_restart_recovers_archived_rows_that_were_never_appended(home, monkeypatch):
+    world = World(home, monkeypatch)
+    world.engine("chat-a")  # first start: backfill done, marker persisted
+    assert world.store().backfilled() and world.store().count() == 0
+    # a crash between archiving and appending left an abandoned primary session behind
+    world.db.sessions["lost"] = {"source": "telegram", "title": "Lost"}
+    world.db.sessions["lost-sub"] = {"source": "subagent"}
+    archive = EventStore(home / "ariadne" / "events.sqlite3")
+    archive.ingest("lost", rows_for("lost", "L"), origin="hermes_db")
+    archive.ingest("lost-sub", rows_for("lost-sub", "M"), origin="hermes_db")
+    tree_engine._reset_registry()  # a new process
+    world.engine("chat-b")
+    store = world.store()
+    assert set(store.sessions()) == {"lost"}
+    assert [e.message_uid for e in store.entries(0, store.count())] == ["Lu", "Lo", "Lt", "La"]
+    assert store.sessions()["lost"].title == "Lost"
+    count = store.count()
+    tree_engine._reset_registry()
+    world.engine("chat-c")  # reconciling again appends nothing
+    assert store.count() == count
+
+
+def test_reconcile_does_not_skip_a_session_unknown_at_the_time(home, monkeypatch):
+    world = World(home, monkeypatch)
+    world.engine("chat-a")
+    archive = EventStore(home / "ariadne" / "events.sqlite3")
+    archive.ingest("late", rows_for("late", "L"), origin="hermes_db")  # state.db lags
+    tree_engine._reset_registry()
+    world.engine("chat-b")
+    assert world.store().count() == 0  # not positively classified: not admitted
+    world.db.sessions["late"] = {"source": "cli"}
+    tree_engine._reset_registry()
+    world.engine("chat-c")
+    assert set(world.store().sessions()) == {"late"}  # the next start recovers it
+
+
+def test_a_session_archived_during_classification_is_never_admitted(home, monkeypatch):
+    archive = EventStore(home / "ariadne" / "events.sqlite3")
+    archive.ingest("old-chat", rows_for("old-chat", "O"), origin="hermes_db")
+    world = World(home, monkeypatch)
+    world.db.sessions["old-chat"] = {"source": "cli"}
+    original = tree_engine._classify_archive
+
+    def racing(*args):
+        out = original(*args)
+        world.db.sessions["worker"] = {"source": "subagent"}
+        archive.ingest("worker", rows_for("worker", "W"), origin="hermes_db")  # after the snapshot
+        return out
+
+    monkeypatch.setattr(tree_engine, "_classify_archive", racing)
+    world.engine("new-chat")
+    store = world.store()
+    assert set(store.sessions()) == {"old-chat"} and store.backfilled()
+    tree_engine._reset_registry()
+    world.engine("chat-b")  # a later reconcile classifies it (non-primary) and still skips it
+    assert "worker" not in store.sessions()
+
+
 def test_appends_wait_for_the_backfill_then_catch_up(home, monkeypatch):
     world = World(home, monkeypatch)
     a = world.engine("chat-a")
