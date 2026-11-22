@@ -573,7 +573,7 @@ def _lost(store, n, *, other=()):
     for i in range(n):
         assert store.reserve(Part(0, i), 10, "dead", **CAPS)
     for i in other:
-        store.mark(Part(0, i), "uncertain", "TimeoutError")
+        store.mark(Part(0, i), "uncertain", "TimeoutError", owner="dead", attempt=1)
     store.stale_reserved(lambda owner: False)
 
 
@@ -597,7 +597,7 @@ def test_rearmed_job_is_reserved_again_as_a_new_charged_reservation(home):
     _lost(store, 1)
     assert store.reserve(Part(0, 0), 10, "b", **CAPS) is False  # blocked until re-armed
     store.rearm_lost(1)
-    assert store.reserve(Part(0, 0), 10, "b", **CAPS) is True
+    assert store.reserve(Part(0, 0), 10, "b", **CAPS) == 2
     job = store.jobs()[Part(0, 0)]
     assert (job.state, job.attempts, job.auto_retries) == ("reserved", 2, 1)
     assert store.counters() == {"logical_jobs": 2, "request_bytes": 20}

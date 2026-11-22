@@ -548,26 +548,35 @@ class TreeBuilder:
 
     # -- one job ---------------------------------------------------------------------
 
-    def _reserve(self, part: Part, size: int) -> str:
+    def _reserve(self, part: Part, size: int) -> tuple[str, int]:
+        """``("ok", attempt)`` for the reservation now held, else ``(reason, 0)``."""
         s = self.settings
-        if self._store.reserve(
+        attempt = self._store.reserve(
             part, size, self.owner, max_jobs=s.max_jobs, max_total_bytes=s.max_total_request_bytes
-        ):
+        )
+        if attempt:
             self._caps_exhausted = False
-            return "ok"
+            return "ok", attempt
         counters = self._store.counters()
         if (
             counters["logical_jobs"] + 1 > s.max_jobs
             or counters["request_bytes"] + size > s.max_total_request_bytes
         ):
             self._caps_exhausted = True
-            return "caps"
-        return "taken"  # built, reserved or blocked by another builder meanwhile
+            return "caps", 0
+        return "taken", 0  # built, reserved or blocked by another builder meanwhile
 
-    def _uncertain(self, part: Part, error: str) -> None:
+    def _release(self, part: Part, attempt: int) -> None:
+        """End a reservation whose call was never sent (it may be reserved again)."""
+        try:
+            self._store.mark(part, "refused", "not_sent", owner=self.owner, attempt=attempt)
+        except Exception:  # noqa: BLE001 - it stays reserved; the next start reconciles it
+            pass
+
+    def _uncertain(self, part: Part, error: str, attempt: int) -> None:
         self._last_error = error
         try:
-            self._store.mark(part, "uncertain", error[:100])
+            self._store.mark(part, "uncertain", error[:100], owner=self.owner, attempt=attempt)
         except Exception:  # noqa: BLE001 - it stays reserved; the next start reconciles it
             pass
 
@@ -580,7 +589,7 @@ class TreeBuilder:
             else:
                 self._usage_unknown += 1  # missing or zero usage is unknown, not zero
 
-    def _execute(self, job: _Job, *, worker: bool = False) -> str:
+    def _execute(self, job: _Job, *, worker: bool = False, held: int = 0) -> str:
         """Run one job to an outcome: built, taken, caps, held, stopped, uncertain or error.
 
         ``worker`` jobs obey ``stop()``: once it was called they send no further call.
@@ -588,7 +597,7 @@ class TreeBuilder:
         with self._lock:
             self._inflight[job.part] = job.lane
         try:
-            return self._build(job, worker)
+            return self._build(job, worker, held)
         except Exception as error:  # noqa: BLE001 - a store failure must not kill the worker
             self._last_error = type(error).__name__
             return "error"
@@ -597,24 +606,30 @@ class TreeBuilder:
                 self._inflight.pop(job.part, None)
                 self._idle.notify_all()
 
-    def _build(self, job: _Job, worker: bool = False) -> str:
+    def _build(self, job: _Job, worker: bool = False, held: int = 0) -> str:
         s, part, store = self.settings, job.part, self._store
         source = job.inputs[0] if part.level == 0 else pt.merge_input(*job.inputs)
         lines: list[str] = []
         messages, size = job.messages, job.request_bytes
-        for attempt in range(job.tries):
-            if attempt:
+        for turn in range(job.tries):
+            if turn:
                 request = self._messages(
                     part, job.inputs, job.context, pt.over(lines[-1], s.node_bytes)
                 )
                 if request is None:
                     return "held"
                 messages, size = request
-            if worker and self._stopped:
-                return "stopped"  # nothing is reserved or sent once stop() was called
-            outcome = self._reserve(part, size)
-            if outcome != "ok":
-                return outcome
+            if held and not turn:  # the planner reserved the first attempt, in lane order
+                outcome, attempt = "ok", held
+                if self._stopped:  # reserved but never sent: a definitive, free answer
+                    self._release(part, attempt)
+                    return "stopped"
+            else:
+                if worker and self._stopped:
+                    return "stopped"  # nothing is reserved or sent once stop() was called
+                outcome, attempt = self._reserve(part, size)
+                if outcome != "ok":
+                    return outcome
             with self._lock:
                 self._calls += 1  # counted before the send: an exception is still a call
             try:
@@ -626,26 +641,28 @@ class TreeBuilder:
                     task=TASK,
                 )
             except Exception as error:  # noqa: BLE001 - any failure is an ambiguous outcome
-                self._uncertain(part, type(error).__name__)
+                self._uncertain(part, type(error).__name__, attempt)
                 return "uncertain"
             raw = getattr(result, "text", None)
             if raw is not None and not isinstance(raw, str):
-                self._uncertain(part, "invalid_result")
+                self._uncertain(part, "invalid_result", attempt)
                 return "uncertain"
             self._count_usage(result)
             line = _clean(raw or "")
             if not line:  # a refusal: the best earlier line, else the source clipped
                 best = min(lines, key=utf8_size) if lines else pt.flat(source)
-                store.finish(part, pt.cut(best, s.node_bytes))
+                store.finish(part, pt.cut(best, s.node_bytes), owner=self.owner, attempt=attempt)
                 return "built"
             if utf8_size(line) <= s.node_bytes:
-                store.finish(part, line)
+                store.finish(part, line, owner=self.owner, attempt=attempt)
                 return "built"
             lines.append(line)
-            if attempt + 1 == job.tries:
-                store.finish(part, pt.cut(min(lines, key=utf8_size), s.node_bytes))
+            if turn + 1 == job.tries:
+                best = pt.cut(min(lines, key=utf8_size), s.node_bytes)
+                store.finish(part, best, owner=self.owner, attempt=attempt)
                 return "built"
-            store.mark(part, "refused", "over_limit")  # a definitive answer: ask again
+            # a definitive answer: ask again
+            store.mark(part, "refused", "over_limit", owner=self.owner, attempt=attempt)
         return "held"  # pragma: no cover - the loop always returns
 
     # -- synchronous pass ------------------------------------------------------------
@@ -754,19 +771,41 @@ class TreeBuilder:
             if self._thread is thread and (thread is None or not thread.is_alive()):
                 self._thread = None
 
-    def _launch(self, job: _Job) -> None:
+    def _launch(self, job: _Job) -> str:
+        """Reserve ``job``'s first attempt here, in plan order, then run it on a thread.
+
+        Reserving in the planning thread (not in each job thread) is what lets the live
+        lane take a scarce job/byte cap before an import: ``plan.jobs`` is live first.
+        """
         with self._lock:
             if self._stopped:
-                return  # the worker was planning when stop() came
+                return "stopped"  # the worker was planning when stop() came
             self._inflight[job.part] = job.lane
-        context = contextvars.copy_context()
-        threading.Thread(
-            target=context.run, args=(self._job_thread, job), name="ariadne-tree-job", daemon=True
-        ).start()
-
-    def _job_thread(self, job: _Job) -> None:
+        outcome, held = "error", 0
         try:
-            outcome = self._execute(job, worker=True)
+            outcome, held = self._reserve(job.part, job.request_bytes)
+            if outcome == "ok":
+                context = contextvars.copy_context()
+                threading.Thread(
+                    target=context.run,
+                    args=(self._job_thread, job, held),
+                    name="ariadne-tree-job",
+                    daemon=True,
+                ).start()
+                return "ok"
+        except Exception as error:  # noqa: BLE001 - a store or thread failure
+            self._last_error = type(error).__name__
+            outcome = "error"
+            if held:
+                self._release(job.part, held)
+        with self._idle:
+            self._inflight.pop(job.part, None)
+            self._idle.notify_all()
+        return outcome
+
+    def _job_thread(self, job: _Job, held: int) -> None:
+        try:
+            outcome = self._execute(job, worker=True, held=held)
             if outcome in ("caps", "error"):
                 self._stalled = True
         finally:
@@ -790,13 +829,23 @@ class TreeBuilder:
                         plan = self._plan(room)
                     fits = plan.fits
                     for job in plan.jobs:
-                        self._launch(job)
-                        launched += 1
+                        outcome = self._launch(job)
+                        if outcome == "ok":
+                            launched += 1
+                        elif outcome in ("caps", "error"):
+                            self._stalled = True  # as step(): stop at a refusing cap
+                            break
+                        elif outcome == "stopped":
+                            break
                 with self._lock:
                     busy = bool(self._inflight)
                 if not (launched or fits or busy):
                     with self._lock:
                         if not self._wake.is_set():
+                            # Retire under the lock kick() takes: a later kick sees no
+                            # worker and starts one; an earlier one is seen just above.
+                            if self._thread is threading.current_thread():
+                                self._thread = None
                             return
                     continue
                 if not fits:
