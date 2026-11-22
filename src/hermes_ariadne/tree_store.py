@@ -261,12 +261,15 @@ def _insert_node(conn, part, text):
     )
 
 
-def _require_reserved(conn, part):
+def _require_reserved(conn, part, owner, attempt):
+    """The job must still be in the exact reservation (owner, attempt) the caller holds."""
     row = conn.execute(
-        "SELECT state FROM jobs WHERE level=? AND idx=?", (part.level, part.index)
+        "SELECT state,owner,attempts FROM jobs WHERE level=? AND idx=?", (part.level, part.index)
     ).fetchone()
     if row is None or row[0] != "reserved":
         raise ValueError("job is not reserved")
+    if type(attempt) is not int or row[1] != owner or row[2] != attempt:
+        raise ValueError("job is reserved by another attempt")
 
 
 class TreeStore:
@@ -490,7 +493,9 @@ class TreeStore:
         Atomic with the logical counters: refused when the part is already built,
         reserved, done or uncertain, or when one more job or ``request_bytes`` more
         would exceed ``max_jobs`` / ``max_total_bytes``. Each reservation is one
-        attempt; counters only ever grow.
+        attempt; counters only ever grow. Returns the new attempt number (always
+        positive); ``finish``/``mark`` must present it with the same ``owner`` so a
+        late caller from a replaced reservation can never settle the new one.
         """
         _part(part)
         for name, value in (
@@ -531,30 +536,35 @@ class TreeStore:
             conn.execute(
                 "UPDATE counters SET value=value+? WHERE name='request_bytes'", (request_bytes,)
             )
-            return True
+            return conn.execute(
+                "SELECT attempts FROM jobs WHERE level=? AND idx=?", (part.level, part.index)
+            ).fetchone()[0]
 
-    def finish(self, part, text):
-        """Record a reserved job's accepted text: store the node and mark it done."""
+    def finish(self, part, text, *, owner, attempt):
+        """Record a reserved job's accepted text: store the node and mark it done.
+
+        Fenced to the reservation (``owner``, ``attempt``) ``reserve`` returned.
+        """
         _part(part)
         text = _node_text(text)
         with self._connect(write=True) as conn:
-            _require_reserved(conn, part)
+            _require_reserved(conn, part, owner, attempt)
             _insert_node(conn, part, text)
             conn.execute(
                 "UPDATE jobs SET state='done', finished_at=? WHERE level=? AND idx=?",
                 (time.time(), part.level, part.index),
             )
 
-    def mark(self, part, state, error_type):
+    def mark(self, part, state, error_type, *, owner, attempt):
         """End a reserved job without a node: ``uncertain`` (ambiguous call, blocked
         until ``retry``) or ``refused`` (definitive answer not accepted; may be
-        reserved again as a new attempt)."""
+        reserved again as a new attempt). Fenced like ``finish``."""
         _part(part)
         if state not in ("uncertain", "refused"):
             raise ValueError("a job can only be marked uncertain or refused")
         error_type = _error_type(error_type)
         with self._connect(write=True) as conn:
-            _require_reserved(conn, part)
+            _require_reserved(conn, part, owner, attempt)
             conn.execute(
                 "UPDATE jobs SET state=?, error_type=?, finished_at=? WHERE level=? AND idx=?",
                 (state, error_type, time.time(), part.level, part.index),
@@ -667,8 +677,10 @@ class TreeStore:
     def backfill(self, archive_path, *, exclude_sessions=frozenset(), titles=None):
         """Append every archived conversation's events not yet in the log.
 
-        ``archive_path`` must be a Hermes home's ``ariadne/events.sqlite3``; it gets
-        the archive reader's admission and is opened read-only. Conversations are
+        ``archive_path`` must be this store's own home archive,
+        ``<home>/ariadne/events.sqlite3`` (compared after resolution; any other path,
+        e.g. another profile's archive, is refused). It gets the archive reader's
+        admission and is opened read-only. Conversations are
         taken in first-observation order (lowest observation rowid), each one's
         events in observation-position order. ``exclude_sessions`` (subagent/cron
         sessions, decided by the caller from state.db) are skipped. Titles come from
@@ -705,12 +717,9 @@ class TreeStore:
         from .store import APPLICATION_ID as ARCHIVE_ID
 
         archive = Path(archive_path)
-        if (
-            not archive.is_absolute()
-            or archive.name != "events.sqlite3"
-            or archive.parent.name != "ariadne"
-        ):
-            raise StorageRefused("backfill reads a Hermes home's ariadne/events.sqlite3")
+        own = self.directory / "events.sqlite3"
+        if not archive.is_absolute() or archive.resolve() != own.resolve():
+            raise StorageRefused("backfill reads only this home's ariadne/events.sqlite3")
         _admit_archive(archive)
         if not archive.is_file():
             return []
