@@ -141,9 +141,43 @@ _LOG_COLUMNS = "position,session_id,event_id,message_uid,role,date,origin,restri
 _SESSION_COLUMNS = "session_id,tag,title,source,origin,first_position,last_position"
 
 
+def _bind(value):
+    """Reversible SQLite binding of an archived string.
+
+    Text that is valid UTF-8 stays TEXT (existing rows keep their shape). A value with a
+    lone UTF-16 surrogate, which SQLite cannot bind as text, becomes a BLOB of its
+    UTF-8/surrogatepass bytes; ``_text`` restores the exact string.
+    """
+    if value is None:
+        return None
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return value.encode("utf-8", "surrogatepass")
+    return value
+
+
+def _text(value):
+    return value.decode("utf-8", "surrogatepass") if isinstance(value, bytes) else value
+
+
 def _log_entry(row):
-    *rest, restricted = row
-    return LogEntry(*rest, bool(restricted))
+    position, session_id, event_id, uid, role, date, origin, restricted = row
+    return LogEntry(
+        position,
+        _text(session_id),
+        event_id,
+        _text(uid),
+        role,
+        _text(date),
+        origin,
+        bool(restricted),
+    )
+
+
+def _session_row(row):
+    session_id, tag, title, source, *rest = row
+    return Session(_text(session_id), tag, _text(title), _text(source), *rest)
 
 
 def _session_id(value):
@@ -379,35 +413,44 @@ class TreeStore:
             for event_id, uid, role, date, restricted in rows:
                 found = conn.execute(
                     "SELECT position FROM log WHERE session_id=? AND event_id=?",
-                    (session_id, event_id),
+                    (_bind(session_id), event_id),
                 ).fetchone()
                 if found:
                     positions.append(found[0])
                     continue
                 conn.execute(
                     "INSERT INTO log VALUES(?,?,?,?,?,?,?,?)",
-                    (next_position, session_id, uid, event_id, role, date, origin, restricted),
+                    (
+                        next_position,
+                        _bind(session_id),
+                        _bind(uid),
+                        event_id,
+                        role,
+                        _bind(date),
+                        origin,
+                        restricted,
+                    ),
                 )
                 positions.append(next_position)
                 added.append(next_position)
                 next_position += 1
             known = conn.execute(
-                "SELECT 1 FROM sessions WHERE session_id=?", (session_id,)
+                "SELECT 1 FROM sessions WHERE session_id=?", (_bind(session_id),)
             ).fetchone()
             if known:
                 conn.execute(
                     "UPDATE sessions SET title=coalesce(?,title), source=coalesce(?,source), "
                     "last_position=max(last_position, ?) WHERE session_id=?",
-                    (title, source, max(added, default=-1), session_id),
+                    (_bind(title), _bind(source), max(added, default=-1), _bind(session_id)),
                 )
             elif added:
                 conn.execute(
                     "INSERT INTO sessions VALUES(?,?,?,?,?,?,?)",
                     (
-                        session_id,
+                        _bind(session_id),
                         _tag(conn, session_id),
-                        title,
-                        source,
+                        _bind(title),
+                        _bind(source),
                         origin,
                         added[0],
                         added[-1],
@@ -453,7 +496,7 @@ class TreeStore:
                 return MappingProxyType({})
             return MappingProxyType(
                 {
-                    row[0]: Session(*row)
+                    _text(row[0]): _session_row(row)
                     for row in conn.execute(
                         f"SELECT {_SESSION_COLUMNS} FROM sessions ORDER BY first_position"
                     )
