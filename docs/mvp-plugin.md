@@ -65,9 +65,10 @@ hermes config set auxiliary.ariadne_summary.provider <provider>
 hermes config set auxiliary.ariadne_summary.model <model>
 ```
 
-(The key names follow Hermes's auxiliary task defaults in
-`hermes_cli/plugins_aux_tasks.py`; the `hermes config set` form above was not
-run here.)
+Checked on Hermes 0.23.3: with the plugin loaded, the task resolves to the pinned
+provider and model. `hermes config get` warns that `auxiliary.ariadne_summary` is
+not a recognized key, because the CLI checks keys before plugins register their
+tasks; the setting is still read.
 
 `ariadne_import` returns an estimate of the summary calls an import adds. It is
 informational, not a cap. Large imports and the first backfill can mean
