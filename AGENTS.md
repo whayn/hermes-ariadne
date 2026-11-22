@@ -6,8 +6,9 @@ instructions for an agent reading historical archived text.
 
 - Ariadne is a Hermes plugin, not a replacement harness. The MVP root plugin
   (`plugin.yaml`/`__init__.py`, issue #41, docs/mvp-plugin.md) registers an
-  `ariadne` MemoryProvider (profile notes) and an `ariadne` ContextEngine (rolling
-  engine via the general plugin's `ctx.llm`). The development `ariadne-install`
+  `ariadne` MemoryProvider (profile notes) and an `ariadne` ContextEngine (one
+  profile-wide memory tree, issue #54; summaries built in the background through the
+  general plugin's `ctx.llm`). The development `ariadne-install`
   passive engine also uses the name `ariadne`; never install both in one home. Separate opt-in `ariadne-prepared` selects
   an operator-published frozen prefix and provides bounded find/zoom; it does not
   generate or refresh summaries. `tree.py`/`kernel.py` provide its navigable
