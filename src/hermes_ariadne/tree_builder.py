@@ -80,7 +80,7 @@ _MAX_INT = (1 << 31) - 1
 SWEEP_READS = 512  # unclassified leaves read per pass to find the ones that fit
 UNAVAILABLE_RETRY = 30.0  # seconds before an unreadable message is read again
 LINE_RATIO = 15 / 16  # UniiChat measured 460-510 byte lines for a 512 byte node
-_CLIP_ROOM = 96
+_CLIP_STEPS = 40  # bounds the search for a prefix whose serialized request fits
 
 
 # --------------------------------------------------------------------------- #
@@ -435,17 +435,26 @@ class TreeBuilder:
             return None
         text = inputs[0]
         total = utf8_size(text)
-        budget = total - (size - cap) - _CLIP_ROOM
-        for _ in range(8):
-            if budget < nb:
-                return None
+
+        def attempt(budget: int):
             clipped = pt.cut(text, budget) + f" …[clipped to {budget} of {total} bytes]"
-            messages = pt.summary_messages(part, (clipped,), context, nb, note)
-            size = len(_request_json(messages))
-            if size <= cap:
-                return messages, size
-            budget -= size - cap + 16  # escapes made the request longer than the text
-        return None
+            clipped_messages = pt.summary_messages(part, (clipped,), context, nb, note)
+            return clipped_messages, len(_request_json(clipped_messages))
+
+        # JSON escaping makes the request longer than the text by an unknown amount, so
+        # the prefix length is searched against the real serialized size (bounded).
+        low, high = nb, total  # `low` is the smallest prefix worth sending
+        best = None
+        for _ in range(_CLIP_STEPS):
+            if low > high:
+                break
+            budget = (low + high) // 2
+            found = attempt(budget)
+            if found[1] <= cap:
+                best, low = found, budget + 1
+            else:
+                high = budget - 1
+        return best
 
     def _sweep(self, count: int, nodes: dict, blocked) -> int:
         """Store the unbuilt leaves that fit (no call, no reservation); returns how many."""
@@ -638,6 +647,9 @@ class TreeBuilder:
                 outcome, attempt = self._reserve(part, size)
                 if outcome != "ok":
                     return outcome
+                if worker and self._stopped:  # stop() came while reserving: release, don't send
+                    self._release(part, attempt)
+                    return "stopped"
             with self._lock:
                 self._calls += 1  # counted before the send: an exception is still a call
             try:
