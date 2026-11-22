@@ -135,6 +135,7 @@ VIEW_OVERHEAD = 4096  # VIEW_DOC, wrappers; the legend shares the 2 * high allow
 CANDIDATE_TAIL_FACTOR = 16
 ZOOM_CHARS = 8000
 SEARCH_SCAN = 2000
+SEARCH_CHUNK = 500  # sessions per IN list (SQLite's parameter limit is far above)
 SEARCH_LIMIT = 50
 PREVIEW_CHARS = 240
 MAX_QUERY_CHARS = 500
@@ -921,22 +922,33 @@ class TreeAriadneEngine(RollingAriadneEngine):
         if conn is None:
             return _ok(query=query, results=[], truncated=False, restricted_skipped=0)
         try:
-            hits = conn.execute(
-                "SELECT o.session_id, e.event_id FROM events e JOIN observations o "
-                "USING (event_id) WHERE instr(e.search_text, ?) > 0 "
-                "GROUP BY o.session_id, e.event_id LIMIT ?",
-                (search_text(query), SEARCH_SCAN + 1),
-            ).fetchall()
-            truncated = len(hits) > SEARCH_SCAN
-            by_session = {}
-            for session_id, event_id in hits[:SEARCH_SCAN]:
-                by_session.setdefault(session_id, []).append(event_id)
             store = shared.store
+            # Only sessions in the tree count toward the scan (archived subagent/cron
+            # messages are excluded), and each chunk scans newest archive rows first.
+            sessions = sorted(store.sessions())
+            hits, truncated = [], False
+            for start in range(0, len(sessions), SEARCH_CHUNK):
+                chunk = sessions[start : start + SEARCH_CHUNK]
+                marks = ",".join("?" * len(chunk))
+                rows = conn.execute(
+                    "SELECT o.session_id, e.event_id, MAX(e.rowid) AS r FROM events e "
+                    "JOIN observations o USING (event_id) WHERE instr(e.search_text, ?) > 0 "
+                    f"AND o.session_id IN ({marks}) "
+                    "GROUP BY o.session_id, e.event_id ORDER BY r DESC LIMIT ?",
+                    (search_text(query), *chunk, SEARCH_SCAN + 1),
+                ).fetchall()
+                truncated = truncated or len(rows) > SEARCH_SCAN
+                hits.extend(rows[:SEARCH_SCAN])
+            by_session = {}
+            for session_id, event_id, _rowid in hits:
+                by_session.setdefault(session_id, []).append(event_id)
             found = []
             for session_id, event_ids in by_session.items():
                 for event_id, position in store.positions(session_id, event_ids).items():
                     found.append((position, session_id, event_id))
-            found.sort(reverse=True)  # newest first
+            found.sort(reverse=True)  # newest first by global position
+            truncated = truncated or len(found) > SEARCH_SCAN
+            found = found[:SEARCH_SCAN]
             tags = {sid: item[0] for sid, item in store.legend().items()}
             results, restricted = [], 0
             for position, session_id, event_id in found:

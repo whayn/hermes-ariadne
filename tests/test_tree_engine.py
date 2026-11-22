@@ -959,3 +959,17 @@ def test_shutdown_stops_every_home_before_waiting_and_shares_one_deadline(monkey
     assert calls[:2] == [("a", 0.0), ("b", 0.0)]  # everything stops scheduling first
     assert calls[2:4] == [("backfill", 10.0)] * 2
     assert calls[4] == ("a", 0.4) and calls[5] == ("b", 0.0)  # b gets what is left: nothing
+
+
+def test_search_scan_limit_counts_only_tree_messages(home, monkeypatch):
+    # Archived worker messages are not in the tree; they must not use up the scan.
+    monkeypatch.setattr(tree_engine, "SEARCH_SCAN", 3)
+    world = World(home, monkeypatch)
+    a = world.engine("chat-a")
+    world.turn(a, "chat-a", "Zebra")
+    sub = world.engine("worker", source="subagent")
+    for i in range(5):
+        world.turn(sub, "worker", f"ZebraSub{i}")
+    found = call(a, "ariadne_search", query="question Zebra")
+    assert [r["id"] for r in found["results"]] == [0]
+    assert found["truncated"] is False
