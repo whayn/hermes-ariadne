@@ -400,10 +400,14 @@ class TreeBuilder:
         except (TypeError, ValueError):
             raise _Unavailable("source_invalid") from None
 
+    def _cooling(self, position: int) -> bool:
+        """Whether the leaf's source was unreadable and is not due to be read again."""
+        until = self._unavailable.get(position)
+        return until is not None and self._clock() < until
+
     def _source_or_skip(self, position: int) -> str | None:
         """A leaf's source, or None (recorded) while it cannot be read."""
-        until = self._unavailable.get(position)
-        if until is not None and self._clock() < until:
+        if self._cooling(position):
             return None
         try:
             source = self._read_source(position)
@@ -496,7 +500,11 @@ class TreeBuilder:
         by_lane = {lane: [p for p in ready if self._lane(p) == lane] for lane in LANES}
         for lane in LANES:  # live first: an import never takes a live node's place
             for part in by_lane[lane]:
-                if len(picked[lane]) >= room.get(lane, 0) or scanned[lane] >= 8 * s.jobs + 64:
+                if len(picked[lane]) >= room.get(lane, 0):
+                    break
+                if part.level == 0 and self._cooling(part.start):
+                    continue  # unreadable until its retry: free, so it cannot hide later leaves
+                if scanned[lane] >= 8 * s.jobs + 64:
                     break
                 scanned[lane] += 1
                 first = self._first(lane, count, nodes)

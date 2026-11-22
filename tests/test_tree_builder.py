@@ -512,6 +512,29 @@ def test_an_unreadable_message_is_retried_after_a_delay_not_every_pass(home, log
     assert log.store.nodes()[Part(0, 0)].endswith("user: late arrival")
 
 
+def test_unavailable_prefix_does_not_stall_planning_of_later_messages(home, log):
+    now = [1000.0]
+    for n in range(97):  # more than the 8 * jobs + 64 scan allowance, none archived
+        item = {
+            "event_id": hashlib.sha256(f"missing-{n}".encode()).hexdigest(),
+            "message_uid": f"missing-{n}",
+            "role": "user",
+            "date": DATE,
+            "restricted": False,
+        }
+        log.store.append("s1", [item], origin="live")
+    valid = log.add(long())
+    assert valid == 97
+    llm = FakeLlm()
+    b = TreeBuilder(home, llm, TreeSettings(), clock=lambda: now[0])
+    for _ in range(5):  # bounded: the valid message must not wait for the prefix to clear
+        b.step()
+        if llm.calls:
+            break
+    assert llm.what() == [("leaf", valid)]
+    assert Part(0, valid) in log.store.nodes()
+
+
 def test_two_builders_on_one_store_never_call_the_same_node_twice(home, log):
     for i in range(6):
         log.add(long(str(i)))
