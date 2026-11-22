@@ -129,8 +129,8 @@ class TreeSettings:
     tail_bytes: int = 32768
     tries: int = 5
     max_tokens: int = 1024
-    timeout: int = 120
-    exit_wait: int | float = 60
+    timeout: int = 300
+    exit_wait: int | float = 120
     auto_reask_lost: int = 1
 
     def __post_init__(self) -> None:

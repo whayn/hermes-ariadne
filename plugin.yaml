@@ -41,6 +41,6 @@ config_schema:
       tail_bytes: 32768
       tries: 5
       max_tokens: 1024
-      timeout: 120
-      exit_wait: 60
+      timeout: 300
+      exit_wait: 120
       auto_reask_lost: 1

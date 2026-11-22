@@ -131,7 +131,7 @@ def test_settings_defaults_and_validation():
     s = TreeSettings()
     assert (s.high, s.seen_high, s.node_bytes, s.jobs) == (128000, 32000, 512, 4)
     assert (s.max_jobs, s.max_request_bytes, s.max_total_request_bytes) == (100000, 65536, 1 << 30)
-    assert (s.tail_bytes, s.tries, s.timeout) == (32768, 5, 120)
+    assert (s.tail_bytes, s.tries, s.timeout) == (32768, 5, 300)
     assert 0 < s.max_tokens
     for name in ("high", "jobs", "node_bytes", "tries", "max_tokens", "timeout", "max_jobs"):
         for bad in (0, -1, True, 1.5, "4", None):
@@ -143,7 +143,7 @@ def test_settings_defaults_and_validation():
 
 def test_exit_wait_and_auto_reask_lost_defaults_and_validation():
     s = TreeSettings()
-    assert s.exit_wait == 60 and s.auto_reask_lost == 1
+    assert s.exit_wait == 120 and s.auto_reask_lost == 1
     assert TreeSettings(exit_wait=0).exit_wait == 0  # 0 = never wait
     assert TreeSettings(exit_wait=2.5).exit_wait == 2.5  # int or float
     assert TreeSettings(auto_reask_lost=0).auto_reask_lost == 0  # 0 disables
