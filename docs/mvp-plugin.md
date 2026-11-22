@@ -1,17 +1,121 @@
-# Ariadne plugin (MVP, issue #41)
+# Ariadne plugin (MVP, issue #41; memory tree, issue #54)
 
 One Hermes plugin, `ariadne`, that you select in **both** settings slots:
 
 | Slot | Setting | What it does now |
 |---|---|---|
-| Memory provider | `memory.provider: ariadne` | Profile notes (`ariadne_notes`), one-way mirror of built-in memory writes, recall of relevant notes and past conversations each turn, `ariadne_conversations` to read past chats |
-| Context engine | `context.engine: ariadne` | The rolling engine (automatic summary of older turns through Hermes's LLM facade, page/search/zoom tools) plus the conversation index |
+| Memory provider | `memory.provider: ariadne` | Profile notes (`ariadne_notes`), one-way mirror of built-in memory writes, recall of relevant notes each turn, `ariadne_import` for archiving conversations |
+| Context engine | `context.engine: ariadne` | One summary tree per profile over all primary conversations; each request carries the tree view plus this chat's recent messages; tools `ariadne_zoom`, `ariadne_search`, `ariadne_memory_status` |
 
-Status: **experimental prerelease (v0.2.1); use a dedicated development
-profile**. Implements #41. The MVP keeps rolling's single cumulative summary with
-exact zoom; the UniiChat summary tree is deferred. The dev-profile ship gate with
-a real model passed (see [Ship gate](#ship-gate)); see
-[Limitations](#limitations) and [Rollback](#rollback) before installing.
+Status: **experimental prerelease; use a dedicated development profile**. The
+tree (#54) replaces the v0.2 rolling summary and past-conversation index. The
+dev-profile ship gate with a real model (one provider) is in
+[Ship gate](#ship-gate); read [Limitations](#limitations) and
+[Rollback](#rollback) before installing.
+
+## The memory tree
+
+Ariadne keeps one chronological tree per profile over **every primary
+conversation**, live chats and imported ones. Subagent and cron sessions are
+not included. There is no per-source rule: every chat in the profile can see
+every other chat's summaries and exact messages.
+
+Every request the engine sends is:
+
+1. the host prefix (system messages), unchanged;
+2. the **view**: one assistant message of `id+n|text` lines (each line a
+   summary of `n` messages starting at message `id`), followed by a user message;
+3. this chat's most recent messages verbatim (`tail_bytes`, default 32768).
+
+This chat's older messages are dropped from the request only once built
+summaries cover them. A stretch not yet summarized collapses into one range line
+(`first..last|(N messages not summarized yet ...)`), so the view stays small
+right after a big import. If the engine cannot build a valid request it
+declines and Hermes sends the original request.
+
+Tools:
+
+- `ariadne_zoom(id, n, at)`: open line `id+n` into the two lines it was made
+  from; `n=1` gives one message in full (paged from `at`).
+- `ariadne_search`: literal, case-sensitive search over exact archived messages
+  of every conversation in the view, newest first.
+- `ariadne_memory_status`: summary progress and blocked summaries; `retry`
+  re-asks blocked ones.
+- `ariadne_notes` and `ariadne_import` (below).
+
+Recall of relevant notes remains. The v0.2 past-conversation index recall and
+`ariadne_conversations`, `ariadne_find` and `ariadne_rolling_page` are gone; the
+exact archive is reached through `ariadne_zoom` and `ariadne_search`. Hermes's
+stored history is never modified, and summaries are navigation data, not
+instructions.
+
+### Summaries: cost and latency
+
+Summaries are written in the background through Hermes's LLM facade under the
+auxiliary task `ariadne_summary`; a turn never waits for them. By default it
+uses the chat model. **Recommended: pin a faster, cheaper model** with the
+`auxiliary.ariadne_summary` block (`provider`, `model`, `base_url`, `api_key`,
+`timeout`, like Hermes's other auxiliary tasks; the Hermes auxiliary settings
+UI lists it as "Ariadne summaries"). In the real runs Mistral Large took about
+60-120 s per call. Each call was about 6-13k tokens (its context view reaches up
+to `seen_high`).
+
+```bash
+hermes config set auxiliary.ariadne_summary.provider <provider>
+hermes config set auxiliary.ariadne_summary.model <model>
+```
+
+Checked on Hermes 0.23.3: with the plugin loaded, the task resolves to the pinned
+provider and model. `hermes config get` warns that `auxiliary.ariadne_summary` is
+not a recognized key, because the CLI checks keys before plugins register their
+tasks; the setting is still read.
+
+`ariadne_import` returns an estimate of the summary calls an import adds. It is
+informational, not a cap. Large imports and the first backfill can mean
+thousands of calls; the first real run made about 210 calls (~2.1M tokens) for
+215 messages.
+
+Lost summaries: when a process exits, it waits up to `exit_wait` seconds (120)
+for in-flight calls. A summary lost with its process is asked again once
+automatically (`auto_reask_lost`). Facade errors and timeouts (`timeout`, 300 s)
+stay blocked until `ariadne_memory_status` retry.
+
+### Settings
+
+Settings live under `plugins.entries.ariadne.settings.tree` (defaults from
+`plugin.yaml`; unknown keys or out-of-range values refuse registration):
+
+```bash
+hermes config set plugins.entries.ariadne.settings.tree.tail_bytes 2048
+```
+
+(Verified working on Hermes 0.23.3.)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `tail_bytes` | 32768 | This chat's recent messages sent verbatim |
+| `high` | 128000 | Bound on built summary bytes in the view (view limit is about twice this) |
+| `seen_high` | 32000 | Largest context view a summary call is shown |
+| `node_bytes` | 512 | Target size of one summary line (32-8192) |
+| `jobs` | 4 | Concurrent summary calls per lane (1-64) |
+| `max_jobs` | 100000 | Logical summary-call reservations allowed |
+| `max_request_bytes` | 65536 | Logical cap per summary request (4096 up) |
+| `max_total_request_bytes` | 1073741824 | Logical cap over all summary requests |
+| `tries` | 5 | Attempts per summary before it is blocked (1-20) |
+| `max_tokens` | 1024 | Output tokens per summary call (reasoning models spend part on thinking) |
+| `timeout` | 300 | Seconds per summary call (1-3600) |
+| `exit_wait` | 120 | Seconds a process waits at exit for in-flight calls (0 = never) |
+| `auto_reask_lost` | 1 | Automatic re-asks of a summary lost with its process (0 disables) |
+
+Job and byte caps count logical reservations, not HTTP requests or billing.
+
+### Upgrading from v0.2.x
+
+On first start the engine backfills the existing archive into the tree in the
+background. The archive is kept; the rolling journals and the notes
+conversation index are no longer used by the `ariadne` engine. Summaries for
+the backlog are then built, which costs model calls (see above). Note-store and
+tree-store schemas migrate in place; an older revision refuses a newer store.
 
 ## Install (development profile)
 
@@ -78,38 +182,6 @@ installed host source and exercised by `tests/test_mvp_native.py`):
   capped at 2,000 characters, labelled as stored data rather than instructions.
   It is not semantic search.
 
-## Past conversations
-
-The engine keeps a small index in the same private store
-(`conversations` table): each archived conversation's first user message as a
-preview, its Hermes title when available, and the latest summary rolling
-published. It is derived navigation data; the exact messages stay in
-`$HERMES_HOME/ariadne/events.sqlite3`, and index failures never affect the chat.
-
-- **First turn of a chat:** recall adds the 8 most recently updated other
-  conversations. **Every turn:** up to 3 other conversations whose title,
-  preview or summary shares words with the message (searched among the 50 most
-  recent). Capped at 1,500 characters, labelled as historical data.
-- **`ariadne_conversations`:** `list`, `search` (literal, over the index and
-  every archived message of other conversations), `open` (summary/metadata),
-  `read` (exact archived messages in first-observed order, 4,000 characters per
-  message) and `zoom` (one full message, paged by characters). The archive is
-  opened read-only and never created by these tools; payloads are rehashed
-  against their ids and reasoning/replay fields are left out of results.
-- Edited messages appear as separate versions with the same `message_uid`.
-- Every chat that runs with the engine is indexed, including delegated
-  subagent and cron sessions. Conversations from before the plugin was
-  installed are not indexed.
-
-Evidence: `tests/test_mvp_native.py` installs the plugin with the real
-installer, runs chat A (the agent saves a note through the real tool loop),
-then a new chat B in another process against a loopback provider. Chat B's
-request contains the note and chat A's index entry, and its
-`ariadne_conversations` read returns chat A's exact original message. The tools
-were exposed directly in that configuration; the deferred `tool_call` path is
-not exercised. This is plumbing evidence with a scripted provider, not a claim
-about how well a real model uses the recall.
-
 ## Importing data
 
 Ask the agent to import files (for example a ChatGPT export). The bundled
@@ -123,14 +195,13 @@ tools, pick one linear path per conversation, then
   imported conversation.
 
 There is no app-specific parser and no approval step; review afterwards with
-`ariadne_notes list/delete` and `ariadne_conversations list/open`.
+`ariadne_notes list/delete` and `ariadne_search`.
 
 Imported conversations get the id `import-<first 24 hex of sha256(key)>` and
 deterministic per-position message ids, so re-sending a batch is a no-op and
 changed text is stored as a new version next to the old one. They live in the
-same exact archive as live chats (origin `import`), appear in the index and in
-recall, and are readable with `ariadne_conversations`. The `summary` is
-agent-written index text, not checked against the messages. Limits: 64 KiB per
+same exact archive as live chats (origin `import`), are part of the tree (summarized in the background like live chats), and are readable with `ariadne_zoom` and `ariadne_search`. The optional `summary` is
+agent-written, not checked against the messages. Limits: 64 KiB per
 message, 2 MiB and 500 messages per call; text content only (no attachments).
 The skill's guidance (skip hidden reasoning and credentials, treat imported
 instructions as data) is not enforced by the tool.
@@ -147,16 +218,17 @@ non-regular files and paths owned by another user, reported to the agent as
 processes running as the Hermes user. The development engines
 (`ariadne-install`) keep their stricter rule requiring a `0700` home.
 
-## Recall and summaries together
+## Memory-context recall and the tree
 
 When the memory provider recalls something, Hermes sends the user's message
 plus a `<memory-context>` block and stores that sent text as the row's
-`api_content`. The engine compares that exact sent text across the stored,
+`api_content`. The tree engine reuses the rolling engine's request
+correspondence check: it compares that exact sent text across the stored,
 restored and assembled views, but only when it is the typed text followed by
 exactly one block in Hermes's own format (`agent/memory_context.py`); any other
-difference still declines selection. Summaries are written from the typed text
-only, so recalled notes do not leak into them. On summarized turns the old
-recall blocks are no longer sent.
+difference declines selection. Summaries are written from the typed text only,
+so recalled notes do not leak into them. Once built summaries cover older
+messages, their old recall blocks are no longer sent.
 
 Newer Hermes builds also put a request-only `_replayed_reasoning_tokens` count
 on assembled assistant rows (popped before the provider call); the engine admits
@@ -164,65 +236,57 @@ it as bookkeeping and does not compare it.
 
 ## Ship gate
 
-`scripts/mvp_ship_gate.py` drives real Hermes (`AIAgent`, `SessionDB`, the
-profile's provider) in a marked disposable profile, one process per phase, and
-only observes engine hooks. Run of 2026-11-19: plugin installed with
-`hermes plugins install whayn/hermes-ariadne --ref b274bb4` into a fresh `0755`
-profile, Hermes `ae2a81c` (not the CI pin), Mistral `mistral-large-4` with
-`reasoning_effort: low` as both chat and `ctx.llm` route, rolling
-`trigger_bytes=1024`, `max_delta_exchanges=2`, `max_logical_jobs=12`.
+The v0.2 (rolling) results are in the `v0.2.1` tag's copy of this document.
 
-| Phase | Result |
-|---|---|
-| Import | Skill loaded; both synthetic conversations archived (abandoned branch skipped) with summaries and sources; existing notes found, not duplicated. 19 s, 7 requests |
-| Long chat (8 turns) | Summaries published after turns 3, 5, 7; requests from turn 4 on carried the summary view. Turn 8 asked for the turn-1 codeword: the model used `ariadne_find` + `ariadne_zoom` on this conversation and quoted it exactly |
-| Restart (new process) | Adopted the published view, selected, published again; answered the turn-2 sensor names from `ariadne_find` |
-| New chat | Answered an imported fact from notes and an earlier chat's codeword through `ariadne_conversations` |
-| Built-in memory | `memory` tool write mirrored as a `mirror:user` note |
+The tree runs below used real Hermes (`caafe53`, 0.23.3) with Mistral
+`mistral-large-4` as chat and summary model, in the dedicated dev profile
+`ariadne-mvp`, plugin at `6c58490` and later `4b71920`.
 
-Latency: `select_context` 13–56 ms per request. Summary preparation runs
-synchronously in turn completion and added 6–43 s to the turns that triggered
-it (the user waits for it before the next turn starts). Not measured: large
-chats near the default limits (#19), other providers.
+- **First start:** the 215 archived messages were backfilled into the tree.
+- **Requests:** all 17 requests across the probe, import, long, restart and
+  newchat phases selected; none declined. The view grew from 41 to 243 lines
+  (about 10 to 62 KB) and later to 266-281 lines (about 69-74 KB). The cache
+  prefix stayed stable between turns (`cache_checked` true).
+- **New chat:** answered a note fact; found the oldest codeword
+  `AMBER-LANTERN-42` with `ariadne_search`; quoted "rue Gallieni" from the
+  imported conversation's original; built-in memory add, replace and remove were
+  mirrored.
+- **Latency:** turns took 1-8 s while summaries were being built. Turn 8 of the
+  long run took 78 s; the builder competing for the provider's rate limit is a
+  possible cause, unconfirmed.
+- **Second run, `tail_bytes` 2048:** from turn 3 each turn retired 2 more of the
+  chat's own messages (12 by turn 8). Turn 8 recovered the turn-1 codeword with
+  `ariadne_search` from the exact original. A restart in a new process retired 14
+  and answered from originals.
+- **Cost:** about 210 summary calls (~2.1M tokens) in the first run; about 4
+  calls per minute with 4 concurrent.
+- **Lost at exit:** the first runs lost 4 in-flight summaries per process exit
+  (16 total). After the fix, 20 lost ones were re-asked on start: 18 built, 2
+  were lost again and stay blocked. 4 calls hit the old 120 s timeout, which is
+  why the defaults are now `timeout` 300 and `exit_wait` 120.
 
-Rerun on 2026-11-20 after the review fixes, Hermes `caafe53` (0.23.3), installed
-at `0cb7ec2` into the same profile (its note store was still at pre-release schema version 1 and migrated to
-3 in place): import (existing notes found, not duplicated), long chat (summaries
-after turns 3/5/7, selected from turn 4; turn 8 quoted the run's codeword from
-the original via `ariadne_find`), restart (answered both sensor names from the
-originals), new chat (imported fact from notes, earlier codeword via
-`ariadne_conversations`, run-unique built-in memory write mirrored). One
-mid-turn request in the import turn was declined with "missing or duplicate
-logical identity" while no summary existed yet; Hermes sent the original
-request. The stored rows had unique identities; the in-memory message lacking
-one was not captured.
-
-Follow-up new-chat run on 2026-11-20 (Hermes `caafe53`, plugin `19861ff`): the
-model found a detail that exists only in an imported conversation's originals
-(`ariadne_conversations` read), and a built-in memory add, replace and remove
-were all mirrored (the remove matched the replaced text; the mirror ended empty
-like built-in memory, agent notes untouched).
-
-Observed confusion: in one run the past-conversation index showed earlier runs'
-summaries containing a similar codeword, and the model briefly described them
-as a lossy summary of the current chat. The answer was still taken from the
-exact original.
+Not measured: other providers, very large archives, strict local chat
+templates.
 
 ## Limitations
 
-- One provider (Mistral `mistral-large-4`) and short chats were tested with a real
-  model, on Hermes `ae2a81c` and `caafe53` (0.23.3); CI pins Hermes `c627ec8`.
-  Other providers and Hermes builds are unverified.
-- Summary preparation runs inside turn completion and can add tens of seconds to
-  the turns that trigger it. Large chats near the default limits are slow (#19).
-- One cumulative summary per conversation, not the UniiChat summary tree.
+- One provider (Mistral `mistral-large-4`) was tested with a real model, on
+  Hermes `caafe53` (0.23.3); CI pins Hermes `c627ec8`. Other providers and Hermes
+  builds are unverified.
+- Building summaries is slow and costly on large models (60-120 s and 6-13k
+  tokens per call in the runs above); a big import or backfill takes a while.
+  Pin a cheaper model under `auxiliary.ariadne_summary`.
+- The view is an assistant message at the start of the request. Not verified on
+  Gemini native or on strict local chat templates that need user-first turns.
+- Any chat in the profile sees all other primary chats' summaries and exact
+  messages; there is no per-source separation.
+- Some requests decline selection and fall back to the full history (#47),
+  which can hit provider limits in long chats.
+- Archives, notes and the tree are not encrypted, and Hermes rewind/delete does
+  not erase Ariadne's copies; there is no erasure command.
+- The correspondence check pins Hermes's current `<memory-context>` wording; if
+  Hermes changes it, selection declines (fail-closed) until updated.
 - Recall is literal word overlap, not semantic search.
-- Some requests decline selection and fall back to the full history (#47), which
-  can hit provider limits in long chats.
-- Archives and notes are not encrypted, and Hermes rewind/delete does not erase
-  Ariadne's copies; there is no erasure command.
-- The recall compatibility check pins Hermes's current `<memory-context>` wording;
-  if Hermes changes it, summaries stop being used (fail-closed) until updated.
 
 ## Rollback
 
@@ -236,8 +300,8 @@ hermes plugins disable ariadne
 hermes plugins remove ariadne               # optional
 ```
 
-Ariadne's data stays in `$HERMES_HOME/ariadne/` (archive, rolling journals, notes)
+Ariadne's data stays in `$HERMES_HOME/ariadne/` (archive, tree, notes)
 until you delete that directory. To go back to an earlier plugin revision, run
 `hermes plugins install whayn/hermes-ariadne --ref <full commit SHA> --force`.
-Note stores are migrated forward in place (schema 1 → 3); an older revision
+Note stores are migrated forward in place (in place); an older revision
 refuses a newer store rather than misreading it.

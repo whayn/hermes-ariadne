@@ -1,4 +1,4 @@
-"""Ariadne MVP ship gate (#41 phase 5). NOT part of the test suite.
+"""Ariadne ship gate (#41 phase 5, #54 tree). NOT part of the test suite.
 
 Drives real Hermes (``AIAgent``, ``SessionDB``, the profile's configured provider)
 in ONE explicitly chosen disposable profile where the ``ariadne`` plugin is already
@@ -9,8 +9,8 @@ and provider calls (timing, outcome, tool names); it never calls a hook itself.
 Phases, in order::
 
     import   – ask the agent to import a synthetic export with the ariadne:import skill
-    long     – an 8-turn conversation that should trigger rolling summaries; last turn
-               asks about the first turn
+    long     – an 8-turn conversation whose older turns the tree view should replace;
+               last turn asks about the first turn
     restart  – a new process continues the long conversation for one turn
     newchat  – a brand-new chat asks about imported and earlier-chat facts, then asks
                the agent to save a built-in memory entry (mirror check)
@@ -18,6 +18,9 @@ Phases, in order::
 Usage (Hermes interpreter, Hermes source on PYTHONPATH)::
 
     HERMES_HOME=$DEV_PROFILE GATE_RUN=r2 python scripts/mvp_ship_gate.py PHASE OUT_DIR
+
+After the last turn each phase waits (``GATE_DRAIN`` seconds, default 600) for the
+background tree builder to finish its ready summaries, so the next phase sees them.
 
 Refuses homes without ``.ariadne-mvp-gate`` and the default Hermes root. Outputs are
 JSON receipts with synthetic text; keep them out of version control.
@@ -336,6 +339,26 @@ def main():
     origin = Path(sys.modules[type(engine).__module__].__file__).resolve()
     refuse(plugin.resolve() in origin.parents, "engine not loaded from the installed plugin")
 
+    tree_mod = sys.modules[type(engine).__module__]
+
+    def tree_status():
+        entry = tree_mod.shared_home(home)
+        if entry is None:
+            return None
+        try:
+            return json.loads(json.dumps(entry.builder.status(), default=str))
+        except Exception as exc:  # diagnostics only
+            return {"error": type(exc).__name__}
+
+    def drain(limit):
+        start, last = time.perf_counter(), None
+        while time.perf_counter() - start < limit:
+            last = tree_status() or {}
+            if not last.get("pending_ready") and not last.get("running"):
+                break
+            time.sleep(2)
+        return {"seconds": round(time.perf_counter() - start, 1), "status": last}
+
     if phase == "import":
         export = home / "workspace" / "synthetic-chat-export.json"
         export.parent.mkdir(parents=True, exist_ok=True)
@@ -382,17 +405,20 @@ def main():
                 "answer": (result.get("final_response") or "")[:1500],
                 "hooks": list(events),
                 "status": json.loads(json.dumps(status, default=str)),
-                "selection": {k: status.get("selection", {}).get(k) for k in ("status", "reason")},
-                "rolling": {
-                    k: status.get("rolling", {}).get(k)
+                "selection": {
+                    k: status.get("selection", {}).get(k)
                     for k in (
                         "status",
-                        "published_generation",
-                        "next_sequence",
-                        "logical_reservations",
-                        "blocked_reason",
+                        "reason",
+                        "retired_count",
+                        "view_lines",
+                        "rendered_bytes",
+                        "summary_bytes",
+                        "cache_checked",
+                        "log_count",
                     )
                 },
+                "tree": tree_status(),
             }
         )
         history = messages or db.get_messages_as_conversation(session, repair_alternation=True)
@@ -404,13 +430,17 @@ def main():
                     "seconds": elapsed,
                     "tools": turns[-1]["tools"],
                     "selection": turns[-1]["selection"],
-                    "rolling": turns[-1]["rolling"],
+                    "tree": {
+                        k: (turns[-1]["tree"] or {}).get(k)
+                        for k in ("count", "built", "pending_ready", "running", "uncertain")
+                    },
                 }
             ),
             flush=True,
         )
         if turns[-1]["failed"]:
             break
+    drained = drain(float(os.environ.get("GATE_DRAIN", "600")))
     agent.close()
 
     from importlib import import_module
@@ -427,6 +457,8 @@ def main():
         if (plugin / ".git" / "HEAD").is_file()
         else None,
         "turns": turns,
+        "drain": drained,
+        "tree_final": tree_status(),
         "notes": store.list(limit=100)["notes"],
         "conversations": store.conversations(limit=50)["conversations"],
     }

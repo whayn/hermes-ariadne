@@ -104,6 +104,7 @@ def test_provider_import_then_new_chat_sees_and_reads_it(home):
         )
     )
     assert result["ok"] and result["archived"] == 2
+    assert result["tree"]["appended"] == 2 and result["tree"]["estimate"]["calls"] == 1
     note = json.loads(
         provider.handle_tool_call(
             "ariadne_notes",
@@ -121,7 +122,8 @@ def test_provider_import_then_new_chat_sees_and_reads_it(home):
     fresh = AriadneMemoryProvider()
     fresh.initialize("later", hermes_home=str(home))
     recall = fresh.prefetch("tell me about my e-bike tyres", session_id="later")
-    assert f"[{result['id']}]" in recall and "User rides a Nakamura e-bike" in recall
+    # #54: the conversation is in the memory tree, not in the provider's recall.
+    assert f"[{result['id']}]" not in recall and "User rides a Nakamura e-bike" in recall
     read = json.loads(
         fresh.handle_tool_call("ariadne_conversations", {"action": "read", "id": result["id"]})
     )

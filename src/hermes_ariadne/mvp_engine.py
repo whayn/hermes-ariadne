@@ -1,4 +1,8 @@
-"""The MVP context engine: rolling preparation under the plain name ``ariadne``.
+"""The v0.2 MVP context engine: rolling preparation under the plain name ``ariadne``.
+
+Superseded: the plugin now registers ``tree_engine.TreeAriadneEngine`` as ``ariadne``
+(issue #54). This class is no longer registered; it is kept, with its tests, until
+the #54 migration notes (phase E) decide its removal.
 
 In addition to the rolling engine's behaviour, it keeps the derived
 conversation index (``notes.NoteStore.upsert_conversation``) that the memory

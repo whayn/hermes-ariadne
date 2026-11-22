@@ -114,6 +114,33 @@ def test_real_engine_directory_collector_registers_nothing():
     assert collector.engine is None
 
 
+def test_engine_is_the_tree_engine_and_registers_the_summary_task():
+    from hermes_ariadne.tree_builder import TASK
+
+    class AuxContext(FullContext):
+        def __init__(self, config=None):
+            super().__init__(config)
+            self.tasks = []
+
+        def register_auxiliary_task(self, key, **kwargs):
+            self.tasks.append((key, kwargs))
+
+    ctx = AuxContext({"tree": {"high": 64000, "tail_bytes": 1024}})
+    load_root().register(ctx)
+    (engine,) = ctx.engines
+    assert type(engine).__name__ == "TreeAriadneEngine"
+    assert engine._tree_settings.high == 64000 and engine._tree_settings.tail_bytes == 1024
+    assert [key for key, _ in ctx.tasks] == [TASK]
+    names = [s["name"] for s in engine.get_tool_schemas()]
+    assert names == ["ariadne_zoom", "ariadne_search", "ariadne_memory_status"]
+
+
+@pytest.mark.parametrize("tree", [{"unknown_limit": 1}, {"high": 0}, {"jobs": True}, "x"])
+def test_invalid_tree_config_refuses_engine(tree):
+    with pytest.raises((TypeError, ValueError)):
+        load_root().register(FullContext({"tree": tree}))
+
+
 def test_invalid_rolling_config_refuses_engine():
     with pytest.raises((TypeError, ValueError)):
         load_root().register(FullContext({"rolling": {"unknown_limit": 1}}))

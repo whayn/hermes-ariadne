@@ -16,11 +16,18 @@ Select `ariadne` as both the memory provider and the context engine, and:
 
 - **Notes:** the agent saves durable facts directly; you can list, edit and delete
   them. Writes to Hermes's built-in memory are mirrored one way into Ariadne.
-- **New chats** recall relevant notes and an index of past conversations, and can
-  read those conversations' exact archived messages.
-- **Long chats** have older turns replaced by an automatic summary for each
-  request. Search and zoom recover the exact originals; Hermes's stored history is
-  never modified.
+  Relevant notes are recalled each turn.
+- **One memory tree per profile:** a chronological tree of summaries over all
+  primary conversations (live and imported; subagent and cron excluded). Each
+  request carries the tree view plus the current chat's recent messages
+  verbatim. Older messages of that chat are replaced only once built summaries
+  cover them. Every chat in the profile can see the others.
+- **Zoom and search:** `ariadne_zoom` opens a summary line down to the exact
+  original message and `ariadne_search` finds exact words. Hermes's stored
+  history is never modified.
+- **Background summaries:** built through Hermes's LLM facade (auxiliary task
+  `ariadne_summary`, the chat model unless you pin another) without delaying
+  turns. They cost model calls; see the guide.
 - **Import:** the bundled `ariadne:import` skill lets the agent turn chat exports
   you supply (any format) into archived conversations plus notes.
 
@@ -37,15 +44,17 @@ hermes config set context.engine ariadne
 To pin a release, add `--ref <full commit SHA>` from the
 [releases page](https://github.com/whayn/hermes-ariadne/releases). The
 [plugin guide](docs/mvp-plugin.md) covers why `enable` is required, storage,
-importing, how recall and summaries interact, and the real-model test results.
+importing, summary cost and settings, upgrading from v0.2.x, and the real-model test results.
 
 ## Status
 
-Tested with one provider (Mistral) on short chats; other providers and very large
-chats are unverified, and writing a summary can add tens of seconds to the turn
-that triggers it. Archives and notes are stored unencrypted under
-`$HERMES_HOME/ariadne/`, and there is no erasure command yet. Releases are
-prereleases; there is no stable release or PyPI package.
+Tested with one provider (Mistral) on a small archive; other providers and very
+large archives are unverified. Building summaries is slow and costly on large
+models (pin a cheaper one under `auxiliary.ariadne_summary`), and upgrading from
+v0.2.x backfills the existing archive into the tree and summarizes it. Archives,
+notes and the tree are stored unencrypted under `$HERMES_HOME/ariadne/`, and there
+is no erasure command yet. Releases are prereleases; there is no stable release
+or PyPI package.
 
 ## Development engines
 
