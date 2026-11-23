@@ -35,12 +35,17 @@ declines and Hermes sends the original request.
 
 Tools:
 
-- `ariadne_zoom(id, n, at)`: open line `id+n` into the two lines it was made
-  from; `n=1` gives one message in full (paged from `at`).
+- `ariadne_zoom(id, n, at)`: open a visible line `id+n` into the two lines it
+  was made from; `n=1` gives one message in full (paged from `at`). Start from
+  a relevant line in the view when you have one; searching first isn't required.
 - `ariadne_search`: literal, case-sensitive search over exact archived messages
   of every conversation in the view, newest first.
-- `ariadne_memory_status`: summary progress and blocked summaries; `retry`
-  re-asks blocked ones.
+- `ariadne_memory_status`: summary progress and blocked summaries, plus the
+  latest selection attempt in this chat. `selection.status` is `selected`,
+  `declined`, or `not_evaluated`. A decline includes a reason and, for request
+  shape errors, a `shape_check` label without message text. This is the engine's
+  decision for its latest request, not a provider receipt or a diagnosis of an
+  earlier reply. `retry` re-asks blocked summaries.
 - `ariadne_notes` and `ariadne_import` (below).
 
 Recall of relevant notes remains. The v0.2 past-conversation index recall and

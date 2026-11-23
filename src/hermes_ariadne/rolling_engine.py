@@ -307,7 +307,7 @@ class RollingAriadneEngine(AriadneEngine):
         uid = incoming.get("message_uid") if type(incoming) is dict else None
         return uid is not None and uid == self._selected_incoming
 
-    def _decline(self, reason, scope, *, incoming=None, carrier=None):
+    def _decline(self, reason, scope, *, incoming=None, carrier=None, shape_check=None):
         with self._lock:
             if self._current(scope):
                 if self._carrier is not None:
@@ -320,13 +320,14 @@ class RollingAriadneEngine(AriadneEngine):
                 fields = {"reason": reason}
                 if carrier:
                     fields["carrier"] = carrier
+                if reason == "unsupported_shape" and shape_check:
+                    fields["shape_check"] = shape_check
                 if mid_turn:
                     fields["mid_turn"] = 1
                 self._note(logging.INFO, "declined", **fields)
                 self._selection = {
                     "status": "declined",
-                    "reason": reason,
-                    **({"carrier": carrier} if carrier else {}),
+                    **fields,
                     "mid_turn": mid_turn,
                     "provider_fit_verified": False,
                     "host_fallback": "original_request_on_decline",

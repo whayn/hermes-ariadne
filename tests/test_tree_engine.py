@@ -262,6 +262,7 @@ def test_declines_unknown_budget_over_budget_and_unsupported_shapes(home, monkey
     no_prefix = assembled(history)[2:]
     result, _ = world.select(b, "chat-b", "N", request=no_prefix)
     assert result is None and b.get_status()["selection"]["reason"] == "unsupported_shape"
+    assert call(b, "ariadne_memory_status")["selection"]["shape_check"] == "host_prefix"
 
     forged = assembled(history)
     forged[-1]["content"] = "not what the user sent"
@@ -608,6 +609,26 @@ def test_memory_status_and_retry(home, monkeypatch):
     world.build(a)
     assert call(a, "ariadne_memory_status")["remaining"]["internal_calls"] == 0
     assert call(a, "ariadne_memory_status", action="other")["error"] == "invalid_argument"
+
+
+def test_memory_status_reports_latest_context_selection(home, monkeypatch):
+    world = World(home, monkeypatch)
+    prior = world.engine("prior")
+    world.turn(prior, "prior", "A")
+    world.build(prior)
+    chat = world.engine("desktop", source="desktop")
+    world.ask("desktop", "B")
+    assert call(chat, "ariadne_memory_status")["selection"]["status"] == "not_evaluated"
+    selected, _ = world.select(chat, "desktop", "B")
+    assert selected is not None
+    status = call(chat, "ariadne_memory_status")["selection"]
+    assert status["status"] == "selected" and status["view_lines"] > 0
+    declined, _ = world.select(chat, "desktop", "B", budget=0)
+    assert declined is None
+    status = call(chat, "ariadne_memory_status")["selection"]
+    assert status["status"] == "declined" and status["reason"] == "unknown_budget"
+    assert status["host_fallback"] == "original_request_on_decline"
+    assert "view_lines" not in status
 
 
 # --------------------------------------------------------------------------- #
