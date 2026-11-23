@@ -631,6 +631,27 @@ def test_memory_status_reports_latest_context_selection(home, monkeypatch):
     assert "view_lines" not in status
 
 
+def test_memory_status_keeps_dispatch_session_selection(home, monkeypatch):
+    world = World(home, monkeypatch)
+    chat = world.engine("desktop", source="desktop")
+    shared = chat._shared
+    world.ask("desktop", "B")
+    world.select(chat, "desktop", "B", budget=0)
+    before = chat.get_status()["selection"]
+    assert before["reason"] == "unknown_budget"
+    status = chat._status
+
+    def rebind_then_status(*args):
+        world.db.sessions["next"] = {"source": "desktop"}
+        chat.bind_session_state(world.db, "next")
+        chat.on_session_start("next", hermes_home=home)
+        assert chat._shared is shared
+        return status(*args)
+
+    monkeypatch.setattr(chat, "_status", rebind_then_status)
+    assert call(chat, "ariadne_memory_status")["selection"] == before
+
+
 # --------------------------------------------------------------------------- #
 # Lifecycle, cache, tags
 # --------------------------------------------------------------------------- #

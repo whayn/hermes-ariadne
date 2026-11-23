@@ -864,6 +864,7 @@ class TreeAriadneEngine(RollingAriadneEngine):
     def handle_tool_call(self, name, args, **kwargs):
         with self._lock:
             shared = self._shared
+            selection = dict(self._selection) if name == STATUS else {}
         try:
             if shared is None:
                 result = _error("uninitialized")
@@ -874,7 +875,7 @@ class TreeAriadneEngine(RollingAriadneEngine):
             elif name == SEARCH:
                 result = self._search(shared, args)
             elif name == STATUS:
-                result = self._status(shared, args)
+                result = self._status(shared, args, selection)
             else:
                 result = _error("unknown_tool")
         except RestrictedEvidence:
@@ -1015,7 +1016,7 @@ class TreeAriadneEngine(RollingAriadneEngine):
             conn.close()
         return _ok(query=query, results=results, truncated=truncated, restricted_skipped=restricted)
 
-    def _status(self, shared, args):
+    def _status(self, shared, args, selection):
         if set(args) - {"action"}:
             raise ValueError("unknown argument")
         action = args.get("action", "status")
@@ -1029,8 +1030,6 @@ class TreeAriadneEngine(RollingAriadneEngine):
         count = builder["count"]
         leaves, parents = shared.store.built_counts()
         s = self._tree_settings
-        with self._lock:
-            selection = dict(self._selection) if shared is self._shared else {}
         if selection.get("status") not in {"selected", "declined"}:
             selection = {"status": "not_evaluated"}
         return _ok(
