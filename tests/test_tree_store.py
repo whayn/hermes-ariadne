@@ -297,6 +297,19 @@ def test_reserve_is_exclusive_and_accounted(home):
     assert store.counters() == {"logical_jobs": 1, "request_bytes": 100}
 
 
+def test_unlimited_reservation_keeps_existing_counters_and_attempts(home):
+    store = TreeStore(home)
+    _log(store, 2)
+    part = Part(0, 0)
+    assert store.reserve(part, 1 << 30, "b", max_jobs=100000, max_total_bytes=1 << 30) == 1
+    store.mark(part, "refused", "not_sent", owner="b", attempt=1)
+    assert store.reserve(part, 123, "b", max_jobs=0, max_total_bytes=0) == 2
+    assert store.counters() == {"logical_jobs": 2, "request_bytes": (1 << 30) + 123}
+    assert store.jobs()[part].attempts == 2
+    assert store.reserve(Part(0, 1), 1, "b", max_jobs=0, max_total_bytes=1 << 30) is False
+    assert store.reserve(Part(0, 1), 1, "b", max_jobs=2, max_total_bytes=0) is False
+
+
 def test_reserve_refuses_when_caps_would_be_exceeded(home):
     store = TreeStore(home)
     _log(store, 8)

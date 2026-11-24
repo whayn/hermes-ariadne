@@ -35,9 +35,9 @@ config_schema:
       seen_high: 32000
       node_bytes: 512
       jobs: 4
-      max_jobs: 100000
+      max_jobs: 0
       max_request_bytes: 65536
-      max_total_request_bytes: 1073741824
+      max_total_request_bytes: 0
       tail_bytes: 32768
       tries: 5
       max_tokens: 1024

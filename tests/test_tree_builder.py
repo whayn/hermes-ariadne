@@ -130,15 +130,32 @@ def drain(b, limit=50):
 def test_settings_defaults_and_validation():
     s = TreeSettings()
     assert (s.high, s.seen_high, s.node_bytes, s.jobs) == (128000, 32000, 512, 4)
-    assert (s.max_jobs, s.max_request_bytes, s.max_total_request_bytes) == (100000, 65536, 1 << 30)
+    assert (s.max_jobs, s.max_request_bytes, s.max_total_request_bytes) == (0, 65536, 0)
     assert (s.tail_bytes, s.tries, s.timeout) == (32768, 5, 300)
     assert 0 < s.max_tokens
-    for name in ("high", "jobs", "node_bytes", "tries", "max_tokens", "timeout", "max_jobs"):
+    for name in ("high", "jobs", "node_bytes", "tries", "max_tokens", "timeout"):
         for bad in (0, -1, True, 1.5, "4", None):
             with pytest.raises(ValueError):
                 TreeSettings(**{name: bad})
     with pytest.raises(ValueError):
         TreeSettings(max_request_bytes=10)
+
+
+def test_lifetime_limits_accept_zero_and_reject_invalid_values():
+    for name in ("max_jobs", "max_total_request_bytes"):
+        assert getattr(TreeSettings(**{name: 0}), name) == 0
+        for bad in (-1, True, 1.5, "1", None):
+            with pytest.raises(ValueError):
+                TreeSettings(**{name: bad})
+
+
+def test_unlimited_reservation_reports_taken_not_caps(home, log):
+    log.add(long())
+    b = builder(home, FakeLlm())
+    part = Part(0, 0)
+    assert b._reserve(part, 10) == ("ok", 1)
+    assert b._reserve(part, 10) == ("taken", 0)
+    assert b.status()["caps_exhausted"] is False
 
 
 def test_exit_wait_and_auto_reask_lost_defaults_and_validation():
@@ -431,6 +448,21 @@ def test_non_text_result_is_uncertain(home, log):
     b = builder(home, Weird())
     drain(b)
     assert log.store.jobs()[Part(0, 0)].state == "uncertain"
+
+
+def test_default_builder_continues_after_old_lifetime_caps(home, log):
+    log.add(long())
+    with log.store._connect(write=True) as conn:
+        conn.execute("UPDATE counters SET value=100000 WHERE name='logical_jobs'")
+        conn.execute("UPDATE counters SET value=? WHERE name='request_bytes'", (1 << 30,))
+    llm = FakeLlm()
+    b = builder(home, llm)
+    drain(b)
+    assert len(llm.calls) == 1
+    assert b.status()["caps_exhausted"] is False
+    counters = log.store.counters()
+    assert counters["logical_jobs"] == 100001
+    assert counters["request_bytes"] == (1 << 30) + len(tree_builder._request_json(llm.calls[0][0]))
 
 
 def test_job_cap_stops_the_pass_and_is_reported(home, log):
