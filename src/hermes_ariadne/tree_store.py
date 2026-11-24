@@ -543,6 +543,15 @@ class TreeStore:
                 )
         return found
 
+    def tag(self, session_id):
+        with self._connect(write=False) as conn:
+            if conn is None:
+                return None
+            row = conn.execute(
+                "SELECT tag FROM sessions WHERE session_id=?", (_session_id(session_id),)
+            ).fetchone()
+            return row[0] if row else None
+
     def legend(self):
         """``{session_id: (tag, title, first_date, last_date)}`` in one snapshot."""
         with self._connect(write=False) as conn:
@@ -653,7 +662,8 @@ class TreeStore:
 
         Atomic with the logical counters: refused when the part is already built,
         reserved, done or uncertain, or when one more job or ``request_bytes`` more
-        would exceed ``max_jobs`` / ``max_total_bytes``. Each reservation is one
+        would exceed a positive ``max_jobs`` / ``max_total_bytes`` (zero means unlimited).
+        Each reservation is one
         attempt; counters only ever grow. Returns the new attempt number (always
         positive); ``finish``/``mark`` must present it with the same ``owner`` so a
         late caller from a replaced reservation can never settle the new one.
@@ -680,9 +690,8 @@ class TreeStore:
             if row and row[0] in BLOCKING_STATES:
                 return False
             counters = _counters(conn)
-            if (
-                counters["logical_jobs"] + 1 > max_jobs
-                or counters["request_bytes"] + request_bytes > max_total_bytes
+            if (max_jobs and counters["logical_jobs"] + 1 > max_jobs) or (
+                max_total_bytes and counters["request_bytes"] + request_bytes > max_total_bytes
             ):
                 return False
             conn.execute(

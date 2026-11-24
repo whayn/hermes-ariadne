@@ -30,8 +30,11 @@ Every request the engine sends is:
 This chat's older messages are dropped from the request only once built
 summaries cover them. A stretch not yet summarized collapses into one range line
 (`first..last|(N messages not summarized yet ...)`), so the view stays small
-right after a big import. If the engine cannot build a valid request it
-declines and Hermes sends the original request.
+right after a big import. If the normal view exceeds a known request token
+budget, Ariadne also tries a smaller navigation-only index (`compact_view` in
+memory status). It shows zoomable ranges instead of summary text and keeps
+all messages in the current request verbatim. If neither request is valid or
+fits, Ariadne declines selection and Hermes sends the original request.
 
 Tools:
 
@@ -39,7 +42,10 @@ Tools:
   was made from; `n=1` gives one message in full (paged from `at`). Start from
   a relevant line in the view when you have one; searching first isn't required.
 - `ariadne_search`: literal, case-sensitive search over exact archived messages
-  of every conversation in the view, newest first.
+  of every conversation in the view, newest tree positions first. Follow `next_cursor`
+  with the same query to reach older results, even if a page is empty. Pages
+  cover the tree as of the first search; start without a cursor to see messages
+  added to the tree since then.
 - `ariadne_memory_status`: summary progress and blocked summaries, plus the
   latest selection attempt in this chat. `selection.status` is `selected`,
   `declined`, or `not_evaluated`. A decline includes a reason and, for request
@@ -103,9 +109,9 @@ hermes config set plugins.entries.ariadne.settings.tree.tail_bytes 2048
 | `seen_high` | 32000 | Largest context view a summary call is shown |
 | `node_bytes` | 512 | Target size of one summary line (32-8192) |
 | `jobs` | 4 | Concurrent summary calls per lane (1-64) |
-| `max_jobs` | 100000 | Logical summary-call reservations allowed |
+| `max_jobs` | 0 | Lifetime logical summary-call reservations; zero is unlimited |
 | `max_request_bytes` | 65536 | Logical cap per summary request (4096 up) |
-| `max_total_request_bytes` | 1073741824 | Logical cap over all summary requests |
+| `max_total_request_bytes` | 0 | Lifetime logical bytes over summary requests; zero is unlimited |
 | `tries` | 5 | Attempts per summary before it is blocked (1-20) |
 | `max_tokens` | 1024 | Output tokens per summary call (reasoning models spend part on thinking) |
 | `timeout` | 300 | Seconds per summary call (1-3600) |

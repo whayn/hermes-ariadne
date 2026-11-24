@@ -270,6 +270,73 @@ def test_declines_unknown_budget_over_budget_and_unsupported_shapes(home, monkey
     assert result is None and b.get_status()["selection"]["reason"] == "unsupported_shape"
 
 
+def test_small_budget_keeps_zoomable_history_and_exact_verbatim_tail(home, monkeypatch):
+    world = World(home, monkeypatch)
+    a = world.engine("chat-a")
+    for tag in "ABCDE":
+        world.turn(a, "chat-a", tag)
+    world.build(a)
+    b = world.engine("chat-b")
+    world.ask("chat-b", "N")
+    monkeypatch.setattr(b, "_measure", lambda messages: len(json.dumps(messages)))
+    normal, request = world.select(b, "chat-b", "N")
+    normal[-1] = request[-1]
+    normal_size = len(json.dumps(normal))
+    budget = tree_engine.RESERVE_TOKENS + normal_size - 1
+    compact, _ = world.select(b, "chat-b", "N", budget)
+    assert compact is not None
+    compact[-1] = request[-1]
+    assert len(json.dumps(compact)) <= budget - tree_engine.RESERVE_TOKENS
+    assert compact[:2] == request[:2]
+    assert compact[2]["role"] == "assistant"
+    assert retired(compact, request) == 0
+    assert compact[3:-1] == request[2:-1]
+    assert "summary not shown" in compact[2]["content"]
+    lines = compact[2]["content"].split("<history>\n", 1)[1].split("</history>", 1)[0].splitlines()
+    covered = set()
+    for line in lines:
+        ref = line.split("|", 1)[0]
+        if ".." in ref:
+            first, last = map(int, ref.split(".."))
+        else:
+            first, count = map(int, ref.split("+"))
+            last = first + count - 1
+        covered.update(range(first, last + 1))
+    assert covered == set(range(world.store().count()))
+    assert call(b, "ariadne_zoom", id=0, n=1)["ok"]
+    assert call(b, "ariadne_zoom", id=max(covered), n=1)["ok"]
+    for _ in range(2):
+        retried, _ = world.select(b, "chat-b", "N", budget)
+        assert retried is not None
+        assert b.get_status()["selection"]["cache_checked"] is False
+    full_again, _ = world.select(b, "chat-b", "N")
+    assert full_again[2]["content"] == normal[2]["content"]
+    assert b.get_status()["selection"]["cache_checked"] is False
+
+
+def test_compact_index_never_retires_own_messages(home, monkeypatch):
+    world = World(home, monkeypatch, TreeSettings(tail_bytes=0))
+    a = world.engine("archive")
+    for tag in "ABCDEFGHIJ":
+        world.turn(a, "archive", tag)
+    world.build(a)
+    b = world.engine("current")
+    for tag in "XYZ":
+        world.turn(b, "current", tag)
+    world.build(b)
+    world.ask("current", "Q")
+    monkeypatch.setattr(b, "_measure", lambda messages: len(json.dumps(messages)))
+    normal, request = world.select(b, "current", "Q")
+    assert retired(normal, request) > 0
+    normal[-1] = request[-1]
+    budget = tree_engine.RESERVE_TOKENS + len(json.dumps(normal)) - 1
+    compact, _ = world.select(b, "current", "Q", budget)
+    assert compact is not None
+    assert retired(compact, request) == 0
+    assert compact[3:-1] == request[2:-1]
+    assert b.get_status()["selection"]["compact_view"] is True
+
+
 def test_view_byte_bound_is_explicit(home, monkeypatch):
     monkeypatch.setattr(tree_engine, "VIEW_OVERHEAD", 0)  # so the fixed text alone is over 400
     world = World(home, monkeypatch, TreeSettings(high=200))
@@ -602,7 +669,7 @@ def test_memory_status_and_retry(home, monkeypatch):
     status = call(a, "ariadne_memory_status")
     assert status["ok"] and status["builder"]["uncertain"] == 1
     assert status["builder"]["count"] == 4
-    assert status["caps"]["max_jobs"] == 100000 and status["caps"]["node_bytes"] == 512
+    assert status["caps"]["max_jobs"] == 0 and status["caps"]["node_bytes"] == 512
     assert status["remaining"]["internal_calls"] == 2
     retried = call(a, "ariadne_memory_status", action="retry")
     assert retried["rearmed"] == 1
@@ -1063,7 +1130,7 @@ def test_shutdown_stops_every_home_before_waiting_and_shares_one_deadline(monkey
 
 def test_search_scan_limit_counts_only_tree_messages(home, monkeypatch):
     # Archived worker messages are not in the tree; they must not use up the scan.
-    monkeypatch.setattr(tree_engine, "SEARCH_SCAN", 3)
+    monkeypatch.setattr(tree_engine, "SEARCH_SCAN", 4)
     world = World(home, monkeypatch)
     a = world.engine("chat-a")
     world.turn(a, "chat-a", "Zebra")

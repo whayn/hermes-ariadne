@@ -92,9 +92,9 @@ _LIMITS = {
     "seen_high": (1, _MAX_INT),
     "node_bytes": (32, 8192),
     "jobs": (1, 64),
-    "max_jobs": (1, _MAX_INT),
+    "max_jobs": (0, _MAX_INT),
     "max_request_bytes": (4096, 1 << 26),
-    "max_total_request_bytes": (1, 1 << 40),
+    "max_total_request_bytes": (0, 1 << 40),
     "tail_bytes": (0, _MAX_INT),
     "tries": (1, 20),
     "max_tokens": (1, 1 << 20),
@@ -108,6 +108,7 @@ _LIMITS = {
 class TreeSettings:
     """Tree limits. ``jobs`` is the concurrency per lane; ``max_jobs`` and the request
     byte caps count LOGICAL reservations (the host may retry or fall back internally).
+    A zero lifetime job or total byte cap means unlimited; accounting continues.
 
     ``max_tokens`` leaves room above the ~130 tokens a 512-byte line needs because a
     reasoning model spends its budget on thinking first: an empty answer is read as a
@@ -123,9 +124,9 @@ class TreeSettings:
     seen_high: int = 32000
     node_bytes: int = 512
     jobs: int = 4
-    max_jobs: int = 100000
+    max_jobs: int = 0
     max_request_bytes: int = 65536
-    max_total_request_bytes: int = 1 << 30
+    max_total_request_bytes: int = 0
     tail_bytes: int = 32768
     tries: int = 5
     max_tokens: int = 1024
@@ -587,9 +588,9 @@ class TreeBuilder:
             self._caps_exhausted = False
             return "ok", attempt
         counters = self._store.counters()
-        if (
-            counters["logical_jobs"] + 1 > s.max_jobs
-            or counters["request_bytes"] + size > s.max_total_request_bytes
+        if (s.max_jobs and counters["logical_jobs"] + 1 > s.max_jobs) or (
+            s.max_total_request_bytes
+            and counters["request_bytes"] + size > s.max_total_request_bytes
         ):
             self._caps_exhausted = True
             return "caps", 0
