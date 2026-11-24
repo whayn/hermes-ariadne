@@ -305,6 +305,13 @@ def test_small_budget_keeps_zoomable_history_and_exact_verbatim_tail(home, monke
     assert covered == set(range(world.store().count()))
     assert call(b, "ariadne_zoom", id=0, n=1)["ok"]
     assert call(b, "ariadne_zoom", id=max(covered), n=1)["ok"]
+    for _ in range(2):
+        retried, _ = world.select(b, "chat-b", "N", budget)
+        assert retried is not None
+        assert b.get_status()["selection"]["cache_checked"] is False
+    full_again, _ = world.select(b, "chat-b", "N")
+    assert full_again[2]["content"] == normal[2]["content"]
+    assert b.get_status()["selection"]["cache_checked"] is False
 
 
 def test_compact_index_never_retires_own_messages(home, monkeypatch):
@@ -1123,7 +1130,7 @@ def test_shutdown_stops_every_home_before_waiting_and_shares_one_deadline(monkey
 
 def test_search_scan_limit_counts_only_tree_messages(home, monkeypatch):
     # Archived worker messages are not in the tree; they must not use up the scan.
-    monkeypatch.setattr(tree_engine, "SEARCH_SCAN", 3)
+    monkeypatch.setattr(tree_engine, "SEARCH_SCAN", 4)
     world = World(home, monkeypatch)
     a = world.engine("chat-a")
     world.turn(a, "chat-a", "Zebra")

@@ -42,7 +42,7 @@ Tools:
   was made from; `n=1` gives one message in full (paged from `at`). Start from
   a relevant line in the view when you have one; searching first isn't required.
 - `ariadne_search`: literal, case-sensitive search over exact archived messages
-  of every conversation in the view, newest archive rows first. Follow `next_cursor`
+  of every conversation in the view, newest tree positions first. Follow `next_cursor`
   with the same query to reach older results, even if a page is empty. Pages
   cover the tree as of the first search; start without a cursor to see messages
   added to the tree since then.

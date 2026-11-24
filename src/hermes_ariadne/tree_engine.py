@@ -145,7 +145,6 @@ VIEW_OVERHEAD = 4096  # VIEW_DOC, wrappers; the legend shares the 2 * high allow
 CANDIDATE_TAIL_FACTOR = 16
 ZOOM_CHARS = 8000
 SEARCH_SCAN = 2000
-SEARCH_CHUNK = 500  # sessions per IN list (SQLite's parameter limit is far above)
 SEARCH_LIMIT = 50
 PREVIEW_CHARS = 240
 MAX_QUERY_CHARS = 500
@@ -765,7 +764,9 @@ class TreeAriadneEngine(RollingAriadneEngine):
             if not self._current(scope) or self._carrier is not None:
                 return self._decline("selection_unavailable", scope, incoming=incoming_message)
             self._selection = {"status": "selected", **diagnostics}
-            self._last = replace(selection, request=(), tail=())  # no host message refs
+            self._last = (
+                None if diagnostics.get("compact_view") else replace(selection, request=(), tail=())
+            )  # only the ordinary selection accurately models its sent text
             self._selected_incoming = (incoming_message or {}).get("message_uid")
         return candidate
 
@@ -834,7 +835,7 @@ class TreeAriadneEngine(RollingAriadneEngine):
         if compact:
             nodes = {}  # no summary is rendered, so no verbatim message may retire
         with self._lock:
-            previous = self._last if self._current(scope) else None
+            previous = self._last if not compact and self._current(scope) else None
         selection = pt.select_view(
             view=view,
             nodes=nodes,
@@ -992,23 +993,14 @@ class TreeAriadneEngine(RollingAriadneEngine):
         cursor = args.get("cursor")
         store = shared.store
         frontier = store.count()  # pin append-only tree membership across search pages
-        if cursor is None:
-            rowid = sid = None
-        else:
+        if cursor is not None:
             try:
                 if not isinstance(cursor, str) or len(cursor) > 16384:
                     raise ValueError("invalid cursor")
-                rowid, sid, cursor_query, snapshot = json.loads(cursor)
-                if (
-                    type(rowid) is not int
-                    or not 1 <= rowid <= 2**63 - 1
-                    or not isinstance(sid, str)
-                    or cursor_query != query
-                    or type(snapshot) is not int
-                    or not 0 <= snapshot <= frontier
-                ):
+                before, cursor_query = json.loads(cursor)
+                if type(before) is not int or not 0 < before <= frontier or cursor_query != query:
                     raise ValueError("invalid cursor")
-                frontier = snapshot
+                frontier = before
             except (ValueError, TypeError):
                 raise ValueError("invalid cursor") from None
         conn = ArchiveReader(shared.home)._connect()
@@ -1017,76 +1009,45 @@ class TreeAriadneEngine(RollingAriadneEngine):
                 query=query, results=[], truncated=False, next_cursor=None, restricted_skipped=0
             )
         try:
-            sessions = sorted(store.sessions())
-            hits = []
-            for start in range(0, len(sessions), SEARCH_CHUNK):
-                chunk = sessions[start : start + SEARCH_CHUNK]
-                hits.extend(
-                    conn.execute(
-                        "SELECT o.session_id, e.event_id, e.rowid FROM events e "
-                        "JOIN observations o USING (event_id) WHERE instr(e.search_text, ?) > 0 "
-                        "AND o.session_id IN (SELECT value FROM json_each(?)) "
-                        "AND (? IS NULL OR e.rowid < ? OR (e.rowid = ? AND o.session_id < ?)) "
-                        "GROUP BY o.session_id, e.event_id ORDER BY e.rowid DESC, o.session_id DESC LIMIT ?",
-                        (
-                            search_text(query),
-                            json.dumps(chunk),
-                            rowid,
-                            rowid,
-                            rowid,
-                            sid,
-                            SEARCH_SCAN + 1,
-                        ),
-                    ).fetchall()
-                )
-                hits.sort(key=lambda row: (row[2], row[0]), reverse=True)
-                hits = hits[: SEARCH_SCAN + 1]
-            by_session = {}
-            for session_id, event_id, _rowid in hits[:SEARCH_SCAN]:
-                by_session.setdefault(session_id, []).append(event_id)
-            positions = {sid: store.positions(sid, ids) for sid, ids in by_session.items()}
-            tags = {sid: item[0] for sid, item in store.legend().items()}
-            results, restricted, processed = [], 0, 0
-            for session_id, event_id, _rowid in hits[:SEARCH_SCAN]:
+            results, restricted, position = [], 0, frontier
+            tags = {}
+            needle = search_text(query)
+            entries = store.entries(max(0, frontier - SEARCH_SCAN), frontier)
+            for entry in reversed(entries):
                 if len(results) >= limit:
                     break
-                processed += 1
-                position = positions[session_id].get(event_id)
-                if position is None or position >= frontier:
-                    continue
-                entry = store.entry(position)
-                if entry is None or entry.restricted:
-                    restricted += entry is not None
-                    continue
+                position = entry.position
                 row = conn.execute(
-                    "SELECT payload_json FROM events WHERE event_id=?", (event_id,)
+                    "SELECT payload_json FROM events WHERE event_id=? AND instr(search_text, ?) > 0 "
+                    "AND EXISTS (SELECT 1 FROM observations WHERE event_id=events.event_id AND session_id=?)",
+                    (entry.event_id, needle, entry.session_id),
                 ).fetchone()
+                if row is None:
+                    continue
+                if entry.restricted:
+                    restricted += 1
+                    continue
                 try:
-                    message, _omitted = carrier_free(_check(event_id, row[0]))
+                    message, _omitted = carrier_free(_check(entry.event_id, row[0]))
                 except RestrictedEvidence:
                     restricted += 1
                     continue
+                if entry.session_id not in tags:
+                    tags[entry.session_id] = store.tag(entry.session_id)
                 text = " ".join(_text_of(message).split())
                 start = max(0, text.find(" ".join(query.split())) - PREVIEW_CHARS // 3)
                 results.append(
                     {
                         "id": position,
-                        "conversation": tags.get(session_id),
+                        "conversation": tags[entry.session_id],
                         "date": entry.date,
                         "role": message.get("role"),
                         "preview": text[start : start + PREVIEW_CHARS],
                         **_linkage(message),
                     }
                 )
-            more = processed < len(hits)
-            next_cursor = (
-                json.dumps(
-                    [hits[processed - 1][2], hits[processed - 1][0], query, frontier],
-                    ensure_ascii=False,
-                )
-                if more and processed
-                else None
-            )
+            more = bool(entries) and position > 0
+            next_cursor = json.dumps([position, query], ensure_ascii=False) if more else None
         finally:
             conn.close()
         return _ok(

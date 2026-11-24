@@ -543,6 +543,15 @@ class TreeStore:
                 )
         return found
 
+    def tag(self, session_id):
+        with self._connect(write=False) as conn:
+            if conn is None:
+                return None
+            row = conn.execute(
+                "SELECT tag FROM sessions WHERE session_id=?", (_session_id(session_id),)
+            ).fetchone()
+            return row[0] if row else None
+
     def legend(self):
         """``{session_id: (tag, title, first_date, last_date)}`` in one snapshot."""
         with self._connect(write=False) as conn:

@@ -8,7 +8,7 @@ from hermes_ariadne import tree_engine
 
 
 def test_search_pages_reach_matches_beyond_scan_window(home, monkeypatch):
-    monkeypatch.setattr(tree_engine, "SEARCH_SCAN", 3)
+    monkeypatch.setattr(tree_engine, "SEARCH_SCAN", 8)
     world = World(home, monkeypatch)
     engine = world.engine("chat")
     for i in range(5):
@@ -24,6 +24,19 @@ def test_search_pages_reach_matches_beyond_scan_window(home, monkeypatch):
     assert [r["id"] for r in second["results"]] == [8, 4]
     assert [r["id"] for r in third["results"]] == [0]
     assert third["next_cursor"] is None
+
+
+def test_search_miss_returns_cursor_after_bounded_work(home, monkeypatch):
+    monkeypatch.setattr(tree_engine, "SEARCH_SCAN", 8)
+    world = World(home, monkeypatch)
+    chat = world.engine("chat")
+    for tag in ("Zebra", "A", "B", "C"):
+        world.turn(chat, "chat", tag)
+    first = call(chat, "ariadne_search", query="question Zebra")
+    assert first["results"] == [] and first["next_cursor"] is not None
+    old = call(chat, "ariadne_search", query="question Zebra", cursor=first["next_cursor"])
+    assert [r["id"] for r in old["results"]] == [0]
+    assert old["next_cursor"] is None
 
 
 def test_cursor_is_query_bound_and_new_rows_do_not_shift_pages(home, monkeypatch):
