@@ -30,8 +30,11 @@ Every request the engine sends is:
 This chat's older messages are dropped from the request only once built
 summaries cover them. A stretch not yet summarized collapses into one range line
 (`first..last|(N messages not summarized yet ...)`), so the view stays small
-right after a big import. If the engine cannot build a valid request it
-declines and Hermes sends the original request.
+right after a big import. If the normal view exceeds a known request token
+budget, Ariadne also tries a smaller navigation-only index (`compact_view` in
+memory status). It shows zoomable ranges instead of summary text and keeps
+all messages in the current request verbatim. If neither request is valid or
+fits, Ariadne declines selection and Hermes sends the original request.
 
 Tools:
 
