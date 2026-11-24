@@ -990,18 +990,25 @@ class TreeAriadneEngine(RollingAriadneEngine):
         if limit > SEARCH_LIMIT:
             raise ValueError("invalid limit")
         cursor = args.get("cursor")
-        if cursor is not None:
+        store = shared.store
+        frontier = store.count()  # pin append-only tree membership across search pages
+        if cursor is None:
+            rowid = sid = None
+        else:
             try:
                 if not isinstance(cursor, str) or len(cursor) > 16384:
                     raise ValueError("invalid cursor")
-                rowid, sid, cursor_query = json.loads(cursor)
+                rowid, sid, cursor_query, snapshot = json.loads(cursor)
                 if (
                     type(rowid) is not int
                     or not 1 <= rowid <= 2**63 - 1
                     or not isinstance(sid, str)
                     or cursor_query != query
+                    or type(snapshot) is not int
+                    or not 0 <= snapshot <= frontier
                 ):
                     raise ValueError("invalid cursor")
+                frontier = snapshot
             except (ValueError, TypeError):
                 raise ValueError("invalid cursor") from None
         conn = ArchiveReader(shared.home)._connect()
@@ -1010,29 +1017,26 @@ class TreeAriadneEngine(RollingAriadneEngine):
                 query=query, results=[], truncated=False, next_cursor=None, restricted_skipped=0
             )
         try:
-            store = shared.store
             sessions = sorted(store.sessions())
             hits = []
             for start in range(0, len(sessions), SEARCH_CHUNK):
                 chunk = sessions[start : start + SEARCH_CHUNK]
-                marks = ",".join("?" * len(chunk))
-                where = (
-                    ""
-                    if cursor is None
-                    else "AND (e.rowid < ? OR (e.rowid = ? AND o.session_id < ?)) "
-                )
-                params = [search_text(query), *chunk]
-                if cursor is not None:
-                    params.extend((rowid, rowid, sid))
-                params.append(SEARCH_SCAN + 1)
                 hits.extend(
                     conn.execute(
                         "SELECT o.session_id, e.event_id, e.rowid FROM events e "
                         "JOIN observations o USING (event_id) WHERE instr(e.search_text, ?) > 0 "
-                        f"AND o.session_id IN ({marks}) "
-                        + where
-                        + "GROUP BY o.session_id, e.event_id ORDER BY e.rowid DESC, o.session_id DESC LIMIT ?",
-                        params,
+                        "AND o.session_id IN (SELECT value FROM json_each(?)) "
+                        "AND (? IS NULL OR e.rowid < ? OR (e.rowid = ? AND o.session_id < ?)) "
+                        "GROUP BY o.session_id, e.event_id ORDER BY e.rowid DESC, o.session_id DESC LIMIT ?",
+                        (
+                            search_text(query),
+                            json.dumps(chunk),
+                            rowid,
+                            rowid,
+                            rowid,
+                            sid,
+                            SEARCH_SCAN + 1,
+                        ),
                     ).fetchall()
                 )
                 hits.sort(key=lambda row: (row[2], row[0]), reverse=True)
@@ -1048,7 +1052,7 @@ class TreeAriadneEngine(RollingAriadneEngine):
                     break
                 processed += 1
                 position = positions[session_id].get(event_id)
-                if position is None:
+                if position is None or position >= frontier:
                     continue
                 entry = store.entry(position)
                 if entry is None or entry.restricted:
@@ -1077,7 +1081,8 @@ class TreeAriadneEngine(RollingAriadneEngine):
             more = processed < len(hits)
             next_cursor = (
                 json.dumps(
-                    [hits[processed - 1][2], hits[processed - 1][0], query], ensure_ascii=False
+                    [hits[processed - 1][2], hits[processed - 1][0], query, frontier],
+                    ensure_ascii=False,
                 )
                 if more and processed
                 else None

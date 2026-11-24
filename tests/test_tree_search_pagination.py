@@ -44,3 +44,21 @@ def test_cursor_is_query_bound_and_new_rows_do_not_shift_pages(home, monkeypatch
     rest = call(engine, "ariadne_search", query="question Zebra", cursor=cursor)
     assert [r["id"] for r in rest["results"]] == [4, 0]
     assert rest["next_cursor"] is None
+
+
+def test_cursor_excludes_rows_appended_to_tree_between_pages(home, monkeypatch):
+    world = World(home, monkeypatch)
+    chat = world.engine("chat")
+    late = world.engine("late", base=chat)
+    world.turn(late, "late", "ZebraOld")
+    world.ask("late", "ZebraPending")
+    late._observe_scope(late._capture())  # archive, without tree append
+    world.turn(chat, "chat", "ZebraNew")
+
+    first = call(chat, "ariadne_search", query="question Zebra", limit=1)
+    assert len(first["results"]) == 1
+    late._append_turn(late._capture())
+    page = call(chat, "ariadne_search", query="question Zebra", cursor=first["next_cursor"])
+    assert [r["id"] for r in page["results"]] == [0]
+    refreshed = call(chat, "ariadne_search", query="question Zebra")
+    assert len(refreshed["results"]) == 3

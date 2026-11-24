@@ -43,7 +43,9 @@ Tools:
   a relevant line in the view when you have one; searching first isn't required.
 - `ariadne_search`: literal, case-sensitive search over exact archived messages
   of every conversation in the view, newest archive rows first. Follow `next_cursor`
-  with the same query to reach older results, even if a page is empty.
+  with the same query to reach older results, even if a page is empty. Pages
+  cover the tree as of the first search; start without a cursor to see messages
+  added to the tree since then.
 - `ariadne_memory_status`: summary progress and blocked summaries, plus the
   latest selection attempt in this chat. `selection.status` is `selected`,
   `declined`, or `not_evaluated`. A decline includes a reason and, for request
