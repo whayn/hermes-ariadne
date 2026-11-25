@@ -100,6 +100,53 @@ def test_full_context_registers_both():
     assert clone.name == "ariadne" and clone._llm is engine._llm
 
 
+def test_idle_task_resumes_existing_tree_without_a_chat(tmp_path, monkeypatch):
+    import threading
+    from types import SimpleNamespace
+
+    from hermes_ariadne.importer import Importer
+    from hermes_ariadne.tree import Part
+    from hermes_ariadne.tree_store import TreeStore
+
+    class IdleContext(FullContext):
+        def register_idle_task(self, name, callback, **schedule):
+            assert name == "resume-tree"
+            assert schedule == dict(interval_hours=1, min_idle_hours=0, first_run="immediate")
+            self.idle = callback
+
+    home = tmp_path / "profile"
+    home.mkdir(mode=0o700)
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: home)
+    config = {"context": {"engine": "compressor"}}
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+    ctx = IdleContext()
+    started = threading.Event()
+
+    class RecordingFacade(Facade):
+        def complete(self, *args, **kwargs):
+            started.set()
+            return SimpleNamespace(text="summary")
+
+    ctx.llm = RecordingFacade()
+    Importer(home).import_batch(
+        key="synthetic", title="Synthetic", messages=[{"role": "user", "content": "a" * 800}]
+    )
+    root = load_root()
+    root.register(ctx)
+    engine = ctx.engines[0]
+    assert engine._shared is None and not started.is_set()
+    ctx.idle(None)
+    assert not started.is_set()
+    config["context"]["engine"] = "ariadne"
+    ctx.idle(None)
+    assert started.wait(5)
+    module = sys.modules[type(engine).__module__]
+    builder = module.shared_home(home).builder
+    builder.stop(timeout=5)
+    assert Part(0, 0) in TreeStore(home).nodes()
+    assert engine._shared is None
+
+
 def test_collector_without_llm_registers_provider_only():
     ctx = CollectorContext()
     load_root().register(ctx)

@@ -557,6 +557,20 @@ class TreeAriadneEngine(RollingAriadneEngine):
         if shared is not None:
             shared.release()
 
+    def resume_backlog(self, home):
+        """Wake already indexed work by profile, without attaching a conversation."""
+        if not self._background:
+            return
+        archive = _archive_path(home, private_home=False)
+        if not archive.is_file() or not TreeStore(home).count():
+            return
+        shared = _shared(home, self._llm, self._tree_settings, self._background)
+        shared.acquire()
+        try:
+            shared.kick()
+        finally:
+            shared.release()
+
     def _initialize(self, scope):
         """Archive admission and observation as rolling does, without its journal."""
         if not callable(getattr(scope.db, "get_messages", None)) or not scope.session_id:
