@@ -2,9 +2,10 @@
 
 Ariadne is a small, experimental Hermes **ContextEngine plugin**. Correctness,
 archive integrity and reviewable changes come before feature count. Read the
-[README](README.md) for shipped behavior. Ordinary `ariadne` remains passive;
-the separate `ariadne-prepared` engine consumes an operator-published frozen view.
-Neither generates automatic live summaries.
+[README](README.md) for shipped behavior. The opt-in plugin's `ariadne` engine
+builds profile summaries in the background. The legacy passive engine and
+`ariadne-prepared`, which consumes an operator-published frozen view, do not
+generate automatic live summaries.
 
 ## Before starting
 

@@ -65,8 +65,12 @@ instructions.
 Summaries are written in the background through Hermes's LLM facade under the
 auxiliary task `ariadne_summary`; a turn never waits for them. By default it
 uses the chat model. Once started, the worker can drain the backlog after the
-last chat closes, while its Hermes process is still running. **Recommended:
-pin a faster, cheaper model** with the
+last chat closes, while its Hermes process is still running. On hosts with
+plugin idle tasks, the `resume-tree` task wakes an existing backlog without
+opening a chat. It runs on the first eligible maintenance poll and no more
+than once an hour; that cadence persists across restarts. On older hosts,
+opening a chat still wakes the builder. **Recommended: pin a faster, cheaper
+model** with the
 `auxiliary.ariadne_summary` block (`provider`, `model`, `base_url`, `api_key`,
 `timeout`, like Hermes's other auxiliary tasks; the Hermes auxiliary settings
 UI lists it as "Ariadne summaries"). In the real runs Mistral Large took about

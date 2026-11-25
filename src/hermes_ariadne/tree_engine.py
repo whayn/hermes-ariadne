@@ -255,10 +255,13 @@ class _Home:
 
     def acquire(self):
         with self.lock:
+            if not self.users and self.background:
+                self.builder.start()
             self.users += 1
-            first = self.users == 1
-        if first and self.background:
-            self.builder.start()  # reconciles dead reservations, then a daemon worker
+
+    def resume(self):
+        with self.lock:
+            self.builder.start()  # recover and rearm eligible jobs before waking
 
     def release(self):
         with self.lock:
@@ -556,6 +559,17 @@ class TreeAriadneEngine(RollingAriadneEngine):
         self._source = self._last = None
         if shared is not None:
             shared.release()
+
+    def resume_backlog(self, home):
+        """Wake already indexed work by profile, without attaching a conversation."""
+        if not self._background:
+            return
+        archive = _archive_path(home, private_home=False)
+        if not archive.is_file() or not TreeStore(home).count():
+            return
+        # Storage errors propagate to Hermes's idle runner, which logs and
+        # records the failure and releases the claim for the next poll interval.
+        _shared(home, self._llm, self._tree_settings, self._background).resume()
 
     def _initialize(self, scope):
         """Archive admission and observation as rolling does, without its journal."""

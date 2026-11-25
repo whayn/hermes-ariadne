@@ -59,6 +59,20 @@ def register(ctx):
     register_task = getattr(ctx, "register_auxiliary_task", None)
     if callable(register_task):
         register_summary_task(ctx)
-    return ctx.register_context_engine(
-        TreeAriadneEngine(llm=llm, settings=settings, tree_settings=tree)
-    )
+    engine = TreeAriadneEngine(llm=llm, settings=settings, tree_settings=tree)
+    registration = ctx.register_context_engine(engine)
+    register_idle = getattr(ctx, "register_idle_task", None)
+    if callable(register_idle):
+
+        def resume(_run):
+            # Hermes invokes idle tasks in the registering profile's scope.
+            from hermes_cli.config import load_config
+            from hermes_constants import get_hermes_home
+
+            if (load_config().get("context") or {}).get("engine") == engine.name:
+                engine.resume_backlog(get_hermes_home())
+
+        register_idle(
+            "resume-tree", resume, interval_hours=1, min_idle_hours=0, first_run="immediate"
+        )
+    return registration
