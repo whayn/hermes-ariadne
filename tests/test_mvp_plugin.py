@@ -137,14 +137,14 @@ def test_idle_task_resumes_existing_tree_without_a_chat(tmp_path, monkeypatch, s
     root = load_root()
     root.register(ctx)
     engine = ctx.engines[0]
+    module = sys.modules[type(engine).__module__]
     assert engine._shared is None and not started.is_set()
     ctx.idle(None)
-    assert not started.is_set()
+    assert module.shared_home(home) is None
     config["context"]["engine"] = "ariadne"
     store = TreeStore(home)
     part = Part(0, 0)
     assert store.reserve(part, 10, f"{os.getpid()}:old", max_jobs=0, max_total_bytes=0)
-    module = sys.modules[type(engine).__module__]
     if start_fails:
 
         def unavailable(*args):
