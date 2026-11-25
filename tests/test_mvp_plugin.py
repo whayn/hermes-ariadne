@@ -100,7 +100,10 @@ def test_full_context_registers_both():
     assert clone.name == "ariadne" and clone._llm is engine._llm
 
 
-def test_idle_task_resumes_existing_tree_without_a_chat(tmp_path, monkeypatch):
+@pytest.mark.parametrize("start_fails", [False, True])
+def test_idle_task_resumes_existing_tree_without_a_chat(tmp_path, monkeypatch, start_fails):
+    import os
+    import sqlite3
     import threading
     from types import SimpleNamespace
 
@@ -138,12 +141,27 @@ def test_idle_task_resumes_existing_tree_without_a_chat(tmp_path, monkeypatch):
     ctx.idle(None)
     assert not started.is_set()
     config["context"]["engine"] = "ariadne"
+    store = TreeStore(home)
+    part = Part(0, 0)
+    assert store.reserve(part, 10, f"{os.getpid()}:old", max_jobs=0, max_total_bytes=0)
+    module = sys.modules[type(engine).__module__]
+    if start_fails:
+
+        def unavailable(*args):
+            raise sqlite3.OperationalError("database is locked")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(module.TreeStore, "rearm_lost", unavailable)
+            with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                ctx.idle(None)
+        assert not started.is_set()
+        assert module.shared_home(home).users == 0
     ctx.idle(None)
     assert started.wait(5)
-    module = sys.modules[type(engine).__module__]
     builder = module.shared_home(home).builder
     builder.stop(timeout=5)
-    assert Part(0, 0) in TreeStore(home).nodes()
+    assert part in store.nodes()
+    assert store.jobs()[part].auto_retries == 1
     assert engine._shared is None
 
 
