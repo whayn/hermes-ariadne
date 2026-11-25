@@ -773,7 +773,7 @@ def test_background_builder_runs_after_a_turn_without_blocking(home, monkeypatch
         time.sleep(0.05)
     assert Part(2, 0) in TreeStore(home).nodes()
     engine.on_session_end("chat-a", [])
-    assert builder._stopped
+    assert not builder._stopped  # ordinary detach does not stop the profile worker
 
 
 def test_cache_prefix_is_stable_across_turns_between_merge_batches(home, monkeypatch):
@@ -1030,9 +1030,9 @@ def test_turns_selection_tools_and_session_end_never_wait_for_the_builder(home, 
     engine.handle_tool_call("ariadne_memory_status", {})
     assert stops == []  # a turn never stops, let alone waits for, the builder
     engine.on_session_end("chat-a", [])  # a real session boundary in a long-lived process
-    assert stops == [0]  # the last release stops scheduling and waits for nothing
     gate.set()
-    _wait(lambda: Part(1, 0) in TreeStore(home).nodes())
+    _wait(lambda: Part(2, 0) in TreeStore(home).nodes())
+    assert stops == []  # no stop or wait before the remaining jobs drain
 
 
 def test_process_exit_waits_for_the_inflight_call_up_to_exit_wait(home, monkeypatch):

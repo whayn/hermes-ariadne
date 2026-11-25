@@ -94,15 +94,12 @@ run reads everything. Live appends wait until the reconcile has completed, then
 catch up (appends are idempotent and every turn appends all missing active rows).
 
 Waiting for in-flight summaries (``tree.exit_wait``): a turn never blocks on the builder.
-``on_turn_complete``, ``select_context``, the tools and a session end only ever kick the
-builder or call ``stop(timeout=0)``. The one place that waits is the ``atexit`` hook
-``_shutdown``: it stops scheduling, then gives in-flight calls up to ``exit_wait`` seconds
-(default 60, 0 = none) to commit. The final ``release`` of a home does NOT wait, because
-the host calls ``on_session_end`` for ``/new`` and gateway session rollover too and
-nothing there distinguishes a process that is exiting; at a real exit it runs first
-(agent close) or after ``_shutdown``, and ``stop`` is repeatable, so ``_shutdown`` still
-waits for what is left. Calls that outlive the wait stay ``reserved`` and the next start
-re-asks them once (``tree.auto_reask_lost``).
+``on_turn_complete``, ``select_context``, the tools and a session end never wait
+for model calls. Detaching the last session lets the profile worker drain and
+then go idle. On process exit, ``_shutdown`` stops scheduling and gives in-flight
+calls up to ``exit_wait`` seconds to commit. Calls that outlive the wait stay
+``reserved`` and the next start
+auto-reasks them once (``tree.auto_reask_lost``).
 
 Tools (replacing ``ariadne_find``/``ariadne_rolling_page`` for this engine):
 ``ariadne_zoom``, ``ariadne_search``, ``ariadne_memory_status``. Their output is
@@ -266,11 +263,8 @@ class _Home:
     def release(self):
         with self.lock:
             self.users = max(0, self.users - 1)
-            last = self.users == 0
-        if last and self.background:
-            # Never waits (see ``_shutdown``): this runs at every session end, and a
-            # long-lived process (gateway, /new) must not stall on a summary call.
-            self.builder.stop(timeout=0)
+        # The worker belongs to the profile in this process, not to its sessions.
+        # It drains admitted jobs and goes idle on its own; _shutdown stops it.
 
     def kick(self):
         if self.background:
