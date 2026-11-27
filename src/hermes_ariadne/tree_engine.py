@@ -6,14 +6,14 @@ profile (``profile_tree.render_view``: ``id+n|text`` lines, legend after them), 
 this conversation's messages from the retirement boundary on, verbatim. Nothing else
 changes; ``request_messages`` and the host history are never mutated.
 
-What is reused, unchanged, from ``rolling_engine.RollingAriadneEngine`` (subclassed):
+From ``session_binding.SessionBoundEngine`` (subclassed; it and ``host_request`` were
+split out of the development rolling engine unchanged, #70):
 binding/lifecycle and revocation scopes, archive admission and observation of the
 session's canonical rows from SessionDB (``_observe_scope``/``_read``), the request
 correspondence proof ``_validated_anchor`` (host prefix split, ``message_uid``
 identity, the incoming boundary, the host ``<memory-context>`` recall block, the
 ``_replayed_reasoning_tokens`` bookkeeping, reasoning/carrier admission and the sticky
-``unsupported_carrier`` refusal), ``_decline`` and the queued diagnostics. The rolling
-journal and its synchronous summary preparation are NOT used: summaries are built by
+``unsupported_carrier`` refusal), ``_decline`` and the queued diagnostics. Summaries are built by
 the shared background ``tree_builder.TreeBuilder``; a turn never waits for them.
 
 Placement of the view (adapter evidence, installed Hermes 0.23.3 ``caafe53``): the view
@@ -120,14 +120,11 @@ from pathlib import Path
 
 from . import profile_tree as pt
 from .conversations import ArchiveReader, RestrictedEvidence, _check, _linkage, _text_of
-from .engine import AriadneEngine as _PassiveEngine
+from .host_request import _leading, _tool_sequence, ascii_json_units, sha256
 from .notes import NoteStore, StorageRefused
-from .prepared import _leading
-from .receipts import _mkdir_private
+from .private_paths import archive_path, mkdir_private
 from .retrieval import _error, _UnsupportedDataUse
-from .rolling import sha256
-from .rolling_engine import RollingAriadneEngine, _archive_path, _flushing, _refused_carrier
-from .simulation import _tool_sequence, ascii_json_units
+from .session_binding import SessionBoundEngine, _flushing, _refused_carrier
 from .store import EventStore, canonical_json, carrier_free, search_text
 from .tree import Part, View, flat, utf8_size
 from .tree_builder import TreeBuilder, TreeSettings
@@ -502,6 +499,42 @@ def current_view(store, count, high):
     return View(parts, size, base.batch, high), nodes
 
 
+def _identity_shape(history, active):
+    """Counts and roles of the conversation messages without a unique ``message_uid`` (#47).
+
+    Never content: roles are reduced to the known set. ``missing_after_canonical``: every
+    uid-less message comes after the canonical (persisted) rows, e.g. an in-flight tool
+    loop the host has not flushed yet.
+    """
+    shape = {"missing": 0, "duplicate": 0, "missing_roles": [], "missing_after_canonical": None}
+    try:
+        messages = [m for m in history if type(m) is dict]
+        messages = messages[_leading(messages) :]
+        seen, missing, duplicate, roles = set(), [], 0, set()
+        for index, message in enumerate(messages):
+            uid = message.get("message_uid")
+            if not isinstance(uid, str) or not uid:
+                missing.append(index)
+                role = message.get("role")
+                roles.add(role if role in {"user", "assistant", "tool"} else "other")
+            elif uid in seen:
+                duplicate += 1
+            else:
+                seen.add(uid)
+        canonical = len(active) if type(active) is list else None
+        shape.update(
+            missing=len(missing),
+            duplicate=duplicate,
+            missing_roles=sorted(roles),
+            missing_after_canonical=(
+                None if canonical is None or not missing else min(missing) >= canonical
+            ),
+        )
+    except Exception:  # noqa: BLE001 - diagnostics must never fail a decline
+        pass
+    return shape
+
+
 def _int(value, name, minimum=0, default=None):
     if value is None and default is not None:
         return default
@@ -519,13 +552,12 @@ def _ok(**payload):
 # --------------------------------------------------------------------------- #
 
 
-class TreeAriadneEngine(RollingAriadneEngine):
+class TreeAriadneEngine(SessionBoundEngine):
     """Per-agent engine; the tree store and builder are shared per home (see module)."""
 
-    _private_home = False  # Hermes profile homes are 0755; Ariadne's own files stay private
-
-    def __init__(self, llm, settings=None, tree_settings=None, *, background=True):
-        super().__init__(llm=llm, settings=settings)
+    def __init__(self, llm, tree_settings=None, *, background=True):
+        super().__init__()
+        self._llm = llm
         self._tree_settings = tree_settings if tree_settings is not None else TreeSettings()
         if not isinstance(self._tree_settings, TreeSettings):
             raise TypeError("tree_settings must be TreeSettings")
@@ -542,7 +574,6 @@ class TreeAriadneEngine(RollingAriadneEngine):
     def clone_for_agent(self):
         clone = type(self)(
             llm=self._llm,
-            settings=self._settings,
             tree_settings=self._tree_settings,
             background=self._background,
         )
@@ -564,7 +595,7 @@ class TreeAriadneEngine(RollingAriadneEngine):
         """Wake already indexed work by profile, without attaching a conversation."""
         if not self._background:
             return
-        archive = _archive_path(home, private_home=False)
+        archive = archive_path(home)
         if not archive.is_file() or not TreeStore(home).count():
             return
         # Storage errors propagate to Hermes's idle runner, which logs and
@@ -572,14 +603,14 @@ class TreeAriadneEngine(RollingAriadneEngine):
         _shared(home, self._llm, self._tree_settings, self._background).resume()
 
     def _initialize(self, scope):
-        """Archive admission and observation as rolling does, without its journal."""
+        """Admit and observe the archive, then attach the home's shared tree."""
         if not callable(getattr(scope.db, "get_messages", None)) or not scope.session_id:
             return
         try:
             with self._lock:
                 self._guard(scope)
-                archive = _archive_path(scope.home, private_home=False)
-                _mkdir_private(archive.parent)
+                archive = archive_path(scope.home)
+                mkdir_private(archive.parent)
                 self._store = EventStore(archive)
                 self._guard(scope)
                 scope = self._capture()
@@ -708,6 +739,7 @@ class TreeAriadneEngine(RollingAriadneEngine):
             )
         if type(budget_tokens) is not int or budget_tokens <= 0:
             return self._decline("unknown_budget", scope, incoming=incoming_message)
+        active = None
         try:
             if not self._primary(scope):
                 return self._decline("non_primary", scope, incoming=incoming_message)
@@ -754,9 +786,15 @@ class TreeAriadneEngine(RollingAriadneEngine):
             elif isinstance(error, (ValueError, TypeError, KeyError, IndexError, RecursionError)):
                 msg = error.args[0] if type(error) is ValueError and error.args else None
                 check = _SHAPE_CHECKS.get(msg, "other") if type(msg) is str else "other"
-                return self._decline(
+                self._decline(
                     "unsupported_shape", scope, incoming=incoming_message, shape_check=check
                 )
+                if check == "message_identity":
+                    shape = _identity_shape(conversation_messages, active)
+                    with self._lock:
+                        if self._current(scope) and self._selection.get("status") == "declined":
+                            self._selection["identity"] = shape
+                return None
             else:
                 reason = "selection_unavailable"
             return self._decline(reason, scope, incoming=incoming_message)
@@ -1108,7 +1146,7 @@ class TreeAriadneEngine(RollingAriadneEngine):
     def get_status(self):
         with self._lock:
             return {
-                **_PassiveEngine.get_status(self),
+                **SessionBoundEngine.get_status(self),
                 "tree": dict(self._tree),
                 "selection": dict(self._selection),
             }

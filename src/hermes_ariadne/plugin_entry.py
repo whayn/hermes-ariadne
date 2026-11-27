@@ -14,10 +14,9 @@ when that facade is present. Import and construction perform no I/O.
 
 The ``ariadne`` engine is the profile memory-tree engine (``tree_engine``, issue
 #54), configured by the plugin's ``tree`` settings; summary calls run under the
-plugin-owned auxiliary task ``ariadne_summary``. The ``rolling`` block is still
-validated (an invalid value refuses registration) and passed to the base class's
-archive helpers; rolling summaries remain the development ``ariadne-rolling``
-engine's.
+plugin-owned auxiliary task ``ariadne_summary``. The legacy ``rolling`` block is
+still validated (an invalid value refuses registration) but unused by the engine;
+it goes with the development engines (#70, phase 2).
 """
 
 
@@ -54,12 +53,12 @@ def register(ctx):
     from .tree_builder import TreeSettings, register_summary_task
     from .tree_engine import TreeAriadneEngine
 
-    settings = RollingSettings(**ctx.get_config("rolling", {}))
+    RollingSettings(**ctx.get_config("rolling", {}))  # validated only (legacy block)
     tree = TreeSettings.from_config(ctx.get_config("tree", None))
     register_task = getattr(ctx, "register_auxiliary_task", None)
     if callable(register_task):
         register_summary_task(ctx)
-    engine = TreeAriadneEngine(llm=llm, settings=settings, tree_settings=tree)
+    engine = TreeAriadneEngine(llm=llm, tree_settings=tree)
     registration = ctx.register_context_engine(engine)
     register_idle = getattr(ctx, "register_idle_task", None)
     if callable(register_idle):

@@ -11,11 +11,12 @@ if not os.environ.get("HERMES_SOURCE"):
     pytest.skip("HERMES_SOURCE required for the ContextEngine ABC", allow_module_level=True)
 
 from agent.turn_context import compose_user_api_content  # noqa: E402
-from test_rolling_selection import POLICY, assembled, exchange, restored  # noqa: E402
+from test_rolling_selection import assembled, exchange, restored  # noqa: E402
 from test_tree_builder import FakeLlm  # noqa: E402
 
 from hermes_ariadne import profile_tree as pt  # noqa: E402
 from hermes_ariadne import tree_engine  # noqa: E402
+from hermes_ariadne.host_request import ReasoningReplayPolicy  # noqa: E402
 from hermes_ariadne.store import EventStore, canonical_json  # noqa: E402
 from hermes_ariadne.tree import Part, View  # noqa: E402
 from hermes_ariadne.tree_builder import TreeBuilder, TreeSettings  # noqa: E402
@@ -23,6 +24,7 @@ from hermes_ariadne.tree_engine import TreeAriadneEngine  # noqa: E402
 from hermes_ariadne.tree_store import TreeStore  # noqa: E402
 
 BUDGET = 100000
+POLICY = ReasoningReplayPolicy("codex_backend", "gpt-test")
 
 
 @pytest.fixture(autouse=True)
@@ -244,6 +246,32 @@ def test_a_tool_round_in_the_current_exchange_keeps_its_complete_group(home, mon
     assert count == 8 and request[-1]["role"] == "tool"
     assert [m["role"] for m in result[-3:]] == ["user", "assistant", "tool"]
     assert result[-2] == request[-2]
+
+
+def test_missing_identity_decline_reports_which_messages_lack_one(home, monkeypatch):
+    """#47: name the roles and places of uid-less messages, never their content."""
+    world = World(home, monkeypatch)
+    a = world.engine("chat-a")
+    world.turn(a, "chat-a", "A")
+    world.build(a)
+    world.ask("chat-a", "D")
+    unflushed = rows_for("chat-a", "D", complete=False)[1:]  # call and result, not persisted
+    history = restored(world.history_rows("chat-a") + unflushed)
+    for message in history[-2:]:
+        message.pop("message_uid")
+        message["content"] = "SECRET-47"
+    result, _ = world.select(a, "chat-a", "D", history=history)
+    assert result is None
+    selection = call(a, "ariadne_memory_status")["selection"]
+    assert selection["reason"] == "unsupported_shape"
+    assert selection["shape_check"] == "message_identity"
+    assert selection["identity"] == {
+        "missing": 2,
+        "duplicate": 0,
+        "missing_roles": ["assistant", "tool"],
+        "missing_after_canonical": True,
+    }
+    assert "SECRET-47" not in json.dumps(a.get_status())
 
 
 def test_declines_unknown_budget_over_budget_and_unsupported_shapes(home, monkeypatch):

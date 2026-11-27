@@ -49,7 +49,9 @@ Tools:
 - `ariadne_memory_status`: summary progress and blocked summaries, plus the
   latest selection attempt in this chat. `selection.status` is `selected`,
   `declined`, or `not_evaluated`. A decline includes a reason and, for request
-  shape errors, a `shape_check` label without message text. This is the engine's
+  shape errors, a `shape_check` label without message text (for `message_identity`,
+  also an `identity` count of messages without a unique `message_uid`, their roles,
+  and whether they all come after the stored rows). This is the engine's
   decision for its latest request, not a provider receipt or a diagnosis of an
   earlier reply. `retry` re-asks blocked summaries.
 - `ariadne_notes` and `ariadne_import` (below).
