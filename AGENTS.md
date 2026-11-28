@@ -43,7 +43,9 @@ findings are triaged by the agent that owns the PR; the maintainer decides only 
 what the triage escalates. Bots review the diff, not the product: the product goal
 is UniiChat-like memory on Hermes (#70: nothing lost, never blocks, always a view).
 
-- After the bots have commented on a ready PR, classify every finding:
+- When the PR is ready, comment `@coderabbitai review` (CodeRabbit does not review
+  this repository automatically); Sourcery reviews on its own. After the bots have
+  commented, classify every finding:
   - **Shipped-path defect, reproducible:** write a failing test, fix, reply in the
     thread with the commit and test name, resolve.
   - **Hypothetical edge case or extra hardening:** decline in the thread with a
