@@ -1,11 +1,9 @@
 # Contributing to Ariadne
 
-Ariadne is a small, experimental Hermes **ContextEngine plugin**. Correctness,
-archive integrity and reviewable changes come before feature count. Read the
-[README](README.md) for shipped behavior. The opt-in plugin's `ariadne` engine
-builds profile summaries in the background. The legacy passive engine and
-`ariadne-prepared`, which consumes an operator-published frozen view, do not
-generate automatic live summaries.
+Ariadne is a small, experimental Hermes plugin: the `ariadne` memory provider and
+the `ariadne` context engine, which builds profile summaries in the background.
+Correctness, archive integrity and reviewable changes come before feature count.
+Read the [README](README.md) for shipped behavior.
 
 ## Before starting
 
@@ -91,7 +89,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt -e .
 .venv/bin/ruff check src tests
 .venv/bin/ruff format --check src tests
-.venv/bin/python -m pytest tests/test_store.py tests/test_crash.py tests/test_simulation.py tests/test_tree.py tests/test_kernel.py tests/test_kernel_demo.py tests/test_receipts.py tests/test_compaction.py tests/test_compactor_profile.py tests/test_host_site.py tests/test_prepared.py tests/test_retrieval.py -q
+.venv/bin/python -m pytest tests/test_store.py tests/test_crash.py tests/test_tree.py tests/test_profile_tree.py tests/test_tree_store.py tests/test_tree_builder.py tests/test_host_site.py tests/test_notes.py -q
 .venv/bin/python -m build
 git diff --check
 ```
@@ -109,7 +107,7 @@ Tests must redirect `HERMES_HOME` before importing Hermes. Use the caller's scra
 they are not proof of actual model recall. Add a regression test for a bug and,
 where practical, demonstrate that it fails on the base revision and passes on the fix.
 
-Hosted CI runs lint/format/build, archive/simulator/kernel tests on Python 3.11 and 3.14, a full
+Hosted CI runs lint/format/build, archive/notes/tree tests on Python 3.11 and 3.14, a full
 integration suite against a **pinned real Hermes revision**, and a history secret
 scan. The host pin is in `.github/workflows/ci.yml`; one pinned revision is not a
 claim of compatibility with all Hermes releases or providers. Hosted runners are

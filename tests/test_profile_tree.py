@@ -10,7 +10,6 @@ from pathlib import Path
 import pytest
 
 from hermes_ariadne import profile_tree as pt
-from hermes_ariadne.kernel import MemoryKernel
 from hermes_ariadne.tree import Part, View, advance_view, flat, roots, utf8_size
 
 SRC = Path(pt.__file__)
@@ -398,10 +397,15 @@ def all_parts(count):
     return [Part(level, i) for level in range(count.bit_length()) for i in range(count >> level)]
 
 
-def test_due_matches_the_kernel_order():
-    for part in all_parts(40):
-        assert pt.due(part) == MemoryKernel._due(part)
-    assert pt.due(Part(1, 0)) < pt.due(Part(0, 2))  # a merge precedes the leaf it ties with
+def test_advance_seen_cuts_the_view_before_the_jobs_first_message():
+    nodes = {Part(0, i): f"t{i}" for i in range(8)}
+    seen = View(high=1000)
+    assert pt.advance_seen(seen, Part(1, 2), nodes, 8) == advance_view(
+        seen, 6, nodes, next_message=True
+    )
+    assert pt.advance_seen(seen, Part(0, 7), nodes, 3) == advance_view(
+        seen, 3, nodes, next_message=True
+    )
 
 
 def test_ready_jobs_examples():
@@ -495,17 +499,6 @@ def test_job_context_cutoff_rule_and_none_cases():
     # over its high -> None
     big = {Part(0, i): "x" * 40 for i in range(4)}
     assert pt.job_context(View(high=10), Part(0, 3), big, 4) is None
-
-
-def test_advance_seen_matches_kernel_cutoff_rule():
-    nodes = {Part(0, i): f"t{i}" for i in range(8)}
-    seen = View(high=1000)
-    assert pt.advance_seen(seen, Part(1, 2), nodes, 8) == advance_view(
-        seen, 6, nodes, next_message=True
-    )
-    assert pt.advance_seen(seen, Part(0, 7), nodes, 3) == advance_view(
-        seen, 3, nodes, next_message=True
-    )
 
 
 def test_job_context_validation():

@@ -202,7 +202,7 @@ def test_site_disabled_discovery_uses_real_venv_without_executing_startup(tmp_pa
     assert not marker.exists()
 
 
-@pytest.mark.parametrize("name", ["test.sh", "compactor-demo.sh"])
+@pytest.mark.parametrize("name", ["test.sh"])
 def test_launchers_discover_real_venv_without_site_startup(tmp_path, name):
     interpreter = shutil.which("python3.13")
     if interpreter is None:
@@ -282,7 +282,7 @@ def test_venv_directory_symlink_keeps_lexical_selected_path(tmp_path):
     assert not result.stdout.strip().startswith(str(host) + os.sep)
 
 
-@pytest.mark.parametrize("name", ["test.sh", "compactor-demo.sh"])
+@pytest.mark.parametrize("name", ["test.sh"])
 def test_launcher_propagates_discovery_failure_without_starting_worker(tmp_path, name):
     root, script = copy_launcher(tmp_path, name)
     host_python = tmp_path / "failing host python"
