@@ -13,8 +13,8 @@ import sqlite3
 from pathlib import Path
 
 from .notes import StorageRefused
+from .private_paths import archive_path
 from .retrieval import _require_supported_data_use, _UnsupportedDataUse
-from .rolling_engine import _archive_path
 from .store import APPLICATION_ID, carrier_free, search_text
 
 MAX_PAGE = 50
@@ -81,9 +81,7 @@ class ArchiveReader:
 
     def _connect(self):
         try:
-            archive = _archive_path(
-                self.home, private_home=False
-            )  # metadata-only admission, no creation
+            archive = archive_path(self.home)  # metadata-only admission, no creation
         except ValueError as exc:
             raise StorageRefused(str(exc)) from exc
         if not archive.is_file():

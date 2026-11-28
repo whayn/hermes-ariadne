@@ -32,7 +32,7 @@ Deviations from the issue #54 plan (section B), all additive:
   stored conversation already has that tag, it is lengthened by 4 hex chars at a
   time, so tags stay unique (the legend, not the hash, is authoritative).
 - ``backfill`` only accepts ``<home>/ariadne/events.sqlite3`` (the archive reader's
-  admission, reimplemented here because ``rolling_engine`` imports Hermes), and
+  admission ``private_paths.archive_path``, raising ``StorageRefused``), and
   skips (and counts) archived rows without a message uid or a known role.
 """
 
@@ -1006,8 +1006,7 @@ def log_entry_for(event_id, message):
 
 
 def _admit_archive(archive):
-    """``rolling_engine._archive_path(home, private_home=False)`` without its host
-    imports: a symlink-free home; private, single-link Ariadne files (drift tightened)."""
+    """``private_paths.archive_path`` raising ``StorageRefused``: a symlink-free home; private, single-link Ariadne files (drift tightened)."""
     for item in (archive.parent.parent, *archive.parent.parent.parents):
         if item.is_symlink():
             raise StorageRefused("ariadne home must not traverse symlinks")
