@@ -187,10 +187,7 @@ def register_summary_task(ctx) -> None:
     ctx.register_auxiliary_task(
         TASK,
         display_name="Ariadne summaries",
-        description=(
-            "Writes the one-line summaries of Ariadne's memory tree of every conversation. "
-            "Defaults to the chat model; pin a cheaper model under auxiliary.ariadne_summary."
-        ),
+        description="Memory tree summaries",
     )
 
 

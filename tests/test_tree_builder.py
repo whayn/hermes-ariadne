@@ -213,7 +213,7 @@ def test_register_summary_task_uses_a_plugin_owned_key():
     ((key, kwargs),) = seen
     assert key == TASK == "ariadne_summary"
     assert kwargs["display_name"] == "Ariadne summaries"
-    assert "chat model" in kwargs["description"] and "summar" in kwargs["description"]
+    assert kwargs["description"] == "Memory tree summaries"  # a short label, no model name
     assert kwargs.get("defaults") is None and kwargs.get("inherit_from") is None
 
 
