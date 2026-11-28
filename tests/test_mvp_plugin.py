@@ -206,9 +206,11 @@ def test_invalid_tree_config_refuses_engine(tree):
         load_root().register(FullContext({"tree": tree}))
 
 
-def test_invalid_rolling_config_refuses_engine():
-    with pytest.raises((TypeError, ValueError)):
-        load_root().register(FullContext({"rolling": {"unknown_limit": 1}}))
+def test_a_leftover_rolling_config_block_is_ignored():
+    """v0.2.x/v0.3.0 configs may still carry ``rolling``; the engine no longer has one."""
+    ctx = FullContext({"rolling": {"unknown_limit": 1, "timeout": 0}})
+    load_root().register(ctx)
+    assert len(ctx.engines) == 1
 
 
 def test_each_registration_builds_fresh_instances():

@@ -132,8 +132,11 @@ Job and byte caps count logical reservations, not HTTP requests or billing.
 ### Upgrading from v0.2.x
 
 On first start the engine backfills the existing archive into the tree in the
-background. The archive is kept; the rolling journals and the notes
-conversation index are no longer used by the `ariadne` engine. Summaries for
+background. The archive is kept; the notes conversation index is no longer
+used by the `ariadne` engine. Since #70 the rolling and prepared engines are gone:
+their leftover directories (`$HERMES_HOME/ariadne/rolling/` and
+`$HERMES_HOME/ariadne/prepared/`) are left untouched and unused, and can be
+deleted by hand; a leftover `rolling` block in the plugin config is ignored. Summaries for
 the backlog are then built, which costs model calls (see above). Note-store and
 tree-store schemas migrate in place; an older revision refuses a newer store.
 
@@ -160,9 +163,7 @@ Context Engine list is fixed to Hermes's built-in choices (`compressor`,
 `default`, `custom`; "custom" is a literal value, not a free-text field). Set it
 with `hermes config set context.engine ariadne`; the list then shows `ariadne`
 as the current value. The engine needs `plugins.isolation: in_process` (Hermes's default);
-`host` isolation is unsupported. Do not also run the development
-`ariadne-install` in the same profile: it targets the same
-`$HERMES_HOME/plugins/ariadne` directory with the old passive engine.
+`host` isolation is unsupported.
 
 ### Why the explicit `enable`
 
@@ -235,15 +236,14 @@ symlinks. If Ariadne's own directory or files are found with a wider mode, it
 resets them to private and logs a warning. It refuses symlinks, hardlinked or
 non-regular files and paths owned by another user, reported to the agent as
 `storage_refused`. This protects against other local users, not against
-processes running as the Hermes user. The development engines
-(`ariadne-install`) keep their stricter rule requiring a `0700` home.
+processes running as the Hermes user.
 
 ## Memory-context recall and the tree
 
 When the memory provider recalls something, Hermes sends the user's message
 plus a `<memory-context>` block and stores that sent text as the row's
-`api_content`. The tree engine reuses the rolling engine's request
-correspondence check: it compares that exact sent text across the stored,
+`api_content`. The tree engine's request correspondence check
+(`host_request.py`): it compares that exact sent text across the stored,
 restored and assembled views, but only when it is the typed text followed by
 exactly one block in Hermes's own format (`agent/memory_context.py`); any other
 difference declines selection. Summaries are written from the typed text only,

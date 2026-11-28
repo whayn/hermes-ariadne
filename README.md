@@ -56,21 +56,12 @@ notes and the tree are stored unencrypted under `$HERMES_HOME/ariadne/`, and the
 is no erasure command yet. Releases are prereleases; there is no stable release
 or PyPI package.
 
-## Development engines
+## Development
 
-The repository also contains earlier development engines and offline tooling.
-They are not needed to use the plugin above:
-
-- [Passive archive engine](docs/passive-engine.md): `ariadne-install`, verbatim
-  snapshots and `ariadne_search`.
-- [Prepared context](docs/prepared-context.md) and
-  [rolling context](docs/rolling-context.md): opt-in selection engines
-  ([rolling storage](docs/rolling-storage.md)).
-- [Context-selection simulator](docs/context-selection-simulator.md),
-  [offline memory kernel](docs/offline-memory-kernel.md) (the UniiChat tree port)
-  and [native compactor](docs/native-compaction.md).
-- [Inspected Hermes contracts](docs/integration-findings.md) and
-  [verification notes](docs/verification.md).
+Earlier development engines (passive archive, prepared and rolling context,
+simulator, offline kernel, native compactor) were removed in #70; they remain in
+the git history and the `v0.2.1` tag. The Hermes contracts the plugin relies on
+are recorded in [integration-findings.md](docs/integration-findings.md).
 
 ## Contributing
 

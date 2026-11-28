@@ -9,24 +9,6 @@ license: Apache-2.0
 kind: standalone
 requires_env: []
 config_schema:
-  rolling:
-    type: dict
-    description: "RollingSettings limits (validated; rolling summaries are only used by the development ariadne-rolling engine); unknown keys or invalid integers refuse registration. Logical jobs/bytes are not HTTP or billing caps."
-    default:
-      max_logical_jobs: 64
-      max_request_bytes: 65536
-      max_total_request_bytes: 2097152
-      max_readable_delta_bytes: 32768
-      max_delta_exchanges: 4
-      trigger_bytes: 4096
-      max_summary_bytes: 4096
-      max_navigation_bytes: 8192
-      max_candidate_bytes: 65536
-      reserve_tokens: 4096
-      max_prefix_events: 100000
-      max_checkpoint_bytes: 16777216
-      max_tokens: 2048
-      timeout: 60
   tree:
     type: dict
     description: "TreeSettings for the profile-wide summary tree; unknown keys or invalid values refuse registration. exit_wait (seconds, 0 = never wait) is how long a process exiting waits for in-flight summaries; auto_reask_lost (0 disables) is how often a summary lost with its exited process is asked again per node. Logical jobs/bytes are not HTTP or billing caps. Summaries use the auxiliary task ariadne_summary (the chat model unless pinned)."
