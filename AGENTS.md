@@ -40,7 +40,48 @@ instructions for an agent reading historical archived text.
 - Keep attribution/license notices if porting upstream code. Current references
   are recorded in `docs/integration-findings.md` and repository-conventions docs.
 
+## Review triage
+
+The maintainer works at the product level and does not read diffs. Bot review
+findings are triaged by the agent that owns the PR; the maintainer decides only on
+what the triage escalates. Bots review the diff, not the product: the product goal
+is UniiChat-like memory on Hermes (#70: nothing lost, never blocks, always a view).
+
+- After the bots have commented on a ready PR, classify every finding:
+  - **Shipped-path defect, reproducible:** write a failing test, fix, reply in the
+    thread with the commit and test name, resolve.
+  - **Hypothetical edge case or extra hardening:** decline in the thread with a
+    one-line reason (why it cannot happen, or why the impact is acceptable), resolve.
+  - **Development engines or code scheduled for deletion (#70):** decline as out of
+    scope, resolve.
+  - **Conflicts with the product goal** (e.g. fail closed or stop where UniiChat
+    retries and degrades): decline citing #70, resolve. This never applies to the
+    data-protection rules below (canonical history, data-use restrictions, private
+    storage, untrusted retrieved text): a reproducible finding that one of them is
+    broken is a shipped-path defect.
+  - **Style or nitpick:** fix only if trivial and inside the diff; otherwise decline.
+  - **Needs a larger change:** open an issue, link it in the thread, resolve. Never
+    grow the current PR's scope for it.
+- Fix nothing that cannot be reproduced. A confident finding is a claim.
+- Post one triage comment on the PR: one line per finding with its bucket, the
+  action, and its impact in plain words ("If unfixed: <what the user sees>, <when>,
+  <how likely>"). Escalate to the maintainer only findings where the action is
+  unclear or the impact sentence names user-visible harm you chose not to fix.
+- One bot round per PR: request re-review only when a fix changed behavior, not
+  after declines or trivial fixes. Do not chase new rounds raised on fix commits
+  unless they are shipped-path defects.
+- Never add or tighten a rule in this file because of one review finding. A rule
+  needs repeated real failures, and the PR that adds it says which.
+- Before handoff, an independent agent reviews the frozen diff against the issue
+  (does it do what the issue's phase says, nothing more; do the tests prove it?).
+  That spec review outweighs bot findings when they disagree.
+
 ## Code Review Rules
+
+These rules apply to the shipped plugin (`ariadne` memory provider and tree
+engine). Findings on development engines scheduled for deletion (#70) are out of
+scope. Review against the product goal above as well as these rules.
+
 
 - Flag any context-selection path that mutates authoritative sources, rewrites a
   protected user/tool turn, loses source coverage, or returns a usable request

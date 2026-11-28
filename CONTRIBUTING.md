@@ -131,7 +131,8 @@ a draft, and disclose missing verification. A draft is not a promise of acceptan
 - AI-assisted contributions are welcome. The author owns the result. For material
   agent-assisted work, state the model/harness and which checks were actually run;
   do not paste private prompts or fabricate review/testing claims.
-- Address review feedback; request re-review after substantive changes.
+- Triage review feedback as described below; request re-review only after a fix
+  changed behavior.
 - Maintainers squash-merge to `main` using the conventional PR title. CI must pass
   and review threads must be resolved. No minimum approval count is imposed while
   this is a solo-maintainer project; that avoids requiring an impossible self-review.
@@ -139,11 +140,23 @@ a draft, and disclose missing verification. A draft is not a promise of acceptan
 
 For substantive code PRs, request a Codex review with a PR comment containing
 `@codex review`, when the repository's Codex cloud integration is available.
-Repository-specific rules live in the root `AGENTS.md` under Code Review Rules.
-A request or reaction is not a completed review: inspect the actual bot review,
-triage findings and request re-review after substantive fixes. Codex review
-complements tests and maintainer judgment; it does not certify correctness or
-replace the existing CI gate. Do not claim it ran if setup/authorization is missing.
+Sourcery reviews automatically. Bots complement tests and maintainer judgment;
+they do not certify correctness, and a request or reaction is not a completed
+review.
+
+Bot findings are triaged by the PR's author (usually an agent), not by the
+maintainer: every finding is sorted into fix (a reproducible defect in the shipped
+plugin, fixed with a failing test first), decline (hypothetical, out of scope,
+development-engine code, or contrary to the product goal), or follow-up issue.
+The author posts one triage comment stating each finding's bucket, action and
+plain-language user impact, and escalates unclear cases and any finding it
+declines despite user-visible harm. One bot round per
+PR; review findings never add rules to `AGENTS.md` on their own. The full policy
+is in [AGENTS.md](AGENTS.md#review-triage), next to the Code Review Rules.
+
+Before handoff, an independent agent reviews the frozen diff against its issue's
+scope and acceptance criteria. Do not claim a review ran if setup or authorization
+is missing.
 
 ## Issues and triage
 
