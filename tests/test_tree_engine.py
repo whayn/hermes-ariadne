@@ -11,7 +11,7 @@ if not os.environ.get("HERMES_SOURCE"):
     pytest.skip("HERMES_SOURCE required for the ContextEngine ABC", allow_module_level=True)
 
 from agent.turn_context import compose_user_api_content  # noqa: E402
-from test_rolling_selection import assembled, exchange, restored  # noqa: E402
+from hermes_messages import assembled, exchange, restored  # noqa: E402
 from test_tree_builder import FakeLlm  # noqa: E402
 
 from hermes_ariadne import profile_tree as pt  # noqa: E402
@@ -539,6 +539,34 @@ def test_a_session_archived_during_classification_is_never_admitted(home, monkey
     tree_engine._reset_registry()
     world.engine("chat-b")  # a later reconcile classifies it (non-primary) and still skips it
     assert "worker" not in store.sessions()
+
+
+def test_a_v0_2_profile_upgrades_and_its_leftover_engine_state_is_left_alone(home, monkeypatch):
+    """#70 phase 2: archive, notes and leftover rolling/prepared files from v0.2.x."""
+    from hermes_ariadne.notes import NoteStore
+
+    archive = EventStore(home / "ariadne" / "events.sqlite3")
+    archive.ingest("old-chat", rows_for("old-chat", "O"), origin="hermes_db")
+    NoteStore(home).add("the user rides a Nakamura e-bike")
+    leftovers = {
+        home / "ariadne" / "rolling" / ("a" * 64) / "journal.jsonl": b'{"v0.2": 1}\n',
+        home / "ariadne" / "prepared" / ("b" * 64) / "manifest.json": b"{}",
+    }
+    for path, data in leftovers.items():
+        path.parent.mkdir(parents=True, mode=0o700)
+        path.write_bytes(data)
+    world = World(home, monkeypatch)
+    world.db.sessions["old-chat"] = {"source": "cli", "title": "Old"}
+    engine = world.engine("new-chat")
+    world.build(engine)
+    store = world.store()
+    assert store.backfilled() and set(store.sessions()) == {"old-chat"}
+    world.ask("new-chat", "N")
+    result, _ = world.select(engine, "new-chat", "N")
+    assert result is not None, engine.get_status()
+    assert "question O" in result[2]["content"]
+    assert "Nakamura" in json.dumps(NoteStore(home).list())
+    assert {path: path.read_bytes() for path in leftovers} == leftovers
 
 
 def test_appends_wait_for_the_backfill_then_catch_up(home, monkeypatch):

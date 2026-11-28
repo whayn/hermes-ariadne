@@ -194,70 +194,6 @@ def test_provider_conversation_tool(home):
     assert call(action="open") == {"ok": False, "error": "invalid_argument"}
 
 
-@needs_host
-def test_engine_indexes_preview_and_published_summary(tmp_path, monkeypatch):
-    from test_rolling_engine import DB, Facade, complete
-    from test_rolling_selection import POLICY, exchange
-
-    from hermes_ariadne import rolling
-    from hermes_ariadne.memory_provider import AriadneMemoryProvider
-    from hermes_ariadne.mvp_engine import AriadneEngine
-
-    monkeypatch.setattr(AriadneEngine, "_bound_reasoning_policy", staticmethod(lambda *a: POLICY))
-    facade, db = Facade(), DB()
-    engine = AriadneEngine(llm=facade, settings=rolling.RollingSettings(trigger_bytes=1))
-    engine.update_model("gpt-test", 100000, "https://invalid.test", "", "fixture", "fixture")
-    engine.bind_session_state(db, "s")
-    engine.on_session_start("s", hermes_home=tmp_path)
-    assert engine.name == "ariadne"
-
-    db.rows = exchange("A")
-    complete(engine, db, "A")
-    row = NoteStore(tmp_path).get_conversation("s")
-    first_user = next(r["content"] for r in exchange("A") if r["role"] == "user")
-    assert row["preview"] == " ".join(first_user.split())[:MAX_PREVIEW_CHARS]
-    assert row["summary"] is None
-
-    db.rows += exchange("B")
-    complete(engine, db, "B")
-    assert engine._published is not None and len(facade.calls) == 1
-    assert NoteStore(tmp_path).get_conversation("s")["summary"] == "summary 1"
-
-    # A brand-new chat can still read the exact originals (the index is no longer
-    # recalled: #54 shows conversations in the engine's memory view instead).
-    provider = AriadneMemoryProvider()
-    provider.initialize("fresh", hermes_home=str(tmp_path))
-    assert provider.prefetch("hi", session_id="fresh") == ""
-    read = json.loads(
-        provider.handle_tool_call("ariadne_conversations", {"action": "read", "id": "s"})
-    )
-    assert read["messages"][0]["content"] == first_user
-
-
-@needs_host
-def test_engine_index_failure_never_breaks_turn(tmp_path, monkeypatch):
-    from test_rolling_engine import DB, Facade, complete
-    from test_rolling_selection import POLICY, exchange
-
-    from hermes_ariadne import rolling
-    from hermes_ariadne.mvp_engine import AriadneEngine
-
-    monkeypatch.setattr(AriadneEngine, "_bound_reasoning_policy", staticmethod(lambda *a: POLICY))
-
-    def boom(*a, **k):
-        raise sqlite3.OperationalError("disk")
-
-    monkeypatch.setattr(NoteStore, "upsert_conversation", boom)
-    facade, db = Facade(), DB()
-    engine = AriadneEngine(llm=facade, settings=rolling.RollingSettings(trigger_bytes=1))
-    engine.update_model("gpt-test", 100000, "https://invalid.test", "", "fixture", "fixture")
-    engine.bind_session_state(db, "s")
-    engine.on_session_start("s", hermes_home=tmp_path)
-    db.rows = exchange("A") + exchange("B")
-    complete(engine, db, "B")
-    assert engine._published is not None
-
-
 # -- review fixes ------------------------------------------------------------------------
 
 
@@ -347,39 +283,6 @@ def test_zoom_recovers_tool_calls_that_read_truncates(home):
 
 
 @needs_host
-def test_preview_skips_restricted_first_message():
-    from hermes_ariadne.mvp_engine import _first_user_text
-
-    assert _first_user_text([{"role": "user", "content": "ok"}]) == "ok"
-    assert _first_user_text([{"role": "user", "content": "x", "data_use": ["no_training"]}]) is None
-
-
-@needs_host
-def test_engine_index_ignores_completion_from_a_replaced_session(tmp_path, monkeypatch):
-    from test_rolling_engine import DB, Facade, complete
-    from test_rolling_selection import POLICY, exchange
-
-    from hermes_ariadne import rolling
-    from hermes_ariadne.mvp_engine import AriadneEngine
-
-    monkeypatch.setattr(AriadneEngine, "_bound_reasoning_policy", staticmethod(lambda *a: POLICY))
-    facade, db = Facade(), DB()
-    engine = AriadneEngine(llm=facade, settings=rolling.RollingSettings(trigger_bytes=1))
-    engine.update_model("gpt-test", 100000, "https://invalid.test", "", "fixture", "fixture")
-    engine.bind_session_state(db, "s")
-    engine.on_session_start("s", hermes_home=tmp_path)
-    db.rows = exchange("A") + exchange("B")
-
-    def rebind():
-        engine.on_session_reset()
-        engine.bind_session_state(DB(), "other")
-
-    facade.hook = rebind  # session replaced while the summary call is in flight
-    complete(engine, db, "B")
-    assert NoteStore(tmp_path).get_conversation("other") is None
-
-
-@needs_host
 def test_read_and_zoom_keep_tool_result_linkage(home):
     from hermes_ariadne.conversations import ArchiveReader
 
@@ -415,34 +318,6 @@ def test_reader_handles_uri_reserved_characters_in_home(tmp_path, name):
     before = sorted(p.name for p in tmp_path.iterdir())
     assert ArchiveReader(home).page("old")["messages"][0]["content"] == "hello"
     assert sorted(p.name for p in tmp_path.iterdir()) == before  # read-only: no stray files
-
-
-@needs_host
-@pytest.mark.parametrize(
-    "metadata",
-    [{"data_use": ["no_training"]}, {"withheld_prompt": "original"}],
-)
-def test_engine_preview_admits_the_canonical_record(tmp_path, monkeypatch, metadata):
-    from test_rolling_engine import DB, Facade, complete
-    from test_rolling_selection import POLICY, exchange
-
-    from hermes_ariadne import rolling
-    from hermes_ariadne.mvp_engine import AriadneEngine
-
-    monkeypatch.setattr(AriadneEngine, "_bound_reasoning_policy", staticmethod(lambda *a: POLICY))
-    facade, db = Facade(), DB()
-    engine = AriadneEngine(llm=facade, settings=rolling.RollingSettings(trigger_bytes=1))
-    engine.update_model("gpt-test", 100000, "https://invalid.test", "", "fixture", "fixture")
-    engine.bind_session_state(db, "s")
-    engine.on_session_start("s", hermes_home=tmp_path)
-    db.rows = exchange("A")
-    first = next(r for r in db.rows if r["role"] == "user")
-    first["display_metadata"] = json.dumps(metadata)  # durable only, not in the callback
-    complete(engine, db, "A")
-    db.rows += exchange("B")
-    complete(engine, db, "B")
-    row = NoteStore(tmp_path).get_conversation("s")
-    assert row is None or row["preview"] is None
 
 
 def test_v1_store_that_already_has_the_index_migrates(home):

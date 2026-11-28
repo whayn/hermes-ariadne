@@ -1,4 +1,4 @@
-"""The shipped plugin's runtime modules do not load the development engines (#70)."""
+"""Every module in the package is part of the shipped plugin (#70): no second engine."""
 
 import json
 import os
@@ -16,30 +16,9 @@ SHIPPED = (
     "hermes_ariadne.conversations",
 )
 
-# Development engines and offline tooling, deleted in #70 phase 2.
-DEVELOPMENT = (
-    "compaction",
-    "compactor_demo",
-    "demo",
-    "engine",
-    "install",
-    "kernel",
-    "live_engine",
-    "mvp_engine",
-    "native_compactor",
-    "prepared",
-    "prepared_entry",
-    "receipts",
-    "rolling",
-    "rolling_delta",
-    "rolling_engine",
-    "rolling_entry",
-    "rolling_migrate",
-    "rolling_retrieval",
-    "rolling_selection",
-    "rolling_state",
-    "simulation",
-)
+# Test tooling inside the package, not part of the plugin: the runner's host-site probe.
+TOOLING = {"_host_site"}
+PACKAGE = SRC / "hermes_ariadne"
 
 
 # Plugin registration with Hermes's LLM facade, as the general plugin loader runs it.
@@ -84,17 +63,17 @@ def _loaded(body):
     return set(json.loads(out.stdout.strip().splitlines()[-1]))
 
 
-def _development(loaded):
-    return sorted(loaded & {f"hermes_ariadne.{name}" for name in DEVELOPMENT})
+def _modules():
+    return {f"hermes_ariadne.{p.stem}" for p in PACKAGE.glob("*.py") if p.stem != "__init__"}
 
 
-def test_shipped_modules_do_not_import_the_development_engines():
-    loaded = _loaded(f"for name in {SHIPPED!r}:\n    __import__(name)")
-    assert set(SHIPPED) <= loaded
-    assert _development(loaded) == []
+def test_registration_and_the_provider_use_every_module_in_the_package():
+    """A module nothing ships with is a leftover engine: delete it instead."""
+    loaded = _loaded(REGISTER + f"for name in {SHIPPED!r}:\n    __import__(name)")
+    unused = _modules() - loaded - {f"hermes_ariadne.{name}" for name in TOOLING}
+    assert unused == set()
 
 
-def test_plugin_registration_does_not_import_the_development_engines():
+def test_plugin_registration_registers_the_tree_engine():
     loaded = _loaded(REGISTER)
     assert {"hermes_ariadne.plugin_entry", "hermes_ariadne.tree_engine"} <= loaded
-    assert _development(loaded) == []

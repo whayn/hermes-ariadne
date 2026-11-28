@@ -19,14 +19,8 @@ Repository = "https://github.com/whayn/hermes-ariadne"
 Issues = "https://github.com/whayn/hermes-ariadne/issues"
 Contributing = "https://github.com/whayn/hermes-ariadne/blob/main/CONTRIBUTING.md"
 
-[project.scripts]
-ariadne-install = "hermes_ariadne.install:main"
-
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-hermes_ariadne = ["plugin.yaml", "prepared_plugin.yaml", "rolling_plugin.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
