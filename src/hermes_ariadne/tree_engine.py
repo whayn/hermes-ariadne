@@ -214,7 +214,8 @@ _SCHEMAS = [
         "name": STATUS,
         "description": (
             "Ariadne memory tree status: messages in the log, summaries built and pending, "
-            "summaries waiting to retry after a failed call (retrying, next_retry_in seconds), "
+            "summaries waiting to retry after a failed call (retrying, next_retry_in seconds; "
+            "paused_for: a lane holding new calls after repeated failures), "
             "held jobs, caps, and an estimate of the remaining summary "
             "calls. selection reports the latest context-engine attempt in this chat: "
             "on decline, Hermes uses the original request without Ariadne's tree view. "

@@ -14,14 +14,15 @@ the answer and stores the node. It follows UniiChat's ``Memory.ts`` build semant
   it whole, but a node past ``node_bytes`` would break the view's size accounting). An
   empty answer is a refusal: the node is its source clipped (``cut(flat(source))``).
 * Patient, like UniiChat's ``AskAI``: an outage only delays a node, never stops it
-  (#70). After a failed call no NEW call is sent until that call's retry is due, so
-  an outage is probed once per backoff instead of once per pending node. A facade exception, a timeout or a non-text result makes the job ``uncertain``
+  (#70). After two failed calls in a row in a lane, that lane sends no NEW call
+  until they are due again, so an outage is probed by a few calls per backoff
+  instead of one per pending node; a lane's failures never pause the other lane. A facade exception, a timeout or a non-text result makes the job ``uncertain``
   and it is asked again after a backoff: ``retry_base`` seconds, doubling with each
   consecutive failure up to ``retry_max``, persisted in the store (``retry_at``) so a
   restart keeps the schedule. A job whose owner process died (``owner_lost``) is due at
   once. Each re-ask is a new durable reservation, charged in the logical totals; a
-  failed call may still have been billed, so a long outage costs at most one call per
-  node per ``retry_max``. ``TreeBuilder.retry`` asks now and resets the backoff. A
+  failed call may still have been billed. A node that always fails is asked once per
+  ``retry_max`` indefinitely (it is not clipped). ``TreeBuilder.retry`` asks now and resets the backoff. A
   reservation is a LOGICAL job, not a physical send or billing ceiling. Missing or
   zero usage is UNKNOWN, never measured zero.
 * Two sides, called lanes: ``live`` and ``import`` (by the origin of a node's LAST
@@ -46,8 +47,10 @@ Deliberate choices beyond the plan:
   running after the timeout is left ``reserved`` and the next start turns it
   ``uncertain`` (``owner_lost``), due again at once.
 * The worker stays alive while a retry or an unreadable source is due later, sleeping
-  until then (``stop()`` wakes it), and an error while planning is recorded and retried
-  after ``retry_base`` seconds instead of ending the worker (#67).
+  until then (``stop()`` wakes it), and a store error while planning or launching is
+  recorded and looked at again after ``retry_base`` seconds instead of ending or
+  stalling the worker (#67). A source unreadable for good (``_PERMANENT``) is skipped
+  and counted (``unreadable``), never polled again by this builder.
 * Liveness of a reservation owner (``recover``): owners are ``"<pid>:<token>"``. An owner
   is alive when it is a builder of this process, or when another process with that pid
   exists (``os.kill(pid, 0)``; on Windows other processes are assumed alive because that
@@ -86,6 +89,8 @@ LANES = ("live", "import")
 _MAX_INT = (1 << 31) - 1
 SWEEP_READS = 512  # unclassified leaves read per pass to find the ones that fit
 UNAVAILABLE_RETRY = 30.0  # seconds before an unreadable message is read again
+# Unreadable for good (a corrupt row or archive record): never read again by this builder.
+_PERMANENT = frozenset({"entry_invalid", "source_invalid"})
 LINE_RATIO = 15 / 16  # UniiChat measured 460-510 byte lines for a 512 byte node
 _CLIP_STEPS = 40  # bounds the search for a prefix whose serialized request fits
 
@@ -338,12 +343,16 @@ class TreeBuilder:
         self._cursor = {"live": 0, "import": 0, "any": 0}
         self._nonfit: set[int] = set()
         self._unavailable: dict[int, float] = {}
+        self._unreadable: set[int] = set()  # _PERMANENT reasons: skipped, never polled
         self._archive: EventStore | None = None
         self._tags: dict[str, str] = {}
         self._caps_exhausted = False
         self._last_error: str | None = None
         self._held = 0
-        self._pause_until = 0.0  # after a failed call: no new call before this clock time
+        # Per lane, after failed calls in a row: no new call before this clock time.
+        self._pause_until = dict.fromkeys(LANES, 0.0)
+        self._streak = dict.fromkeys(LANES, 0)  # consecutive failed calls in the lane
+        self._error_until = 0.0  # after a store/thread error: when the worker looks again
         self._calls = 0
         self._usage_known = 0
         self._usage_unknown = 0
@@ -434,6 +443,8 @@ class TreeBuilder:
 
     def _cooling(self, position: int) -> bool:
         """Whether the leaf's source was unreadable and is not due to be read again."""
+        if position in self._unreadable:
+            return True
         until = self._unavailable.get(position)
         return until is not None and self._clock() < until
 
@@ -445,7 +456,11 @@ class TreeBuilder:
             source = self._read_source(position)
         except _Unavailable as error:
             self._last_error = str(error)
-            self._unavailable[position] = self._clock() + UNAVAILABLE_RETRY
+            if str(error) in _PERMANENT:
+                self._unreadable.add(position)
+                self._unavailable.pop(position, None)
+            else:
+                self._unavailable[position] = self._clock() + UNAVAILABLE_RETRY
             return None
         self._unavailable.pop(position, None)
         return source
@@ -494,13 +509,17 @@ class TreeBuilder:
         budget, fits = SWEEP_READS, 0
         start = self._cursor["any"]
         while start < count and Part(0, start) in nodes:
+            self._unavailable.pop(start, None)  # built, maybe by another process
             start += 1
         self._cursor["any"] = start
         for position in range(start, count):
             if position in self._nonfit:
                 continue
             part = Part(0, position)
-            if part in nodes or part in blocked or self._cooling(position):
+            if part in nodes:
+                self._unavailable.pop(position, None)
+                continue
+            if part in blocked or self._cooling(position):
                 continue  # a cooling (unreadable) leaf must not use up the read budget
             if budget == 0:
                 break
@@ -533,8 +552,6 @@ class TreeBuilder:
         blocked = {p for p, job in jobs.items() if job.state in BLOCKING_STATES} | running
         plan.fits = self._sweep(count, nodes, blocked)
         self._advance_chat(count, nodes)
-        if self._clock() < self._pause_until:
-            return plan  # a call just failed: send nothing new until its retry is due
         ready = pt.ready_jobs(count, nodes, blocked)
         seen, revision = store.load_view("seen")
         seen = View(high=s.seen_high) if seen is None else replace(seen, high=s.seen_high)
@@ -542,7 +559,10 @@ class TreeBuilder:
         picked = {lane: [] for lane in LANES}
         scanned = dict.fromkeys(LANES, 0)
         by_lane = {lane: [p for p in ready if self._lane(p) == lane] for lane in LANES}
+        now = self._clock()
         for lane in LANES:  # live first: an import never takes a live node's place
+            if now < self._pause_until[lane]:
+                continue  # failed calls in a row: nothing new until their retry is due
             for part in by_lane[lane]:
                 if len(picked[lane]) >= room.get(lane, 0):
                     break
@@ -609,9 +629,9 @@ class TreeBuilder:
 
     def _next_due(self) -> float | None:
         """The clock time of the earliest retry or unreadable-source read, if any."""
+        now = self._clock()
         due = list(self._unavailable.values())
-        if self._pause_until > self._clock():
-            due.append(self._pause_until)
+        due += [t for t in (*self._pause_until.values(), self._error_until) if t > now]
         for job in self._store.jobs().values():
             if job.state == "uncertain":
                 due.append(job.retry_at if job.retry_at is not None else self._clock())
@@ -656,13 +676,17 @@ class TreeBuilder:
         except Exception:  # noqa: BLE001 - it stays reserved; the next start reconciles it
             pass
 
-    def _uncertain(self, part: Part, error: str, attempt: int) -> None:
+    def _uncertain(self, part: Part, error: str, attempt: int, lane: str) -> None:
         self._last_error = error
         now = self._clock()
+        with self._lock:
+            self._streak[lane] += 1
+            outage = self._streak[lane] >= 2  # one failing node alone is not an outage
 
         def schedule(failures: int) -> float:
             due = now + self.settings.retry_delay(failures)
-            self._pause_until = due  # an outage is probed once per backoff (see _plan)
+            if outage:  # probe the provider once per backoff, not once per node (_plan)
+                self._pause_until[lane] = max(self._pause_until[lane], due)
             return due
 
         try:
@@ -691,7 +715,9 @@ class TreeBuilder:
         try:
             outcome = self._build(job, worker, held)
             if outcome == "built":
-                self._pause_until = 0.0  # the model answers again
+                with self._lock:  # the model answers again
+                    self._streak[job.lane] = 0
+                    self._pause_until[job.lane] = 0.0
             return outcome
         except Exception as error:  # noqa: BLE001 - a store failure must not kill the worker
             self._last_error = type(error).__name__
@@ -739,11 +765,11 @@ class TreeBuilder:
                     task=TASK,
                 )
             except Exception as error:  # noqa: BLE001 - any failure is an ambiguous outcome
-                self._uncertain(part, type(error).__name__, attempt)
+                self._uncertain(part, type(error).__name__, attempt, job.lane)
                 return "uncertain"
             raw = getattr(result, "text", None)
             if raw is not None and not isinstance(raw, str):
-                self._uncertain(part, "invalid_result", attempt)
+                self._uncertain(part, "invalid_result", attempt, job.lane)
                 return "uncertain"
             self._count_usage(result)
             line = _clean(raw or "")
@@ -791,8 +817,8 @@ class TreeBuilder:
                 report["built"] += 1
             elif outcome == "uncertain":
                 report["uncertain"] += 1
-            if outcome in ("caps", "error", "uncertain"):
-                break  # a failed call pauses the rest (see _plan)
+            if outcome in ("caps", "error"):
+                break
         report["calls"] = self._calls - calls
         report["caps_exhausted"] = self._caps_exhausted
         report["progress"] = bool(report["fits"] or report["built"] or report["calls"])
@@ -803,7 +829,9 @@ class TreeBuilder:
     def retry(self, parts=None) -> list[Part]:
         """Ask uncertain jobs now (all when ``parts`` is None), resetting their backoff.
         Also lifts the pause after a failure. Does not wake the worker."""
-        self._pause_until = 0.0
+        with self._lock:
+            self._pause_until = dict.fromkeys(LANES, 0.0)
+            self._streak = dict.fromkeys(LANES, 0)
         return self._store.retry(parts)
 
     # -- background worker -----------------------------------------------------------
@@ -904,8 +932,10 @@ class TreeBuilder:
     def _job_thread(self, job: _Job, held: int) -> None:
         try:
             outcome = self._execute(job, worker=True, held=held)
-            if outcome in ("caps", "error"):
+            if outcome == "caps":
                 self._stalled = True
+            elif outcome == "error":  # a store failure: look again later, never retire
+                self._error_until = self._clock() + self.settings.retry_base
         finally:
             self._wake.set()
 
@@ -917,13 +947,13 @@ class TreeBuilder:
                     if not self._recovered:
                         self.recover()
                     active = self._iteration()
+                    due = None if active or self._stalled else self._next_due()
                 except Exception as error:  # noqa: BLE001 - recorded by type, then retried
                     self._last_error = type(error).__name__
                     self._wake.wait(self.settings.retry_base)
                     continue
                 if active:
                     continue
-                due = None if self._stalled else self._next_due()
                 if due is None:
                     with self._lock:
                         if not self._wake.is_set():
@@ -933,8 +963,9 @@ class TreeBuilder:
                                 self._thread = None
                             return
                     continue
-                # Nothing runnable now, but a retry or a source read is due later.
-                delay = min(max(due - self._clock(), 0.05), self.settings.retry_max)
+                # Nothing runnable now, but a retry or a source read is due later. The
+                # 1 s floor bounds a due item that planning cannot act on to 1 Hz.
+                delay = min(max(due - self._clock(), 1.0), self.settings.retry_max)
                 self._wake.wait(delay)
         finally:
             with self._lock:
@@ -944,6 +975,7 @@ class TreeBuilder:
     def _iteration(self) -> bool:
         """Plan and launch what has room; whether work is running or was just done."""
         launched, fits = 0, 0
+        self._error_until = 0.0  # set again below if the store still fails
         with self._lock:
             room = {
                 lane: self.settings.jobs - sum(1 for v in self._inflight.values() if v == lane)
@@ -957,8 +989,11 @@ class TreeBuilder:
                 outcome = self._launch(job)
                 if outcome == "ok":
                     launched += 1
-                elif outcome in ("caps", "error"):
+                elif outcome == "caps":
                     self._stalled = True  # as step(): stop at a refusing cap
+                    break
+                elif outcome == "error":  # a store failure: look again later
+                    self._error_until = self._clock() + self.settings.retry_base
                     break
                 elif outcome == "stopped":
                     break
@@ -1002,7 +1037,8 @@ class TreeBuilder:
             "reserved": states.count("reserved"),
             "retrying": states.count("uncertain"),
             "next_retry_in": min(waits) if waits else None,
-            "paused_for": max(0, math.ceil(self._pause_until - now)) or None,
+            "paused_for": max(0, math.ceil(max(self._pause_until.values()) - now)) or None,
+            "unreadable": len(self._unreadable),
             "refused": states.count("refused"),
             "armed": states.count("armed"),
             "held": self._held,

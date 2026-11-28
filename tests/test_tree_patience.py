@@ -86,8 +86,8 @@ def test_invalid_results_and_lost_owners_are_asked_again(home, log):
     drain(b)
     jobs = log.store.jobs()
     assert jobs[Part(0, 0)].state == "uncertain"  # a non-text answer
-    assert jobs[Part(0, 1)].state == "armed"  # the lost one is due at once...
-    now[0] += 6  # ...once the pause after the failure is over
+    assert Part(0, 1) in log.store.nodes()  # the lost one was asked again at once
+    now[0] += 6
     drain(b)
     assert {Part(0, 0), Part(0, 1)} <= set(log.store.nodes())
 
@@ -149,14 +149,92 @@ def test_an_outage_is_probed_once_per_backoff_not_once_per_summary(home, log):
     now = [0.0]
     b = clocked(home, llm, now, jobs=1, retry_base=30)
     drain(b)
-    assert len(llm.calls) == 1  # one failure pauses every new call, not just its own
+    assert len(llm.calls) == 2  # two failures in a row pause every new call
     now[0] += 31
     drain(b)
-    assert len(llm.calls) == 2  # one probe when the retry is due
+    assert len(llm.calls) <= 4  # probes when the retries are due, not one per summary
     down[0] = False
     now[0] += 61
     drain(b)
     assert all(Part(0, i) in log.store.nodes() for i in range(10))  # back: all of it
+
+
+def test_a_single_failing_node_does_not_pause_its_lane(home, log):
+    for i in range(4):
+        log.add(long(str(i)))
+    llm = FakeLlm(lambda n, m, k: ValueError("400") if "compress message 0" in str(m) else "ok")
+    now = [0.0]
+    b = clocked(home, llm, now, jobs=1, retry_base=30)
+    drain(b)
+    # leaf 0 keeps failing, the provider works: the other leaves are not held back
+    assert all(Part(0, i) in log.store.nodes() for i in (1, 2, 3))
+
+
+def test_an_import_outage_never_pauses_the_live_lane(home, log):
+    log.add(long("i"), session="old", origin="import")
+    llm = FakeLlm(lambda n, m, k: ConnectionError("down") if "LLLL" not in str(m) else "ok")
+    now = [0.0]
+    b = clocked(home, llm, now, jobs=1, retry_base=3600)
+    drain(b)
+    log.add(long("k"), session="old", origin="import")
+    drain(b)  # two import failures in a row: the import lane pauses
+    assert b.status()["paused_for"] is not None
+    live = log.add(long("L"), session="now", origin="live")
+    drain(b)
+    assert Part(0, live) in log.store.nodes()
+
+
+def test_a_leaf_built_elsewhere_does_not_keep_the_worker_spinning(home, log):
+    position = log.add(long())
+    b = builder(home, FakeLlm())
+    b._unavailable[position] = 0.0  # read failed once, long due
+    log.store.put_node(Part(0, position), "built by another process")
+    plans = []
+    plan = b._plan
+    b._plan = lambda room: plans.append(1) or plan(room)
+    b.start()
+    try:
+        time.sleep(1.5)
+    finally:
+        b.stop()
+    assert len(plans) <= 3 and b._unavailable == {}
+
+
+def test_a_store_error_does_not_retire_the_worker_with_retries_pending(home, log):
+    log.add(long())
+    b = builder(home, FakeLlm(), retry_base=1)
+    reserve, failed = b._reserve, threading.Event()
+
+    def flaky(part, size):
+        if not failed.is_set():
+            failed.set()
+            raise sqlite3.OperationalError("database is locked")
+        return reserve(part, size)
+
+    b._reserve = flaky
+    b.start()
+    try:
+        wait_for(lambda: Part(0, 0) in log.store.nodes(), timeout=10)
+    finally:
+        b.stop()
+
+
+def test_a_corrupt_source_is_not_read_again_and_again(home, log, monkeypatch):
+    position = log.add(long())
+    reads = []
+
+    def corrupt(pos):
+        reads.append(pos)
+        raise tree_builder._Unavailable("source_invalid")
+
+    now = [0.0]
+    b = clocked(home, FakeLlm(), now)
+    monkeypatch.setattr(b, "_read_source", corrupt)
+    for _ in range(5):
+        drain(b)
+        now[0] += 3600
+    assert reads == [position]  # permanent: never polled again
+    assert b._next_due() is None and b.status()["unreadable"] == 1
 
 
 # -- settings ------------------------------------------------------------------------------

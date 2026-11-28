@@ -11,7 +11,7 @@ requires_env: []
 config_schema:
   tree:
     type: dict
-    description: "TreeSettings for the profile-wide summary tree; unknown keys or invalid values refuse registration. exit_wait (seconds, 0 = never wait) is how long a process exiting waits for in-flight summaries; A failed summary call is asked again after retry_base seconds, doubling up to retry_max (seconds); auto_reask_lost from v0.3.0 is accepted and ignored. Logical jobs/bytes are not HTTP or billing caps. Summaries use the auxiliary task ariadne_summary (the chat model unless pinned)."
+    description: "TreeSettings for the profile-wide summary tree; unknown keys or invalid values refuse registration. exit_wait (seconds, 0 = never wait) is how long a process exiting waits for in-flight summaries; a failed summary call is asked again after retry_base seconds, doubling up to retry_max (seconds); auto_reask_lost from v0.3.0 is accepted and ignored. Logical jobs/bytes are not HTTP or billing caps. Summaries use the auxiliary task ariadne_summary (the chat model unless pinned)."
     default:
       high: 128000
       seen_high: 32000

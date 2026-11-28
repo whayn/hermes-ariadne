@@ -747,7 +747,7 @@ def test_memory_status_and_retry(home, monkeypatch):
     assert status["ok"] and status["builder"]["retrying"] == 1
     assert status["builder"]["count"] == 4
     assert status["caps"]["max_jobs"] == 0 and status["caps"]["node_bytes"] == 512
-    assert status["remaining"]["internal_calls"] == 3  # the failure paused the other calls
+    assert status["remaining"]["internal_calls"] == 2
     retried = call(a, "ariadne_memory_status", action="retry")
     assert retried["rearmed"] == 1
     world.build(a)
