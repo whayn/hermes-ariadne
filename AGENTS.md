@@ -105,10 +105,9 @@ scope. Review against the product goal above as well as these rules.
   Missing usage is unknown, not zero; native token estimates are not exact
   provider tokens or a dollar ceiling. Never silently drop output caps or hide
   SDK/recovery/fallback requests. Codex's uncapped output requires explicit opt-in.
-- After an ambiguous dispatch, preserve its reservation and block automatic
-  retries. Return generated text only after the valid receipt commits; receipt
-  reuse must bind source/projection, prompt content, route and generation policy.
-  Exception (#54): a memory-tree summary job whose owner process died
-  (`owner_lost`) may be re-reserved automatically at most `tree.auto_reask_lost`
-  times (default 1); each re-ask is a new durable reservation counted in the logical
-  totals. Facade errors and timeouts stay blocked until an explicit retry.
+- Memory-tree summaries are patient, like UniiChat's (#70): a failed, ambiguous or
+  lost summary call is asked again automatically after a persisted backoff
+  (`tree.retry_base` doubling to `tree.retry_max`). Reserve every ask durably
+  before sending it and count it in the logical totals; publish a node only from a
+  validated answer to its current reservation. Do not claim a billing ceiling:
+  a failed call may have been charged, and the lifetime caps are opt-in.

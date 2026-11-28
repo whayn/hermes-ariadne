@@ -46,7 +46,7 @@ Tools:
   with the same query to reach older results, even if a page is empty. Pages
   cover the tree as of the first search; start without a cursor to see messages
   added to the tree since then.
-- `ariadne_memory_status`: summary progress and blocked summaries, plus the
+- `ariadne_memory_status`: summary progress and summaries waiting to retry, plus the
   latest selection attempt in this chat. `selection.status` is `selected`,
   `declined`, or `not_evaluated`. A decline includes a reason and, for request
   shape errors, a `shape_check` label without message text (for `message_identity`,
@@ -54,7 +54,7 @@ Tools:
   whether they all come after the stored rows, and the same counts for the
   stored rows). This is the engine's
   decision for its latest request, not a provider receipt or a diagnosis of an
-  earlier reply. `retry` re-asks blocked summaries.
+  earlier reply. `retry` asks failed summaries now instead of waiting.
 - `ariadne_notes` and `ariadne_import` (below).
 
 Recall of relevant notes remains. The v0.2 past-conversation index recall and
@@ -95,10 +95,31 @@ informational, not a cap. Large imports and the first backfill can mean
 thousands of calls; the first real run made about 210 calls (~2.1M tokens) for
 215 messages.
 
-Lost summaries: when a process exits, it waits up to `exit_wait` seconds (120)
-for in-flight calls. A summary lost with its process is asked again once
-automatically (`auto_reask_lost`). Facade errors and timeouts (`timeout`, 300 s)
-stay blocked until `ariadne_memory_status` retry.
+Failed summaries never stop the tree, they only delay it (as in UniiChat). A
+summary call that fails (provider error, timeout after `timeout` seconds, an
+unusable answer) is asked again after `retry_base` seconds (30), doubling with
+each consecutive failure up to `retry_max` (3600); the schedule survives
+restarts. After two failed calls in a row in a lane (live chats or imports), that
+lane sends no new summary call until the failed ones are due again, so an outage
+is probed by a few calls per wait rather than one per pending summary; a failing
+import never pauses the live lane. When a process exits it waits up to
+`exit_wait` seconds (120) for in-flight calls; a summary lost with its process is
+asked again on the next start.
+
+Cost of failures: each retry is a new call, and a failed call may still have
+been billed by the provider. During an outage the failed summaries are asked
+again after 30 s, 1, 2, 4… minutes, so about 8 times each in the first hour and
+then once an hour, up to `jobs` (4) summaries per lane at a time. A summary that
+fails every time while the provider works (for example a request too large for
+a pinned model's context window) is retried once an hour indefinitely and its
+older history is not merged above it. Set `max_jobs` or
+`max_total_request_bytes` for a hard lifetime cap.
+
+`ariadne_memory_status` shows how many summaries are waiting (`retrying`), when
+the next one is due (`next_retry_in`), whether a lane is paused (`paused_for`,
+seconds) and how many messages cannot be read at all (`unreadable`); its `retry`
+action asks failed summaries at once and lifts the pause. The v3 tree store
+written by this version cannot be opened by v0.3.0 (no downgrade).
 
 ### Settings
 
@@ -121,11 +142,15 @@ hermes config set plugins.entries.ariadne.settings.tree.tail_bytes 2048
 | `max_jobs` | 0 | Lifetime logical summary-call reservations; zero is unlimited |
 | `max_request_bytes` | 65536 | Logical cap per summary request (4096 up) |
 | `max_total_request_bytes` | 0 | Lifetime logical bytes over summary requests; zero is unlimited |
-| `tries` | 5 | Attempts per summary before it is blocked (1-20) |
+| `tries` | 5 | Asks per summary while the answer is too long; the shortest is kept (1-20) |
 | `max_tokens` | 1024 | Output tokens per summary call (reasoning models spend part on thinking) |
 | `timeout` | 300 | Seconds per summary call (1-3600) |
 | `exit_wait` | 120 | Seconds a process waits at exit for in-flight calls (0 = never) |
-| `auto_reask_lost` | 1 | Automatic re-asks of a summary lost with its process (0 disables) |
+| `retry_base` | 30 | Seconds before a failed summary call is asked again (1-86400) |
+| `retry_max` | 3600 | Longest wait between asks; the wait doubles up to it (1-86400) |
+
+`auto_reask_lost` (v0.3.0) is still accepted and ignored: lost summaries now
+retry like any other failure.
 
 Job and byte caps count logical reservations, not HTTP requests or billing.
 
@@ -282,7 +307,7 @@ The tree runs below used real Hermes (`caafe53`, 0.23.3) with Mistral
   calls per minute with 4 concurrent.
 - **Lost at exit:** the first runs lost 4 in-flight summaries per process exit
   (16 total). After the fix, 20 lost ones were re-asked on start: 18 built, 2
-  were lost again and stay blocked. 4 calls hit the old 120 s timeout, which is
+  were lost again (that build kept them blocked; they are now asked again). 4 calls hit the old 120 s timeout, which is
   why the defaults are now `timeout` 300 and `exit_wait` 120.
 
 Not measured: other providers, very large archives, strict local chat

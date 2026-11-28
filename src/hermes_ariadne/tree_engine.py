@@ -98,8 +98,8 @@ Waiting for in-flight summaries (``tree.exit_wait``): a turn never blocks on the
 for model calls. Detaching the last session lets the profile worker drain and
 then go idle. On process exit, ``_shutdown`` stops scheduling and gives in-flight
 calls up to ``exit_wait`` seconds to commit. Calls that outlive the wait stay
-``reserved`` and the next start
-auto-reasks them once (``tree.auto_reask_lost``).
+``reserved`` and the next start asks them again; failed calls are asked again
+after a backoff (``tree.retry_base``/``tree.retry_max``).
 
 Tools (replacing ``ariadne_find``/``ariadne_rolling_page`` for this engine):
 ``ariadne_zoom``, ``ariadne_search``, ``ariadne_memory_status``. Their output is
@@ -214,11 +214,14 @@ _SCHEMAS = [
         "name": STATUS,
         "description": (
             "Ariadne memory tree status: messages in the log, summaries built and pending, "
-            "uncertain or held summary jobs, caps, and an estimate of the remaining summary "
+            "summaries waiting to retry after a failed call (retrying, next_retry_in seconds; "
+            "paused_for: a lane holding new calls after repeated failures), "
+            "held jobs, caps, and an estimate of the remaining summary "
             "calls. selection reports the latest context-engine attempt in this chat: "
             "on decline, Hermes uses the original request without Ariadne's tree view. "
             "Use this to check whether the tree view was selected. "
-            "action=retry re-arms uncertain jobs (each retry may cost model calls)."
+            "Failed summaries are retried automatically; action=retry asks them now instead "
+            "of waiting (each retry may cost model calls)."
         ),
         "parameters": {
             "type": "object",
@@ -258,7 +261,7 @@ class _Home:
 
     def resume(self):
         with self.lock:
-            self.builder.start()  # recover and rearm eligible jobs before waking
+            self.builder.start()  # recover lost reservations before waking
 
     def release(self):
         with self.lock:

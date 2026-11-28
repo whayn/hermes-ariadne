@@ -432,7 +432,7 @@ def main():
                     "selection": turns[-1]["selection"],
                     "tree": {
                         k: (turns[-1]["tree"] or {}).get(k)
-                        for k in ("count", "built", "pending_ready", "running", "uncertain")
+                        for k in ("count", "built", "pending_ready", "running", "retrying")
                     },
                 }
             ),

@@ -13,21 +13,25 @@ the answer and stores the node. It follows UniiChat's ``Memory.ts`` build semant
   The shortest line is kept (cut to ``node_bytes`` if every try was over: UniiChat keeps
   it whole, but a node past ``node_bytes`` would break the view's size accounting). An
   empty answer is a refusal: the node is its source clipped (``cut(flat(source))``).
-* An exception from the facade is ambiguous (the host may have sent, retried or fallen
-  back): the job becomes ``uncertain`` and is never resubmitted automatically; only
-  ``TreeBuilder.retry`` re-arms it. A reservation is a LOGICAL job, not a physical
-  send or billing ceiling. Missing or zero usage is UNKNOWN, never measured zero.
-* The one exception (#54): a job whose OWNER process died (``owner_lost``: the calls in
-  flight when a Hermes process exited) is re-armed by ``start()`` at most
-  ``auto_reask_lost`` times per node (default 1, 0 disables). The re-ask is a new durable
-  reservation, charged in the logical totals like any other; a node lost again stays
-  ``uncertain`` for an explicit ``retry``. Facade errors, timeouts and invalid results are
-  never re-asked automatically.
+* Patient, like UniiChat's ``AskAI``: an outage only delays a node, never stops it
+  (#70). After two failed calls in a row in a lane, that lane sends no NEW call
+  until they are due again, so an outage is probed by a few calls per backoff
+  instead of one per pending node; a lane's failures never pause the other lane. A facade exception, a timeout or a non-text result makes the job ``uncertain``
+  and it is asked again after a backoff: ``retry_base`` seconds, doubling with each
+  consecutive failure up to ``retry_max``, persisted in the store (``retry_at``) so a
+  restart keeps the schedule. A job whose owner process died (``owner_lost``) is due at
+  once. Each re-ask is a new durable reservation, charged in the logical totals; a
+  failed call may still have been billed. A node that always fails is asked once per
+  ``retry_max`` indefinitely (it is not clipped). ``TreeBuilder.retry`` asks now and resets the backoff. A
+  reservation is a LOGICAL job, not a physical send or billing ceiling. Missing or
+  zero usage is UNKNOWN, never measured zero.
 * Two sides, called lanes: ``live`` and ``import`` (by the origin of a node's LAST
   message, like UniiChat). Each lane has its own ``jobs`` concurrency and its own first
   unbuilt leaf (the context cutoff), and a pass always plans the live lane first, so an
   import backlog never takes a live node's slot or call. A job also ignores unbuilt
-  parts of the OTHER lane in its context (they are skipped, not waited for).
+  parts of the OTHER lane in its context (they are skipped, not waited for), and when
+  the other lane's built lines push the context over ``seen_high`` its oldest such lines
+  are left out of that job's context (#59): only the job's own lane waits for merges.
   Caps (``max_jobs``, request bytes) are shared: live work reserves first.
 
 Deliberate choices beyond the plan:
@@ -41,7 +45,12 @@ Deliberate choices beyond the plan:
   ``timeout`` seconds for the calls in flight to commit; a caller that may block (process
   exit, ``exit_wait``) passes a timeout, a long-lived process passes 0. A call still
   running after the timeout is left ``reserved`` and the next start turns it
-  ``uncertain`` (``owner_lost``), which ``start()`` then re-asks once.
+  ``uncertain`` (``owner_lost``), due again at once.
+* The worker stays alive while a retry or an unreadable source is due later, sleeping
+  until then (``stop()`` wakes it), and a store error while planning or launching is
+  recorded and looked at again after ``retry_base`` seconds instead of ending or
+  stalling the worker (#67). A source unreadable for good (``_PERMANENT``) is skipped
+  and counted (``unreadable``), never polled again by this builder.
 * Liveness of a reservation owner (``recover``): owners are ``"<pid>:<token>"``. An owner
   is alive when it is a builder of this process, or when another process with that pid
   exists (``os.kill(pid, 0)``; on Windows other processes are assumed alive because that
@@ -58,6 +67,7 @@ Deliberate choices beyond the plan:
 
 import contextvars
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -70,7 +80,7 @@ from pathlib import Path
 
 from . import profile_tree as pt
 from .store import EventStore
-from .tree import Part, View, advance_view, render_lines, utf8_size
+from .tree import Part, View, advance_view, flat, render_lines, utf8_size
 from .tree_store import BLOCKING_STATES, MAX_OWNER_CHARS, MAX_PAGE, TreeStore
 
 TASK = "ariadne_summary"
@@ -79,6 +89,8 @@ LANES = ("live", "import")
 _MAX_INT = (1 << 31) - 1
 SWEEP_READS = 512  # unclassified leaves read per pass to find the ones that fit
 UNAVAILABLE_RETRY = 30.0  # seconds before an unreadable message is read again
+# Unreadable for good (a corrupt row or archive record): never read again by this builder.
+_PERMANENT = frozenset({"entry_invalid", "source_invalid"})
 LINE_RATIO = 15 / 16  # UniiChat measured 460-510 byte lines for a 512 byte node
 _CLIP_STEPS = 40  # bounds the search for a prefix whose serialized request fits
 
@@ -100,8 +112,11 @@ _LIMITS = {
     "max_tokens": (1, 1 << 20),
     "timeout": (1, 3600),
     "exit_wait": (0, 3600),
-    "auto_reask_lost": (0, 100),
+    "retry_base": (1, 86400),
+    "retry_max": (1, 86400),
 }
+# Accepted for configs written for v0.3.0 and ignored: lost jobs now retry like any other.
+_RETIRED = frozenset({"auto_reask_lost"})
 
 
 @dataclass(frozen=True)
@@ -115,8 +130,8 @@ class TreeSettings:
     refusal and would clip the node.
 
     ``exit_wait`` is the seconds (int or float, 0 = never wait) a process may wait at its
-    exit for in-flight summary calls to commit. ``auto_reask_lost`` is how often a job
-    whose owner process died is re-armed automatically per node (0 disables); see the
+    exit for in-flight summary calls to commit. ``retry_base``/``retry_max`` are the
+    first and the longest wait in seconds before a failed call is asked again; see the
     module docs.
     """
 
@@ -132,7 +147,8 @@ class TreeSettings:
     max_tokens: int = 1024
     timeout: int = 300
     exit_wait: int | float = 120
-    auto_reask_lost: int = 1
+    retry_base: int = 30
+    retry_max: int = 3600
 
     def __post_init__(self) -> None:
         for spec in fields(self):
@@ -141,6 +157,12 @@ class TreeSettings:
             kinds = (int, float) if spec.name == "exit_wait" else (int,)
             if type(value) not in kinds or not low <= value <= high:
                 raise ValueError(f"tree setting {spec.name} must be an integer in {low}..{high}")
+        if self.retry_base > self.retry_max:
+            raise ValueError("tree setting retry_base must not exceed retry_max")
+
+    def retry_delay(self, failures: int) -> int:
+        """Seconds before the next ask after ``failures`` consecutive failed calls."""
+        return min(self.retry_max, self.retry_base << min(max(failures - 1, 0), 32))
 
     @classmethod
     def from_config(cls, config: Mapping | None) -> "TreeSettings":
@@ -149,10 +171,11 @@ class TreeSettings:
             return cls()
         if not isinstance(config, Mapping):
             raise ValueError("tree settings must be a mapping")
-        unknown = sorted(str(key) for key in config.keys() - {f.name for f in fields(cls)})
+        known = {f.name for f in fields(cls)}
+        unknown = sorted(str(key) for key in config.keys() - known - _RETIRED)
         if unknown:
             raise ValueError("unknown tree setting: " + ", ".join(unknown))
-        return cls(**dict(config))
+        return cls(**{key: value for key, value in config.items() if key in known})
 
 
 def register_summary_task(ctx) -> None:
@@ -164,10 +187,7 @@ def register_summary_task(ctx) -> None:
     ctx.register_auxiliary_task(
         TASK,
         display_name="Ariadne summaries",
-        description=(
-            "Writes the one-line summaries of Ariadne's memory tree of every conversation. "
-            "Defaults to the chat model; pin a cheaper model under auxiliary.ariadne_summary."
-        ),
+        description="Memory tree summaries",
     )
 
 
@@ -320,11 +340,16 @@ class TreeBuilder:
         self._cursor = {"live": 0, "import": 0, "any": 0}
         self._nonfit: set[int] = set()
         self._unavailable: dict[int, float] = {}
+        self._unreadable: set[int] = set()  # _PERMANENT reasons: skipped, never polled
         self._archive: EventStore | None = None
         self._tags: dict[str, str] = {}
         self._caps_exhausted = False
         self._last_error: str | None = None
         self._held = 0
+        # Per lane, after failed calls in a row: no new call before this clock time.
+        self._pause_until = dict.fromkeys(LANES, 0.0)
+        self._streak = dict.fromkeys(LANES, 0)  # consecutive failed calls in the lane
+        self._error_until = 0.0  # after a store/thread error: when the worker looks again
         self._calls = 0
         self._usage_known = 0
         self._usage_unknown = 0
@@ -415,6 +440,8 @@ class TreeBuilder:
 
     def _cooling(self, position: int) -> bool:
         """Whether the leaf's source was unreadable and is not due to be read again."""
+        if position in self._unreadable:
+            return True
         until = self._unavailable.get(position)
         return until is not None and self._clock() < until
 
@@ -426,7 +453,11 @@ class TreeBuilder:
             source = self._read_source(position)
         except _Unavailable as error:
             self._last_error = str(error)
-            self._unavailable[position] = self._clock() + UNAVAILABLE_RETRY
+            if str(error) in _PERMANENT:
+                self._unreadable.add(position)
+                self._unavailable.pop(position, None)
+            else:
+                self._unavailable[position] = self._clock() + UNAVAILABLE_RETRY
             return None
         self._unavailable.pop(position, None)
         return source
@@ -475,13 +506,17 @@ class TreeBuilder:
         budget, fits = SWEEP_READS, 0
         start = self._cursor["any"]
         while start < count and Part(0, start) in nodes:
+            self._unavailable.pop(start, None)  # built, maybe by another process
             start += 1
         self._cursor["any"] = start
         for position in range(start, count):
             if position in self._nonfit:
                 continue
             part = Part(0, position)
-            if part in nodes or part in blocked or self._cooling(position):
+            if part in nodes:
+                self._unavailable.pop(position, None)
+                continue
+            if part in blocked or self._cooling(position):
                 continue  # a cooling (unreadable) leaf must not use up the read budget
             if budget == 0:
                 break
@@ -505,6 +540,7 @@ class TreeBuilder:
         count = store.count()
         if count == 0:
             return plan
+        store.rearm_due(self._clock())
         self._sync_origins(count)
         nodes = dict(store.nodes())
         jobs = store.jobs()
@@ -520,7 +556,10 @@ class TreeBuilder:
         picked = {lane: [] for lane in LANES}
         scanned = dict.fromkeys(LANES, 0)
         by_lane = {lane: [p for p in ready if self._lane(p) == lane] for lane in LANES}
+        now = self._clock()
         for lane in LANES:  # live first: an import never takes a live node's place
+            if now < self._pause_until[lane]:
+                continue  # failed calls in a row: nothing new until their retry is due
             for part in by_lane[lane]:
                 if len(picked[lane]) >= room.get(lane, 0):
                     break
@@ -531,11 +570,11 @@ class TreeBuilder:
                 scanned[lane] += 1
                 first = self._first(lane, count, nodes)
                 seen = pt.advance_seen(seen, part, nodes, first)  # kept even if skipped
-                if seen.size > seen.high or any(
-                    p not in nodes and self._lane(p) == lane for p in seen.parts
-                ):
-                    continue  # its own lane has a hole, or the view is over its high: wait
-                context = render_lines(seen, nodes)  # skips the other lane's unbuilt parts
+                if any(p not in nodes and self._lane(p) == lane for p in seen.parts):
+                    continue  # its own lane has a hole: wait
+                context = self._lines_for(seen, nodes, lane)
+                if context is None:
+                    continue  # its own lane's lines are over the high: wait for merges
                 if part.level == 0:
                     source = self._source_or_skip(part.start)
                     if source is None:
@@ -563,6 +602,37 @@ class TreeBuilder:
         self._held = plan.held
         plan.jobs = picked["live"] + picked["import"]
         return plan
+
+    def _lines_for(self, seen: View, nodes, lane: str) -> tuple[str, ...] | None:
+        """The ``<chat>`` lines of a ``lane`` job: ``seen``'s built lines within its high.
+
+        Unbuilt parts are skipped (only the other lane's can be left). Over the high, the
+        OTHER lane's oldest lines are dropped first (#59); None if the job's own lane
+        alone is over it.
+        """
+        if seen.size <= seen.high:
+            return render_lines(seen, nodes)
+        built = [p for p in seen.parts if p in nodes]
+        size = sum(utf8_size(nodes[p]) for p in built)
+        keep = []
+        for p in built:  # oldest first
+            if size > seen.high and self._lane(p) != lane:
+                size -= utf8_size(nodes[p])
+                continue
+            keep.append(p)
+        if size > seen.high:
+            return None
+        return tuple(f"{p.start}+{p.count}|{flat(nodes[p])}" for p in keep)
+
+    def _next_due(self) -> float | None:
+        """The clock time of the earliest retry or unreadable-source read, if any."""
+        now = self._clock()
+        due = list(self._unavailable.values())
+        due += [t for t in (*self._pause_until.values(), self._error_until) if t > now]
+        for job in self._store.jobs().values():
+            if job.state == "uncertain":
+                due.append(job.retry_at if job.retry_at is not None else self._clock())
+        return min(due) if due else None
 
     def _advance_chat(self, count: int, nodes) -> None:
         """Advance and persist the ``chat`` view to the end of the log (CAS, re-read)."""
@@ -603,10 +673,23 @@ class TreeBuilder:
         except Exception:  # noqa: BLE001 - it stays reserved; the next start reconciles it
             pass
 
-    def _uncertain(self, part: Part, error: str, attempt: int) -> None:
+    def _uncertain(self, part: Part, error: str, attempt: int, lane: str) -> None:
         self._last_error = error
+        now = self._clock()
+        with self._lock:
+            self._streak[lane] += 1
+            outage = self._streak[lane] >= 2  # one failing node alone is not an outage
+
+        def schedule(failures: int) -> float:
+            due = now + self.settings.retry_delay(failures)
+            if outage:  # probe the provider once per backoff, not once per node (_plan)
+                self._pause_until[lane] = max(self._pause_until[lane], due)
+            return due
+
         try:
-            self._store.mark(part, "uncertain", error[:100], owner=self.owner, attempt=attempt)
+            self._store.mark(
+                part, "uncertain", error[:100], owner=self.owner, attempt=attempt, schedule=schedule
+            )
         except Exception:  # noqa: BLE001 - it stays reserved; the next start reconciles it
             pass
 
@@ -627,7 +710,12 @@ class TreeBuilder:
         with self._lock:
             self._inflight[job.part] = job.lane
         try:
-            return self._build(job, worker, held)
+            outcome = self._build(job, worker, held)
+            if outcome == "built":
+                with self._lock:  # the model answers again
+                    self._streak[job.lane] = 0
+                    self._pause_until[job.lane] = 0.0
+            return outcome
         except Exception as error:  # noqa: BLE001 - a store failure must not kill the worker
             self._last_error = type(error).__name__
             return "error"
@@ -674,11 +762,11 @@ class TreeBuilder:
                     task=TASK,
                 )
             except Exception as error:  # noqa: BLE001 - any failure is an ambiguous outcome
-                self._uncertain(part, type(error).__name__, attempt)
+                self._uncertain(part, type(error).__name__, attempt, job.lane)
                 return "uncertain"
             raw = getattr(result, "text", None)
             if raw is not None and not isinstance(raw, str):
-                self._uncertain(part, "invalid_result", attempt)
+                self._uncertain(part, "invalid_result", attempt, job.lane)
                 return "uncertain"
             self._count_usage(result)
             line = _clean(raw or "")
@@ -736,7 +824,11 @@ class TreeBuilder:
         return report
 
     def retry(self, parts=None) -> list[Part]:
-        """Re-arm uncertain jobs (all when ``parts`` is None). Does not wake the worker."""
+        """Ask uncertain jobs now (all when ``parts`` is None), resetting their backoff.
+        Also lifts the pause after a failure. Does not wake the worker."""
+        with self._lock:
+            self._pause_until = dict.fromkeys(LANES, 0.0)
+            self._streak = dict.fromkeys(LANES, 0)
         return self._store.retry(parts)
 
     # -- background worker -----------------------------------------------------------
@@ -744,13 +836,11 @@ class TreeBuilder:
     def start(self) -> None:
         """Reconcile dead reservations and start the worker. Never blocks on a model.
 
-        Reservations of dead owners become ``uncertain``; those (and only those) are then
-        re-armed once more, up to ``settings.auto_reask_lost`` times per node.
+        Reservations of dead owners become ``uncertain``, due at once.
         """
         with self._lock:
             self._stopped = False
         self.recover()
-        self._store.rearm_lost(self.settings.auto_reask_lost)  # no-op without a store
         self.kick()
 
     def kick(self) -> bool:
@@ -839,40 +929,29 @@ class TreeBuilder:
     def _job_thread(self, job: _Job, held: int) -> None:
         try:
             outcome = self._execute(job, worker=True, held=held)
-            if outcome in ("caps", "error"):
+            if outcome == "caps":
                 self._stalled = True
+            elif outcome == "error":  # a store failure: look again later, never retire
+                self._error_until = self._clock() + self.settings.retry_base
         finally:
             self._wake.set()
 
     def _loop(self) -> None:
         try:
-            if not self._recovered:
-                self.recover()
             while not self._stopped:
                 self._wake.clear()
-                launched, fits = 0, 0
-                with self._lock:
-                    room = {
-                        lane: self.settings.jobs
-                        - sum(1 for v in self._inflight.values() if v == lane)
-                        for lane in LANES
-                    }
-                if not self._stalled and any(v > 0 for v in room.values()):
-                    with self._plan_lock:
-                        plan = self._plan(room)
-                    fits = plan.fits
-                    for job in plan.jobs:
-                        outcome = self._launch(job)
-                        if outcome == "ok":
-                            launched += 1
-                        elif outcome in ("caps", "error"):
-                            self._stalled = True  # as step(): stop at a refusing cap
-                            break
-                        elif outcome == "stopped":
-                            break
-                with self._lock:
-                    busy = bool(self._inflight)
-                if not (launched or fits or busy):
+                try:
+                    if not self._recovered:
+                        self.recover()
+                    active = self._iteration()
+                    due = None if active or self._stalled else self._next_due()
+                except Exception as error:  # noqa: BLE001 - recorded by type, then retried
+                    self._last_error = type(error).__name__
+                    self._wake.wait(self.settings.retry_base)
+                    continue
+                if active:
+                    continue
+                if due is None:
                     with self._lock:
                         if not self._wake.is_set():
                             # Retire under the lock kick() takes: a later kick sees no
@@ -881,14 +960,47 @@ class TreeBuilder:
                                 self._thread = None
                             return
                     continue
-                if not fits:
-                    self._wake.wait(1.0)  # a finished job or a kick wakes it at once
-        except Exception as error:  # noqa: BLE001 - recorded by type; a kick retries
-            self._last_error = type(error).__name__
+                # Nothing runnable now, but a retry or a source read is due later. The
+                # 1 s floor bounds a due item that planning cannot act on to 1 Hz.
+                delay = min(max(due - self._clock(), 1.0), self.settings.retry_max)
+                self._wake.wait(delay)
         finally:
             with self._lock:
                 if self._thread is threading.current_thread():
                     self._thread = None
+
+    def _iteration(self) -> bool:
+        """Plan and launch what has room; whether work is running or was just done."""
+        launched, fits = 0, 0
+        self._error_until = 0.0  # set again below if the store still fails
+        with self._lock:
+            room = {
+                lane: self.settings.jobs - sum(1 for v in self._inflight.values() if v == lane)
+                for lane in LANES
+            }
+        if not self._stalled and any(v > 0 for v in room.values()):
+            with self._plan_lock:
+                plan = self._plan(room)
+            fits = plan.fits
+            for job in plan.jobs:
+                outcome = self._launch(job)
+                if outcome == "ok":
+                    launched += 1
+                elif outcome == "caps":
+                    self._stalled = True  # as step(): stop at a refusing cap
+                    break
+                elif outcome == "error":  # a store failure: look again later
+                    self._error_until = self._clock() + self.settings.retry_base
+                    break
+                elif outcome == "stopped":
+                    break
+        with self._lock:
+            busy = bool(self._inflight)
+        if not (launched or fits or busy):
+            return False
+        if not fits:
+            self._wake.wait(1.0)  # a finished job or a kick wakes it at once
+        return True
 
     # -- status ----------------------------------------------------------------------
 
@@ -908,16 +1020,24 @@ class TreeBuilder:
             calls = self._calls
         blocked = {p for p, job in jobs.items() if job.state in BLOCKING_STATES} | running
         states = [job.state for job in jobs.values()]
+        now = self._clock()
+        waits = [
+            max(0, math.ceil((job.retry_at if job.retry_at is not None else now) - now))
+            for job in jobs.values()
+            if job.state == "uncertain"
+        ]
         return {
             "count": count,
             "built": len(nodes),
             "pending_ready": len(pt.ready_jobs(count, nodes, blocked)),
             "running": len(running),
             "reserved": states.count("reserved"),
-            "uncertain": states.count("uncertain"),
+            "retrying": states.count("uncertain"),
+            "next_retry_in": min(waits) if waits else None,
+            "paused_for": max(0, math.ceil(max(self._pause_until.values()) - now)) or None,
+            "unreadable": len(self._unreadable),
             "refused": states.count("refused"),
             "armed": states.count("armed"),
-            "auto_rearmed": sum(1 for job in jobs.values() if job.auto_retries > 0),
             "held": self._held,
             "counters": store.counters(),
             "caps_exhausted": self._caps_exhausted,
