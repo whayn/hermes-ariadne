@@ -72,9 +72,6 @@ def test_wire_reasoning_estimate_is_bookkeeping_only():
 # -- storage paths -------------------------------------------------------------------
 
 
-# -- relaxed home admission (MVP paths only) ----------------------------------------
-
-
 def test_mvp_paths_tighten_drifted_modes_but_refuse_symlinks(tmp_path):
     from hermes_ariadne.notes import NoteStore, StorageRefused
     from hermes_ariadne.private_paths import archive_path

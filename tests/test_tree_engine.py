@@ -547,10 +547,15 @@ def test_a_v0_2_profile_upgrades_and_its_leftover_engine_state_is_left_alone(hom
 
     archive = EventStore(home / "ariadne" / "events.sqlite3")
     archive.ingest("old-chat", rows_for("old-chat", "O"), origin="hermes_db")
-    NoteStore(home).add("the user rides a Nakamura e-bike")
+    notes = NoteStore(home)
+    notes.add("the user rides a Nakamura e-bike")
+    # What v0.2.1's engine wrote: the conversation index and, per session, the rolling
+    # journal at ariadne/rolling/<sha256(session_id)>/journal.sqlite3.
+    notes.upsert_conversation("old-chat", preview="question O", summary="v0.2 summary")
+    session = hashlib.sha256(b"old-chat").hexdigest()
     leftovers = {
-        home / "ariadne" / "rolling" / ("a" * 64) / "journal.jsonl": b'{"v0.2": 1}\n',
-        home / "ariadne" / "prepared" / ("b" * 64) / "manifest.json": b"{}",
+        home / "ariadne" / "rolling" / session / "journal.sqlite3": b"SQLite format 3\x00",
+        home / "ariadne" / "prepared" / session / "manifest.json": b"{}",
     }
     for path, data in leftovers.items():
         path.parent.mkdir(parents=True, mode=0o700)
@@ -566,6 +571,7 @@ def test_a_v0_2_profile_upgrades_and_its_leftover_engine_state_is_left_alone(hom
     assert result is not None, engine.get_status()
     assert "question O" in result[2]["content"]
     assert "Nakamura" in json.dumps(NoteStore(home).list())
+    assert NoteStore(home).get_conversation("old-chat")["summary"] == "v0.2 summary"
     assert {path: path.read_bytes() for path in leftovers} == leftovers
 
 

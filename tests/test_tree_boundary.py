@@ -1,5 +1,6 @@
 """Every module in the package is part of the shipped plugin (#70): no second engine."""
 
+import ast
 import json
 import os
 import subprocess
@@ -77,3 +78,17 @@ def test_registration_and_the_provider_use_every_module_in_the_package():
 def test_plugin_registration_registers_the_tree_engine():
     loaded = _loaded(REGISTER)
     assert {"hermes_ariadne.plugin_entry", "hermes_ariadne.tree_engine"} <= loaded
+
+
+def test_every_relative_import_in_the_package_resolves():
+    """Lazy imports inside functions too: a deleted module must leave no caller."""
+    names = {p.stem for p in PACKAGE.glob("*.py")}
+    dangling = []
+    for path in sorted(PACKAGE.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ImportFrom) and node.level == 1:
+                targets = (
+                    [node.module.split(".")[0]] if node.module else [a.name for a in node.names]
+                )
+                dangling += [f"{path.name}: .{t}" for t in targets if t not in names]
+    assert dangling == []

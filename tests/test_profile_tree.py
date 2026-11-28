@@ -397,6 +397,17 @@ def all_parts(count):
     return [Part(level, i) for level in range(count.bit_length()) for i in range(count >> level)]
 
 
+def test_advance_seen_cuts_the_view_before_the_jobs_first_message():
+    nodes = {Part(0, i): f"t{i}" for i in range(8)}
+    seen = View(high=1000)
+    assert pt.advance_seen(seen, Part(1, 2), nodes, 8) == advance_view(
+        seen, 6, nodes, next_message=True
+    )
+    assert pt.advance_seen(seen, Part(0, 7), nodes, 3) == advance_view(
+        seen, 3, nodes, next_message=True
+    )
+
+
 def test_ready_jobs_examples():
     assert pt.ready_jobs(0, set(), set()) == []
     assert pt.ready_jobs(3, set(), set()) == [Part(0, 0), Part(0, 1), Part(0, 2)]
