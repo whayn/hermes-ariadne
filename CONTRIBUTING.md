@@ -140,7 +140,8 @@ a draft, and disclose missing verification. A draft is not a promise of acceptan
 
 For substantive code PRs, request a Codex review with a PR comment containing
 `@codex review`, when the repository's Codex cloud integration is available.
-Sourcery reviews automatically. Bots complement tests and maintainer judgment;
+Sourcery reviews automatically. CodeRabbit skips automatic review on this
+repository: comment `@coderabbitai review` on every ready PR. Bots complement tests and maintainer judgment;
 they do not certify correctness, and a request or reaction is not a completed
 review.
 
