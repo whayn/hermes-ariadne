@@ -17,9 +17,8 @@ import json
 
 from .conversations import RestrictedEvidence
 from .notes import NoteStore, StorageRefused, conversation_fields
-from .receipts import _mkdir_private
+from .private_paths import archive_path, mkdir_private
 from .retrieval import _require_supported_data_use, _UnsupportedDataUse
-from .rolling_engine import _archive_path
 from .store import EventStore, canonical_json
 
 IMPORT_PREFIX = "import-"
@@ -138,11 +137,9 @@ class Importer:
         notes = NoteStore(self.home)
         try:
             notes.prepare()
-            archive = _archive_path(
-                self.home, private_home=False
-            )  # admission before any file is created
-            _mkdir_private(archive.parent)
-            archive = _archive_path(self.home, private_home=False)
+            archive = archive_path(self.home)  # admission before any file is created
+            mkdir_private(archive.parent)
+            archive = archive_path(self.home)
         except ValueError as exc:
             raise StorageRefused(str(exc)) from exc
         outcome = EventStore(archive).ingest(conv_id, rows, origin="import", start=offset)
