@@ -149,7 +149,8 @@ maintainer: every finding is sorted into fix (a reproducible defect in the shipp
 plugin, fixed with a failing test first), decline (hypothetical, out of scope,
 development-engine code, or contrary to the product goal), or follow-up issue.
 The author posts one triage comment stating each finding's bucket, action and
-plain-language user impact, and escalates only unclear cases. One bot round per
+plain-language user impact, and escalates unclear cases and any finding it
+declines despite user-visible harm. One bot round per
 PR; review findings never add rules to `AGENTS.md` on their own. The full policy
 is in [AGENTS.md](AGENTS.md#review-triage), next to the Code Review Rules.
 

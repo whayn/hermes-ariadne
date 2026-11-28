@@ -55,7 +55,10 @@ is UniiChat-like memory on Hermes (#70: nothing lost, never blocks, always a vie
   - **Development engines or code scheduled for deletion (#70):** decline as out of
     scope, resolve.
   - **Conflicts with the product goal** (e.g. fail closed or stop where UniiChat
-    retries and degrades): decline citing #70, resolve.
+    retries and degrades): decline citing #70, resolve. This never applies to the
+    data-protection rules below (canonical history, data-use restrictions, private
+    storage, untrusted retrieved text): a reproducible finding that one of them is
+    broken is a shipped-path defect.
   - **Style or nitpick:** fix only if trivial and inside the diff; otherwise decline.
   - **Needs a larger change:** open an issue, link it in the thread, resolve. Never
     grow the current PR's scope for it.
