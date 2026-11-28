@@ -151,7 +151,7 @@ def test_idle_task_resumes_existing_tree_without_a_chat(tmp_path, monkeypatch, s
             raise sqlite3.OperationalError("database is locked")
 
         with monkeypatch.context() as patch:
-            patch.setattr(module.TreeStore, "rearm_lost", unavailable)
+            patch.setattr(module.TreeStore, "stale_reserved", unavailable)
             with pytest.raises(sqlite3.OperationalError, match="database is locked"):
                 ctx.idle(None)
         assert not started.is_set()
@@ -161,7 +161,7 @@ def test_idle_task_resumes_existing_tree_without_a_chat(tmp_path, monkeypatch, s
     builder = module.shared_home(home).builder
     builder.stop(timeout=5)
     assert part in store.nodes()
-    assert store.jobs()[part].auto_retries == 1
+    assert store.jobs()[part].attempts == 2  # the lost call was asked again
     assert engine._shared is None
 
 

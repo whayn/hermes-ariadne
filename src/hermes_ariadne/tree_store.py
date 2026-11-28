@@ -16,11 +16,12 @@ The log references the exact archive (``events.sqlite3``) by ``event_id``; it ho
 no message text. Summaries are derived navigation data, never canonical.
 
 Job states: ``reserved`` (a call may be in flight), ``done`` (node stored),
-``uncertain`` (ambiguous outcome or lost owner: blocked, never resubmitted
-automatically, except that ``rearm_lost`` re-arms a lost owner a bounded number of
-times), ``refused`` (a definitive answer that was not accepted, e.g. over length: may be
-reserved again as a new attempt) and ``armed`` (an uncertain job re-armed by an explicit
-``retry`` or by ``rearm_lost``; ``jobs.auto_retries`` counts only the latter).
+``uncertain`` (a failed or ambiguous call, or a lost owner: blocked until its
+``retry_at``, when ``rearm_due`` re-arms it; ``failures`` counts the consecutive
+failures the builder's backoff grows with), ``refused`` (a definitive answer that was
+not accepted, e.g. over length: may be reserved again as a new attempt) and ``armed``
+(an uncertain job re-armed by ``rearm_due`` or an explicit ``retry``).
+``jobs.auto_retries`` is kept from v2 stores and no longer written.
 ``counters`` hold the logical totals of every reservation ever made and never decrease.
 
 Deviations from the issue #54 plan (section B), all additive:
@@ -55,7 +56,7 @@ from .private_paths import StorageRefused, tighten_private
 from .tree import Part, View, utf8_size
 
 APPLICATION_ID = 0x41525452  # "ARTR"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 ORIGINS = ("live", "import")
 ROLES = ("user", "assistant", "tool", "system")
@@ -96,7 +97,8 @@ SCHEMA = (
             ('reserved', 'done', 'uncertain', 'refused', 'armed')),
         attempts INTEGER NOT NULL, request_bytes INTEGER NOT NULL, owner TEXT,
         reserved_at REAL, finished_at REAL, error_type TEXT,
-        auto_retries INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (level, idx)
+        auto_retries INTEGER NOT NULL DEFAULT 0, retry_at REAL,
+        failures INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (level, idx)
     )""",
     """CREATE TABLE counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL)""",
     """INSERT INTO counters VALUES ('logical_jobs', 0), ('request_bytes', 0)""",
@@ -110,6 +112,8 @@ SCHEMA = (
 # Upgrades for stores written by earlier revisions: {from_version: steps}. Each step
 # is SQL text or a callable(conn) and must be idempotent. Version 1 is the first.
 # v1 -> v2 (#54): ``jobs.auto_retries``, how often a lost job was re-armed automatically.
+# v2 -> v3 (#70): ``jobs.retry_at`` and ``jobs.failures``, the automatic retry schedule.
+# Jobs left ``uncertain`` by v2 get no ``retry_at``: they are due at once.
 
 
 def _add_auto_retries(conn):
@@ -118,7 +122,15 @@ def _add_auto_retries(conn):
         conn.execute("ALTER TABLE jobs ADD COLUMN auto_retries INTEGER NOT NULL DEFAULT 0")
 
 
-MIGRATIONS = {1: (_add_auto_retries,)}
+def _add_retry_schedule(conn):
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+    if "retry_at" not in columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN retry_at REAL")
+    if "failures" not in columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN failures INTEGER NOT NULL DEFAULT 0")
+
+
+MIGRATIONS = {1: (_add_auto_retries,), 2: (_add_retry_schedule,)}
 
 
 @dataclass(frozen=True)
@@ -255,11 +267,14 @@ class Job:
     reserved_at: float | None
     finished_at: float | None
     error_type: str | None
-    auto_retries: int = 0  # times ``rearm_lost`` re-armed it (explicit ``retry`` is not counted)
+    auto_retries: int = 0  # v2 only: times a lost job was re-armed (no longer written)
+    retry_at: float | None = None  # when an uncertain job is due again (None: at once)
+    failures: int = 0  # consecutive failed calls, the backoff exponent
 
 
 _JOB_COLUMNS = (
-    "level,idx,state,attempts,request_bytes,owner,reserved_at,finished_at,error_type,auto_retries"
+    "level,idx,state,attempts,request_bytes,owner,reserved_at,finished_at,error_type,"
+    "auto_retries,retry_at,failures"
 )
 
 
@@ -726,10 +741,14 @@ class TreeStore:
                 (time.time(), part.level, part.index),
             )
 
-    def mark(self, part, state, error_type, *, owner, attempt):
-        """End a reserved job without a node: ``uncertain`` (ambiguous call, blocked
-        until ``retry``) or ``refused`` (definitive answer not accepted; may be
-        reserved again as a new attempt). Fenced like ``finish``."""
+    def mark(self, part, state, error_type, *, owner, attempt, schedule=None):
+        """End a reserved job without a node: ``uncertain`` (failed or ambiguous call,
+        blocked until its ``retry_at``) or ``refused`` (definitive answer not accepted;
+        may be reserved again as a new attempt). Fenced like ``finish``.
+
+        For ``uncertain``, ``failures`` grows by one and ``schedule(failures)`` gives
+        the ``retry_at`` (None: due at once), in the same transaction.
+        """
         _part(part)
         if state not in ("uncertain", "refused"):
             raise ValueError("a job can only be marked uncertain or refused")
@@ -740,12 +759,23 @@ class TreeStore:
                 "UPDATE jobs SET state=?, error_type=?, finished_at=? WHERE level=? AND idx=?",
                 (state, error_type, time.time(), part.level, part.index),
             )
+            if state == "uncertain":
+                (failures,) = conn.execute(
+                    "SELECT failures+1 FROM jobs WHERE level=? AND idx=?",
+                    (part.level, part.index),
+                ).fetchone()
+                retry_at = None if schedule is None else schedule(failures)
+                conn.execute(
+                    "UPDATE jobs SET failures=?, retry_at=? WHERE level=? AND idx=?",
+                    (failures, retry_at, part.level, part.index),
+                )
 
     def stale_reserved(self, alive):
-        """Turn reservations whose owner is not alive into ``uncertain``.
+        """Turn reservations whose owner is not alive into ``uncertain``, due at once.
 
         ``alive`` is a predicate ``owner -> bool`` or a collection of live owners.
-        A lost reservation may have dispatched, so it never becomes free again here.
+        A lost reservation may have dispatched, so it never becomes free again here;
+        ``rearm_due`` asks it again as a new, counted reservation.
         """
         is_alive = alive if callable(alive) else (lambda owner: owner in alive)
         with self._connect(write=True) as conn:
@@ -759,14 +789,15 @@ class TreeStore:
             now = time.time()
             for part in stale:
                 conn.execute(
-                    "UPDATE jobs SET state='uncertain', error_type='owner_lost', finished_at=? "
-                    "WHERE level=? AND idx=?",
+                    "UPDATE jobs SET state='uncertain', error_type='owner_lost', finished_at=?, "
+                    "retry_at=NULL WHERE level=? AND idx=?",
                     (now, part.level, part.index),
                 )
             return stale
 
     def retry(self, parts=None):
-        """Explicitly re-arm uncertain jobs (all when ``parts`` is None); returns them."""
+        """Re-arm uncertain jobs now (all when ``parts`` is None), resetting their
+        backoff; returns them."""
         if parts is not None:
             parts = [_part(part) for part in parts]
         with self._connect(write=True) as conn:
@@ -780,41 +811,37 @@ class TreeStore:
             chosen = [p for p in uncertain if wanted is None or p in wanted]
             for part in chosen:
                 conn.execute(
-                    "UPDATE jobs SET state='armed' WHERE level=? AND idx=?",
+                    "UPDATE jobs SET state='armed', failures=0, retry_at=NULL "
+                    "WHERE level=? AND idx=?",
                     (part.level, part.index),
                 )
             return chosen
 
-    def rearm_lost(self, max_auto):
-        """Automatically re-arm jobs whose owner process died (issue #54); returns them.
+    def rearm_due(self, now):
+        """Re-arm every uncertain job whose ``retry_at`` is unset or not after ``now``.
 
-        In ONE write transaction every ``uncertain`` job with ``error_type='owner_lost'``
-        and ``auto_retries < max_auto`` becomes ``armed`` and its ``auto_retries`` grows
-        by one. Counters are untouched: the later ``reserve`` is charged like any new
-        reservation. Jobs uncertain for another reason (a facade exception or timeout,
-        an invalid result) stay blocked until an explicit ``retry``, which does not
-        count here. Never creates the store.
+        Counters are untouched: the later ``reserve`` is charged like any new
+        reservation. Never creates the store. Returns the re-armed parts.
         """
-        if type(max_auto) is not int or max_auto < 0:
-            raise ValueError("max_auto must be a nonnegative integer")
-        if max_auto == 0 or not self.path.exists():
+        if type(now) not in (int, float):
+            raise ValueError("now must be a number")
+        if not self.path.exists():
             return []
         with self._connect(write=True) as conn:
-            lost = [
+            due = [
                 Part(level, idx)
                 for level, idx in conn.execute(
                     "SELECT level,idx FROM jobs WHERE state='uncertain' AND "
-                    "error_type='owner_lost' AND auto_retries<? ORDER BY level,idx",
-                    (max_auto,),
+                    "(retry_at IS NULL OR retry_at<=?) ORDER BY level,idx",
+                    (now,),
                 ).fetchall()
             ]
-            for part in lost:
+            for part in due:
                 conn.execute(
-                    "UPDATE jobs SET state='armed', auto_retries=auto_retries+1 "
-                    "WHERE level=? AND idx=?",
+                    "UPDATE jobs SET state='armed' WHERE level=? AND idx=?",
                     (part.level, part.index),
                 )
-            return lost
+            return due
 
     def jobs(self):
         """Read-only ``{Part: Job}`` snapshot of every job ever reserved."""

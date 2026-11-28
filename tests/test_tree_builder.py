@@ -158,19 +158,20 @@ def test_unlimited_reservation_reports_taken_not_caps(home, log):
     assert b.status()["caps_exhausted"] is False
 
 
-def test_exit_wait_and_auto_reask_lost_defaults_and_validation():
+def test_exit_wait_and_retry_defaults_and_validation():
     s = TreeSettings()
-    assert s.exit_wait == 120 and s.auto_reask_lost == 1
+    assert s.exit_wait == 120 and (s.retry_base, s.retry_max) == (30, 3600)
     assert TreeSettings(exit_wait=0).exit_wait == 0  # 0 = never wait
     assert TreeSettings(exit_wait=2.5).exit_wait == 2.5  # int or float
-    assert TreeSettings(auto_reask_lost=0).auto_reask_lost == 0  # 0 disables
-    assert TreeSettings.from_config({"exit_wait": 5, "auto_reask_lost": 2}).auto_reask_lost == 2
+    assert TreeSettings.from_config({"exit_wait": 5, "retry_base": 2}).retry_base == 2
+    assert [s.retry_delay(n) for n in (1, 2, 3, 8, 50)] == [30, 60, 120, 3600, 3600]
     for bad in (-1, -0.5, True, "5", None, float("nan"), float("inf"), 10**6):
         with pytest.raises(ValueError):
             TreeSettings(exit_wait=bad)
-    for bad in (-1, True, 1.5, "1", None, 10**6):
-        with pytest.raises(ValueError):
-            TreeSettings(auto_reask_lost=bad)
+    for name in ("retry_base", "retry_max"):
+        for bad in (0, -1, True, 1.5, "1", None, 10**6):
+            with pytest.raises(ValueError):
+                TreeSettings(**{name: bad})
 
 
 def test_settings_from_config_rejects_unknown_keys_and_bad_values():
@@ -406,24 +407,6 @@ def test_empty_answer_clips_the_source(home, log):
     assert len(llm.calls) == 3  # a refusal is final: no second ask
 
 
-def test_exception_makes_the_job_uncertain_and_is_never_retried(home, log):
-    log.add(long())
-    log.add(long("y"))
-    llm = FakeLlm(lambda n, m, k: RuntimeError("provider said secret-detail") if n == 1 else "ok")
-    b = builder(home, llm)
-    drain(b)
-    assert len(llm.calls) == 2  # leaf 0 failed once, leaf 1 went on
-    job = log.store.jobs()[Part(0, 0)]
-    assert (job.state, job.error_type) == ("uncertain", "RuntimeError")
-    assert Part(0, 0) not in log.store.nodes() and Part(1, 0) not in log.store.nodes()
-    drain(b)
-    drain(b)
-    assert len(llm.calls) == 2
-    status = b.status()
-    assert status["uncertain"] == 1 and status["last_error"] == "RuntimeError"
-    assert "secret-detail" not in repr(status)
-
-
 def test_explicit_retry_rearms_an_uncertain_job(home, log):
     log.add(long())
     llm = FakeLlm(lambda n, m, k: RuntimeError("down") if n == 1 else "fine")
@@ -630,7 +613,9 @@ def test_restart_turns_dead_reservations_uncertain_and_keeps_live_ones(home, log
     ]
     assert jobs[Part(0, 0)].error_type == "owner_lost"
     drain(other)
-    assert llm.calls == []  # nothing is sent for a lost or in-flight reservation
+    # The lost ones are asked again (each a new reservation); in-flight ones are not.
+    assert sorted(llm.what()[:2]) == [("leaf", 0), ("leaf", 1)]
+    assert {("leaf", 2), ("leaf", 3)}.isdisjoint(llm.what())
 
 
 def test_first_step_recovers_before_planning(home, log):
@@ -638,7 +623,8 @@ def test_first_step_recovers_before_planning(home, log):
     log.store.reserve(Part(0, 0), 10, f"{os.getpid()}:old", max_jobs=10, max_total_bytes=10**6)
     llm = FakeLlm()
     drain(builder(home, llm))
-    assert llm.calls == [] and log.store.jobs()[Part(0, 0)].state == "uncertain"
+    job = log.store.jobs()[Part(0, 0)]
+    assert len(llm.calls) == 1 and (job.state, job.attempts) == ("done", 2)
 
 
 def test_chat_view_is_advanced_and_persisted_with_cas(home, log):
@@ -857,13 +843,15 @@ def test_worker_calls_run_in_the_callers_context(home, log):
     b.stop()
 
 
-def test_worker_survives_an_llm_failure_and_goes_idle(home, log):
+def test_worker_survives_an_llm_failure_and_waits_for_the_retry(home, log):
     log.add(long())
-    b = builder(home, FakeLlm(lambda n, m, k: RuntimeError("x")))
+    b = builder(home, FakeLlm(lambda n, m, k: RuntimeError("x")), retry_base=3600)
     b.start()
-    wait_idle(b)
-    assert log.store.jobs()[Part(0, 0)].state == "uncertain"
+    wait_for(lambda: log.store.jobs().get(Part(0, 0)) is not None)
+    wait_for(lambda: log.store.jobs()[Part(0, 0)].state == "uncertain")
+    assert b._thread is not None and b._thread.is_alive()  # waiting, not gone
     b.stop()
+    assert b._thread is None
 
 
 def test_status_reports_counts_and_unknown_usage(home, log):
@@ -897,7 +885,7 @@ def test_reported_usage_is_counted_only_when_present(home, log):
     assert b.status()["usage"] == {"known_calls": 1, "unknown_calls": 0, "total_tokens": 15}
 
 
-# -- lost owners: automatic re-ask, at most once ------------------------------------------
+# -- lost owners: asked again at once -------------------------------------------------------
 
 
 def dead_owner():
@@ -909,7 +897,7 @@ def dead_owner():
 CAPS = {"max_jobs": 100, "max_total_bytes": 10**6}
 
 
-def test_start_rearms_a_lost_job_and_builds_the_node_once_more(home, log):
+def test_start_asks_a_lost_job_again_and_builds_the_node(home, log):
     log.add(long())
     log.store.reserve(Part(0, 0), 10, dead_owner(), **CAPS)  # a process that exited mid-call
     llm = FakeLlm()
@@ -918,56 +906,9 @@ def test_start_rearms_a_lost_job_and_builds_the_node_once_more(home, log):
     wait_idle(b)
     assert log.store.nodes()[Part(0, 0)] == "summary 1"
     job = log.store.jobs()[Part(0, 0)]
-    assert (job.state, job.attempts, job.auto_retries) == ("done", 2, 1)
+    assert (job.state, job.attempts) == ("done", 2)
     assert log.store.counters()["logical_jobs"] == 2  # the re-ask is a charged reservation
-    status = b.status()
-    assert status["auto_rearmed"] == 1 and status["uncertain"] == 0
-    b.stop()
-
-
-def test_a_node_lost_twice_stays_uncertain(home, log):
-    log.add(long())
-    log.store.reserve(Part(0, 0), 10, dead_owner(), **CAPS)
-    builder(home, FakeLlm()).recover()  # the first start: lost, then re-armed once
-    assert log.store.rearm_lost(1) == [Part(0, 0)]
-    assert log.store.reserve(Part(0, 0), 10, dead_owner(), **CAPS)  # lost again
-    llm = FakeLlm()
-    again = builder(home, llm)
-    again.start()
-    wait_idle(again)
-    job = log.store.jobs()[Part(0, 0)]
-    assert (job.state, job.error_type, job.auto_retries) == ("uncertain", "owner_lost", 1)
-    assert llm.calls == [] and log.store.nodes() == {}
-    status = again.status()
-    assert status["uncertain"] == 1 and status["auto_rearmed"] == 1
-    assert again.retry() == [Part(0, 0)]  # an explicit retry still works
-    drain(again)
-    assert log.store.nodes()[Part(0, 0)] == "summary 1"
-    again.stop()
-
-
-def test_start_leaves_facade_failures_blocked(home, log):
-    log.add(long())
-    b = builder(home, FakeLlm(lambda n, m, k: TimeoutError("slow")))
-    drain(b)
-    assert log.store.jobs()[Part(0, 0)].error_type == "TimeoutError"
-    llm = FakeLlm()
-    later = builder(home, llm)
-    later.start()
-    wait_idle(later)
-    assert llm.calls == [] and log.store.jobs()[Part(0, 0)].state == "uncertain"
-    assert later.status()["auto_rearmed"] == 0
-    later.stop()
-
-
-def test_auto_reask_lost_zero_disables_the_rearm(home, log):
-    log.add(long())
-    log.store.reserve(Part(0, 0), 10, dead_owner(), **CAPS)
-    llm = FakeLlm()
-    b = builder(home, llm, auto_reask_lost=0)
-    b.start()
-    wait_idle(b)
-    assert llm.calls == [] and log.store.jobs()[Part(0, 0)].state == "uncertain"
+    assert b.status()["retrying"] == 0
     b.stop()
 
 

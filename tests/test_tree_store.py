@@ -348,7 +348,7 @@ def test_refused_attempt_can_be_reserved_again_and_counts_every_attempt(home):
     assert store.counters() == {"logical_jobs": 2, "request_bytes": 120}
 
 
-def test_uncertain_job_stays_blocked_until_retry(home):
+def test_uncertain_job_stays_blocked_until_rearmed(home):
     store = TreeStore(home)
     _log(store, 4)
     caps = {"max_jobs": 10, "max_total_bytes": 1000}
@@ -356,7 +356,7 @@ def test_uncertain_job_stays_blocked_until_retry(home):
     assert store.reserve(Part(0, 1), 10, "b", **caps)
     store.mark(Part(0, 0), "uncertain", "TimeoutError", owner="b", attempt=1)
     store.mark(Part(0, 1), "uncertain", "ConnectionError", owner="b", attempt=1)
-    assert store.reserve(Part(0, 0), 10, "b", **caps) is False  # never resubmitted
+    assert store.reserve(Part(0, 0), 10, "b", **caps) is False  # blocked until re-armed
     assert store.retry([Part(0, 0)]) == [Part(0, 0)]
     assert store.jobs()[Part(0, 1)].state == "uncertain"
     assert store.reserve(Part(0, 0), 10, "b", **caps) == 2
@@ -456,17 +456,17 @@ def test_views_are_validated(home):
 
 
 def test_migrations_upgrade_older_stores_and_unknown_versions_refuse(home, monkeypatch):
-    assert tree_store.SCHEMA_VERSION == 2 and set(tree_store.MIGRATIONS) == {1}
+    assert tree_store.SCHEMA_VERSION == 3 and set(tree_store.MIGRATIONS) == {1, 2}
     TreeStore(home).append("s", [entry("a")], origin="live")
-    monkeypatch.setattr(tree_store, "SCHEMA_VERSION", 3)
+    monkeypatch.setattr(tree_store, "SCHEMA_VERSION", 4)
     monkeypatch.setattr(
         tree_store,
         "MIGRATIONS",
-        {2: ("CREATE TABLE IF NOT EXISTS probe (x)", lambda conn: None)},
+        {3: ("CREATE TABLE IF NOT EXISTS probe (x)", lambda conn: None)},
     )
     assert TreeStore(home).count() == 1
     conn = sqlite3.connect(home / "ariadne" / "tree.sqlite3")
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
     assert conn.execute("SELECT name FROM sqlite_schema WHERE name='probe'").fetchone()
     conn.execute("PRAGMA user_version=7")
     conn.commit()
@@ -535,25 +535,29 @@ def _v1_store(home):
     return path
 
 
-def test_v1_store_migrates_in_place_to_v2_keeping_every_job(home):
+def test_v1_store_migrates_in_place_to_v3_keeping_every_job(home):
     path = _v1_store(home)
     store = TreeStore(home)
     assert store.count() == 2  # a plain read migrates
     conn = sqlite3.connect(path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
     columns = {row[1]: row for row in conn.execute("PRAGMA table_info(jobs)")}
-    _, _, kind, not_null, default, _ = columns["auto_retries"]
-    assert (kind, not_null, default) == ("INTEGER", 1, "0")
+    for name, kind, not_null, default in (
+        ("auto_retries", "INTEGER", 1, "0"),
+        ("failures", "INTEGER", 1, "0"),
+        ("retry_at", "REAL", 0, None),
+    ):
+        assert columns[name][2:5] == (kind, not_null, default)
     conn.close()
     jobs = store.jobs()
-    assert jobs[Part(0, 0)].auto_retries == 0 and jobs[Part(0, 1)].auto_retries == 0
+    assert jobs[Part(0, 0)].auto_retries == 0 and jobs[Part(0, 1)].failures == 0
     assert (jobs[Part(0, 0)].state, jobs[Part(0, 0)].error_type) == ("uncertain", "owner_lost")
     assert jobs[Part(0, 0)].attempts == 2 and jobs[Part(0, 0)].request_bytes == 200
     assert store.counters() == {"logical_jobs": 3, "request_bytes": 300}
-    assert store.rearm_lost(1) == [Part(0, 0)]  # the migrated column is usable
+    assert store.rearm_due(0) == [Part(0, 0)]  # an old blocked job is due at once
     # migrating again is a no-op
     TreeStore(home).prepare()
-    assert TreeStore(home).jobs()[Part(0, 0)].auto_retries == 1
+    assert TreeStore(home).jobs()[Part(0, 0)].state == "armed"
 
 
 def test_v1_migration_step_is_idempotent(home):
@@ -565,93 +569,87 @@ def test_v1_migration_step_is_idempotent(home):
     assert TreeStore(home).jobs()[Part(0, 0)].auto_retries == 0
 
 
-def test_fresh_store_has_the_v2_schema(home):
+def test_v2_migration_step_is_idempotent(home):
+    path = _v1_store(home)
+    TreeStore(home).count()  # now v3
+    conn = sqlite3.connect(path)
+    for step in tree_store.MIGRATIONS[2] * 2:  # already applied: must not fail
+        step(conn) if callable(step) else conn.execute(step)
+    conn.close()
+    assert TreeStore(home).jobs()[Part(0, 0)].failures == 0
+
+
+def test_fresh_store_has_the_v3_schema(home):
     TreeStore(home).prepare()
     conn = sqlite3.connect(home / "ariadne" / "tree.sqlite3")
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
-    assert "auto_retries" in {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+    assert {"auto_retries", "retry_at", "failures"} <= columns
     conn.close()
 
 
-# -- re-arming lost jobs -------------------------------------------------------------
+# -- the retry schedule --------------------------------------------------------------
 
 
 CAPS = {"max_jobs": 100, "max_total_bytes": 10**6}
 
 
-def _lost(store, n, *, other=()):
-    """Log ``n`` entries; reserve every one; lose the owner of all, then mark ``other``
-    parts uncertain for a different reason first."""
-    _log(store, n)
-    for i in range(n):
-        assert store.reserve(Part(0, i), 10, "dead", **CAPS)
-    for i in other:
-        store.mark(Part(0, i), "uncertain", "TimeoutError", owner="dead", attempt=1)
+def test_a_failure_schedules_its_retry_and_counts_consecutive_failures(home):
+    store = TreeStore(home)
+    _log(store, 2)
+    part = Part(0, 0)
+    seen = []
+
+    def schedule(failures):
+        seen.append(failures)
+        return 1000.0 + failures
+
+    for attempt in (1, 2):
+        assert store.reserve(part, 10, "b", **CAPS) == attempt
+        store.mark(part, "uncertain", "TimeoutError", owner="b", attempt=attempt, schedule=schedule)
+        job = store.jobs()[part]
+        assert (job.state, job.failures, job.retry_at) == ("uncertain", attempt, 1000.0 + attempt)
+        assert store.rearm_due(1000.0) == []  # not due yet
+        assert store.rearm_due(1000.0 + attempt) == [part]
+    assert seen == [1, 2]
+    store.reserve(part, 10, "b", **CAPS)
+    store.mark(part, "refused", "over_limit", owner="b", attempt=3)  # not a failure
+    assert store.jobs()[part].failures == 2
+    assert store.counters() == {"logical_jobs": 3, "request_bytes": 30}  # re-arming is free
+
+
+def test_lost_owners_and_unscheduled_failures_are_due_at_once(home):
+    store = TreeStore(home)
+    _log(store, 3)
+    for i in range(3):
+        store.reserve(Part(0, i), 10, "dead", **CAPS)
+    store.mark(Part(0, 1), "uncertain", "TimeoutError", owner="dead", attempt=1)
+    store.mark(
+        Part(0, 2), "uncertain", "TimeoutError", owner="dead", attempt=1, schedule=lambda f: 5e9
+    )
     store.stale_reserved(lambda owner: False)
+    assert store.jobs()[Part(0, 0)].retry_at is None
+    assert store.rearm_due(0) == [Part(0, 0), Part(0, 1)]
+    assert store.rearm_due(5e9) == [Part(0, 2)]
 
 
-def test_rearm_lost_only_takes_owner_lost_and_counts_nothing(home):
+def test_explicit_retry_resets_the_backoff(home):
     store = TreeStore(home)
-    _lost(store, 3, other=(2,))
-    before = store.counters()
-    assert store.rearm_lost(1) == [Part(0, 0), Part(0, 1)]
-    jobs = store.jobs()
-    for i in (0, 1):
-        assert jobs[Part(0, i)].state == "armed" and jobs[Part(0, i)].auto_retries == 1
-        assert jobs[Part(0, i)].attempts == 1 and jobs[Part(0, i)].request_bytes == 10
-    assert (jobs[Part(0, 2)].state, jobs[Part(0, 2)].auto_retries) == ("uncertain", 0)
-    assert jobs[Part(0, 2)].error_type == "TimeoutError"  # facade errors stay blocked
-    assert store.counters() == before  # re-arming charges nothing
-    assert store.rearm_lost(1) == []  # nothing left to re-arm
-
-
-def test_rearmed_job_is_reserved_again_as_a_new_charged_reservation(home):
-    store = TreeStore(home)
-    _lost(store, 1)
-    assert store.reserve(Part(0, 0), 10, "b", **CAPS) is False  # blocked until re-armed
-    store.rearm_lost(1)
-    assert store.reserve(Part(0, 0), 10, "b", **CAPS) == 2
+    _log(store, 1)
+    store.reserve(Part(0, 0), 10, "b", **CAPS)
+    store.mark(Part(0, 0), "uncertain", "X", owner="b", attempt=1, schedule=lambda f: 9e9)
+    assert store.retry() == [Part(0, 0)]
     job = store.jobs()[Part(0, 0)]
-    assert (job.state, job.attempts, job.auto_retries) == ("reserved", 2, 1)
-    assert store.counters() == {"logical_jobs": 2, "request_bytes": 20}
+    assert (job.state, job.failures, job.retry_at) == ("armed", 0, None)
 
 
-def test_rearm_lost_is_capped_per_node(home):
+def test_rearm_due_never_creates_the_store_and_validates(home):
     store = TreeStore(home)
-    _lost(store, 1)
-    assert store.rearm_lost(1) == [Part(0, 0)]
-    store.reserve(Part(0, 0), 10, "dead2", **CAPS)
-    store.stale_reserved(lambda owner: False)  # lost a second time
-    assert store.jobs()[Part(0, 0)].state == "uncertain"
-    assert store.rearm_lost(1) == []  # at most once
-    assert store.rearm_lost(0) == []
-    assert store.rearm_lost(2) == [Part(0, 0)]  # a higher cap allows another
-    assert store.jobs()[Part(0, 0)].auto_retries == 2
-
-
-def test_rearm_lost_zero_disables_and_validates(home):
-    store = TreeStore(home)
-    _lost(store, 1)
-    assert store.rearm_lost(0) == []
-    assert store.jobs()[Part(0, 0)].state == "uncertain"
-    for bad in (-1, True, 1.5, "1", None):
+    assert store.rearm_due(1.0) == [] and not store.path.exists()
+    store.prepare()
+    for bad in (None, "1", True):
         with pytest.raises(ValueError):
-            store.rearm_lost(bad)
-
-
-def test_rearm_lost_never_creates_the_store(home):
-    assert TreeStore(home).rearm_lost(1) == [] and not (home / "ariadne").exists()
-
-
-def test_explicit_retry_is_independent_of_auto_retries(home):
-    store = TreeStore(home)
-    _lost(store, 1)
-    store.rearm_lost(1)
-    store.reserve(Part(0, 0), 10, "dead2", **CAPS)
-    store.stale_reserved(lambda owner: False)
-    assert store.retry() == [Part(0, 0)]  # explicit retry always works
-    job = store.jobs()[Part(0, 0)]
-    assert (job.state, job.auto_retries) == ("armed", 1)  # untouched by retry
+            store.rearm_due(bad)
 
 
 # -- backfill from the exact archive ------------------------------------------------
