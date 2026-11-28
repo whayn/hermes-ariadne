@@ -16,6 +16,11 @@ Scripted provider fixtures verify integration, not model recall quality. -->
 <!-- Consider archive compatibility, privacy, context/tool integrity and performance.
 For schema changes, explain migration and recovery. Use N/A with a reason if appropriate. -->
 
+## Review triage
+
+<!-- Filled after the bots comment (AGENTS.md "Review triage"): one line per finding
+with bucket, action and "If unfixed: ..." impact, or a link to the triage comment. -->
+
 ## Checklist
 
 - [ ] Scope is focused; substantial behavior changes were discussed first.
