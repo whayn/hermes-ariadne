@@ -270,8 +270,23 @@ def test_missing_identity_decline_reports_which_messages_lack_one(home, monkeypa
         "duplicate": 0,
         "missing_roles": ["assistant", "tool"],
         "missing_after_canonical": True,
+        "canonical": {"missing": 0, "duplicate": 0},
     }
     assert "SECRET-47" not in json.dumps(a.get_status())
+
+
+def test_identity_shape_survives_malformed_roles_and_reports_both_views():
+    """Sourcery on #71: an unhashable role must not zero the report; canonical rows count."""
+    history = [
+        {"role": "system", "content": "host"},
+        {"role": "user", "content": "q", "message_uid": "a"},
+        {"role": ["assistant"], "content": "x"},
+    ]
+    active = [{"role": "user", "message_uid": "a"}, {"role": "assistant"}]
+    shape = tree_engine._identity_shape(history, active)
+    assert shape["missing"] == 1 and shape["missing_roles"] == ["other"]
+    assert shape["missing_after_canonical"] is False
+    assert shape["canonical"] == {"missing": 1, "duplicate": 0}
 
 
 def test_declines_unknown_budget_over_budget_and_unsupported_shapes(home, monkeypatch):

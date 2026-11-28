@@ -504,23 +504,19 @@ def _identity_shape(history, active):
 
     Never content: roles are reduced to the known set. ``missing_after_canonical``: every
     uid-less message comes after the canonical (persisted) rows, e.g. an in-flight tool
-    loop the host has not flushed yet.
+    loop the host has not flushed yet. ``canonical``: the same counts for those rows,
+    which the identity check also covers.
     """
-    shape = {"missing": 0, "duplicate": 0, "missing_roles": [], "missing_after_canonical": None}
+    shape = {
+        "missing": None,
+        "duplicate": None,
+        "missing_roles": [],
+        "missing_after_canonical": None,
+        "canonical": None,
+    }
     try:
         messages = [m for m in history if type(m) is dict]
-        messages = messages[_leading(messages) :]
-        seen, missing, duplicate, roles = set(), [], 0, set()
-        for index, message in enumerate(messages):
-            uid = message.get("message_uid")
-            if not isinstance(uid, str) or not uid:
-                missing.append(index)
-                role = message.get("role")
-                roles.add(role if role in {"user", "assistant", "tool"} else "other")
-            elif uid in seen:
-                duplicate += 1
-            else:
-                seen.add(uid)
+        missing, duplicate, roles = _identity_counts(messages[_leading(messages) :])
         canonical = len(active) if type(active) is list else None
         shape.update(
             missing=len(missing),
@@ -530,9 +526,29 @@ def _identity_shape(history, active):
                 None if canonical is None or not missing else min(missing) >= canonical
             ),
         )
+        if canonical is not None:
+            rows, row_duplicate, _ = _identity_counts([m for m in active if type(m) is dict])
+            shape["canonical"] = {"missing": len(rows), "duplicate": row_duplicate}
     except Exception:  # noqa: BLE001 - diagnostics must never fail a decline
         pass
     return shape
+
+
+def _identity_counts(messages):
+    """Positions of messages without a uid, the duplicate count and the missing roles."""
+    seen, missing, duplicate, roles = set(), [], 0, set()
+    for index, message in enumerate(messages):
+        uid = message.get("message_uid")
+        if not isinstance(uid, str) or not uid:
+            missing.append(index)
+            role = message.get("role")
+            known = isinstance(role, str) and role in {"user", "assistant", "tool"}
+            roles.add(role if known else "other")
+        elif uid in seen:
+            duplicate += 1
+        else:
+            seen.add(uid)
+    return missing, duplicate, roles
 
 
 def _int(value, name, minimum=0, default=None):

@@ -16,8 +16,39 @@ The ``ariadne`` engine is the profile memory-tree engine (``tree_engine``, issue
 #54), configured by the plugin's ``tree`` settings; summary calls run under the
 plugin-owned auxiliary task ``ariadne_summary``. The legacy ``rolling`` block is
 still validated (an invalid value refuses registration) but unused by the engine;
-it goes with the development engines (#70, phase 2).
+it goes with the development engines (#70, phase 2). It is validated here, without
+importing ``rolling``, so registration loads no development module.
 """
+
+# ``rolling.RollingSettings`` field names; each value must be a positive bounded int.
+_LEGACY_ROLLING_KEYS = frozenset(
+    {
+        "max_logical_jobs",
+        "max_request_bytes",
+        "max_total_request_bytes",
+        "max_readable_delta_bytes",
+        "max_delta_exchanges",
+        "trigger_bytes",
+        "max_summary_bytes",
+        "max_navigation_bytes",
+        "max_candidate_bytes",
+        "reserve_tokens",
+        "max_prefix_events",
+        "max_checkpoint_bytes",
+        "max_tokens",
+        "timeout",
+    }
+)
+
+
+def _validate_legacy_rolling(config):
+    """``RollingSettings(**config)``'s refusals: TypeError for keys, ValueError for values."""
+    unknown = set(config) - _LEGACY_ROLLING_KEYS
+    if unknown:
+        raise TypeError(f"unknown rolling settings: {sorted(map(str, unknown))}")
+    for value in config.values():
+        if type(value) is not int or not 0 < value <= 2**31 - 1:
+            raise ValueError("rolling limits must be positive bounded integers")
 
 
 def _facade(ctx):
@@ -49,11 +80,10 @@ def register(ctx):
     _register_skill(ctx)
     if llm is None:
         return None
-    from .rolling import RollingSettings
     from .tree_builder import TreeSettings, register_summary_task
     from .tree_engine import TreeAriadneEngine
 
-    RollingSettings(**ctx.get_config("rolling", {}))  # validated only (legacy block)
+    _validate_legacy_rolling(ctx.get_config("rolling", {}))
     tree = TreeSettings.from_config(ctx.get_config("tree", None))
     register_task = getattr(ctx, "register_auxiliary_task", None)
     if callable(register_task):

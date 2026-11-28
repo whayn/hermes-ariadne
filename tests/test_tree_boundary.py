@@ -42,15 +42,36 @@ DEVELOPMENT = (
 )
 
 
-def test_shipped_modules_do_not_import_the_development_engines():
+# Plugin registration with Hermes's LLM facade, as the general plugin loader runs it.
+REGISTER = """
+class Llm:
+    def complete(self, *args, **kwargs):
+        raise AssertionError("registration must not call the model")
+
+class Ctx:
+    llm = Llm()
+    def __init__(self, config):
+        self.config = config
+    def get_config(self, key, default=None):
+        return self.config.get(key, default)
+    def register_memory_provider(self, provider):
+        pass
+    def register_context_engine(self, engine):
+        return engine
+
+from hermes_ariadne.plugin_entry import register
+assert register(Ctx({"rolling": {"timeout": 30}})) is not None
+"""
+
+
+def _loaded(body):
     # A fresh interpreter: this process has already imported every module. It gets
     # this process's import path (worktree src first, host source and site).
     path = [str(SRC), *(p for p in sys.path if p)]
     script = (
         "import json, sys\n"
         f"sys.path[:0] = {path!r}\n"
-        f"for name in {SHIPPED!r}:\n"
-        "    __import__(name)\n"
+        f"{body}\n"
         "print(json.dumps(sorted(m for m in sys.modules if m.startswith('hermes_ariadne.'))))\n"
     )
     out = subprocess.run(
@@ -60,7 +81,20 @@ def test_shipped_modules_do_not_import_the_development_engines():
         text=True,
         check=True,
     )
-    loaded = set(json.loads(out.stdout.strip().splitlines()[-1]))
+    return set(json.loads(out.stdout.strip().splitlines()[-1]))
+
+
+def _development(loaded):
+    return sorted(loaded & {f"hermes_ariadne.{name}" for name in DEVELOPMENT})
+
+
+def test_shipped_modules_do_not_import_the_development_engines():
+    loaded = _loaded(f"for name in {SHIPPED!r}:\n    __import__(name)")
     assert set(SHIPPED) <= loaded
-    forbidden = sorted(loaded & {f"hermes_ariadne.{name}" for name in DEVELOPMENT})
-    assert forbidden == []
+    assert _development(loaded) == []
+
+
+def test_plugin_registration_does_not_import_the_development_engines():
+    loaded = _loaded(REGISTER)
+    assert {"hermes_ariadne.plugin_entry", "hermes_ariadne.tree_engine"} <= loaded
+    assert _development(loaded) == []
